@@ -157,6 +157,14 @@ ENV/
 env.bak/
 venv.bak/
 
+# Platform runtime data (local dev NAS/scratch paths, see app/core/config.py)
+/nas_data/
+/work_data/
+
+# Auto-downloaded ML model weights (Ultralytics YOLO/YOLO-World, ~30-350MB each)
+weights/
+*.pt
+
 # Spyder project settings
 .spyderproject
 .spyproject

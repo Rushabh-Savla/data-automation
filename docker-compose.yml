@@ -1,0 +1,105 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: data_automation
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://postgres:postgres@postgres:5432/data_automation
+      REDIS_URL: redis://redis:6379/0
+      NAS_ROOT: /nas
+      WORK_ROOT: /work
+    ports:
+      - "8000:8000"
+    volumes:
+      - nas_data:/nas
+      - work_data:/work
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://postgres:postgres@postgres:5432/data_automation
+      REDIS_URL: redis://redis:6379/0
+      NAS_ROOT: /nas
+      WORK_ROOT: /work
+    volumes:
+      - nas_data:/nas
+      - work_data:/work
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  beat:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker
+    command: ["uv", "run", "celery", "-A", "app.tasks.celery_app", "beat", "--loglevel=info"]
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://postgres:postgres@postgres:5432/data_automation
+      REDIS_URL: redis://redis:6379/0
+      NAS_ROOT: /nas
+      WORK_ROOT: /work
+    volumes:
+      - nas_data:/nas
+      - work_data:/work
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  flower:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker
+    command: ["uv", "run", "celery", "-A", "app.tasks.celery_app", "flower", "--port=5555"]
+    env_file: .env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+    ports:
+      - "5555:5555"
+    depends_on:
+      redis:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+  nas_data:
+  work_data:

@@ -1,0 +1,24 @@
+# Worker image bakes in ffmpeg (YouTube frame extraction) and deno (yt-dlp's
+# JS-runtime dependency for solving YouTube's n-challenge) so the runtime
+# environment is deterministic instead of depending on the host's PATH, which
+# is what the legacy youtube_downloader.py script did (see app/connectors/
+# youtube_connector.py for the removed PATH-shimming logic).
+FROM python:3.13-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ffmpeg curl unzip ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh
+ENV PATH="/usr/local/bin:${PATH}"
+
+WORKDIR /srv
+
+RUN pip install --no-cache-dir uv
+
+COPY pyproject.toml uv.lock* ./
+RUN uv sync --no-dev || uv pip install --system -e .
+
+COPY app ./app
+
+CMD ["uv", "run", "celery", "-A", "app.tasks.celery_app", "worker", "--loglevel=info", "--concurrency=4"]

@@ -1,0 +1,58 @@
+[project]
+name = "data-automation-platform"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = [
+    # -- Web / API --------------------------------------------------------
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "websockets>=13.1",
+    "pydantic>=2.9.0",
+    "pydantic-settings>=2.6.0",
+    # -- Database -----------------------------------------------------------
+    "sqlalchemy>=2.0.36",
+    "alembic>=1.14.0",
+    "psycopg[binary]>=3.2.3",
+    # -- Task queue / broker -------------------------------------------------
+    "celery[redis]>=5.4.0",
+    "redis>=5.2.0",
+    "flower>=2.0.1",
+    # -- Security -------------------------------------------------------------
+    "cryptography>=43.0.0",
+    # -- Source connectors (existing, reused) ----------------------------------
+    "deno>=2.9.5",
+    "kaggle>=1.6.0",
+    "kagglehub>=0.2.0",
+    "opencv-python-headless>=4.8.0",
+    "pillow>=10.0.0",
+    "python-dotenv>=1.2.2",
+    "requests>=2.28.0",
+    "roboflow>=1.1.0",
+    "scenedetect[opencv]>=0.6.3",
+    "yt-dlp>=2024.1.0",
+    # -- Web scraping connector -------------------------------------------------
+    "ddgs>=9.0.0",
+    "img2dataset>=1.45.0",
+    # img2dataset (and a couple of its own deps) still import the stdlib
+    # `imghdr` module, which was removed in Python 3.13 — this backport
+    # package restores it. Without it, `import img2dataset` raises
+    # ModuleNotFoundError on this project's >=3.13 interpreter.
+    "standard-imghdr>=3.13.0; python_version >= '3.13'",
+    # -- Relevance filtering / dedup ---------------------------------------------
+    "ultralytics>=8.3.0",
+    "imagehash>=4.3.1",
+    "numpy>=1.26.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.24.0",
+    "httpx>=0.27.0",
+    "respx>=0.21.1",
+    "freezegun>=1.5.1",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
