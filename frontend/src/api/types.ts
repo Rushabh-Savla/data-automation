@@ -3,6 +3,13 @@
 // `config` field on JobCreateRequest is an untyped dict backend-side with no
 // OpenAPI-level shape to codegen against.
 
+export interface PageResponse<T> {
+  items: T[]
+  total: number
+  limit: number
+  offset: number
+}
+
 export type SourceType = 'roboflow' | 'kaggle' | 'youtube' | 'web'
 
 export type JobStatus =
@@ -186,6 +193,7 @@ export interface AssetResponse {
   source_url: string | null
   dataset_identifier: string | null
   license: string | null
+  original_name: string | null
   width: number | null
   height: number | null
   file_format: string | null

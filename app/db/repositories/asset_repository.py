@@ -1,8 +1,9 @@
 import uuid
 
-from sqlalchemy import select
+from sqlalchemy import func, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
+from sqlalchemy.sql import ColumnElement
 
 from app.db.models.asset import Asset
 from app.domain.enums import ASSET_ACCEPTED_STATUSES, AssetStatus, SourceType
@@ -70,26 +71,54 @@ class AssetRepository:
         )
         return self.db.execute(stmt).scalar_one_or_none()
 
+    @staticmethod
+    def _filters(
+        job_id: uuid.UUID,
+        status: AssetStatus | None,
+        source_type: SourceType | None,
+        search: str | None,
+    ) -> list[ColumnElement]:
+        conditions: list[ColumnElement] = [Asset.job_id == job_id]
+        if status is not None:
+            conditions.append(Asset.status == status)
+        if source_type is not None:
+            conditions.append(Asset.source_type == source_type)
+        if search:
+            pattern = f"%{search}%"
+            conditions.append(
+                or_(
+                    Asset.original_name.ilike(pattern),
+                    Asset.dataset_identifier.ilike(pattern),
+                    Asset.source_item_id.ilike(pattern),
+                )
+            )
+        return conditions
+
     def list_for_job(
         self,
         job_id: uuid.UUID,
         status: AssetStatus | None = None,
         source_type: SourceType | None = None,
+        search: str | None = None,
         limit: int = 100,
         offset: int = 0,
     ) -> list[Asset]:
-        stmt = (
-            select(Asset)
-            .where(Asset.job_id == job_id)
-            .order_by(Asset.discovered_at.desc())
-            .limit(limit)
-            .offset(offset)
-        )
-        if status is not None:
-            stmt = stmt.where(Asset.status == status)
-        if source_type is not None:
-            stmt = stmt.where(Asset.source_type == source_type)
+        stmt = select(Asset).order_by(Asset.discovered_at.desc()).limit(limit).offset(offset)
+        for condition in self._filters(job_id, status, source_type, search):
+            stmt = stmt.where(condition)
         return list(self.db.execute(stmt).scalars().all())
+
+    def count_for_job(
+        self,
+        job_id: uuid.UUID,
+        status: AssetStatus | None = None,
+        source_type: SourceType | None = None,
+        search: str | None = None,
+    ) -> int:
+        stmt = select(func.count()).select_from(Asset)
+        for condition in self._filters(job_id, status, source_type, search):
+            stmt = stmt.where(condition)
+        return self.db.execute(stmt).scalar_one()
 
     def list_for_export(self, job_id: uuid.UUID, min_relevance_score: float | None = None) -> list[Asset]:
         stmt = select(Asset).where(Asset.job_id == job_id, Asset.status.in_(ASSET_ACCEPTED_STATUSES))

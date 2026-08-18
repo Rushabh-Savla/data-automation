@@ -11,22 +11,25 @@ from app.core.security import require_api_key
 from app.db.repositories.asset_repository import AssetRepository
 from app.domain.enums import AssetStatus, SourceType
 from app.schemas.asset import AssetResponse
+from app.schemas.common import PageResponse
 
 router = APIRouter(tags=["assets"], dependencies=[Depends(require_api_key)])
 
 
-@router.get("/jobs/{job_id}/assets", response_model=list[AssetResponse])
+@router.get("/jobs/{job_id}/assets", response_model=PageResponse[AssetResponse])
 def list_assets(
     job_id: uuid.UUID,
     status: AssetStatus | None = None,
     source_type: SourceType | None = None,
+    search: str | None = Query(default=None, description="Matches filename, dataset, or source item id"),
     limit: int = Query(default=100, le=500),
     offset: int = 0,
     db: Session = Depends(get_db),
 ):
-    return AssetRepository(db).list_for_job(
-        job_id, status=status, source_type=source_type, limit=limit, offset=offset
-    )
+    repo = AssetRepository(db)
+    items = repo.list_for_job(job_id, status=status, source_type=source_type, search=search, limit=limit, offset=offset)
+    total = repo.count_for_job(job_id, status=status, source_type=source_type, search=search)
+    return PageResponse(items=items, total=total, limit=limit, offset=offset)
 
 
 @router.get("/assets/{asset_id}", response_model=AssetResponse)

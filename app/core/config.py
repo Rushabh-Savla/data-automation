@@ -46,6 +46,17 @@ class Settings(BaseSettings):
     celery_task_time_limit_s: int = 2100
     watchdog_stall_threshold_s: int = 300
 
+    # -- Fast-path source selection --------------------------------------------------
+    # For small target counts, fanning out to every connector at once wastes time —
+    # Kaggle/Roboflow download whole datasets and YouTube downloads+extracts video
+    # frames, all much slower than web scraping for a handful of images. When a job
+    # is auto-sourced (no explicit `sources` list) and asks for at most this many
+    # images, only web scraping is dispatched first; the remaining connectors are
+    # only brought in afterward if web scraping alone didn't reach the target (see
+    # JobService.create() and orchestration_tasks.check_and_advance_job()).
+    fast_path_enabled: bool = True
+    fast_path_max_target_count: int = 50
+
     # -- Source credentials (fallback if not set via the Credential API) -----------
     roboflow_api_key: str = ""
     kaggle_username: str = ""

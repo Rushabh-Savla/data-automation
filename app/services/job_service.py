@@ -10,6 +10,7 @@ from datetime import datetime
 
 from sqlalchemy.orm import Session
 
+from app.core.config import get_settings
 from app.core.redis_client import get_redis
 from app.db.models.job import Job
 from app.db.models.job_source_task import JobSourceTask
@@ -58,10 +59,36 @@ class JobService:
         # currently has implemented. This is what makes "just give a query"
         # actually run on every source automatically, rather than requiring
         # the caller to know and list connector names up front.
+        was_auto_sourced = not sources
         if not sources:
             sources = sorted(get_implemented_sources(), key=lambda s: s.value)
             if not sources:
                 raise ValueError("No source connectors are implemented yet")
+
+        job_config = dict(config or {})
+
+        # Fast path: for a small auto-sourced target count, dispatching every
+        # connector at once wastes time — Kaggle/Roboflow pull whole datasets
+        # and YouTube downloads+extracts video, all much slower than web
+        # scraping for a handful of images. Try web alone first; the
+        # remaining sources only get created/dispatched later if web didn't
+        # reach the target (see orchestration_tasks.check_and_advance_job's
+        # escalation branch). An explicit `sources` list is a deliberate
+        # user choice and is never deferred like this.
+        settings = get_settings()
+        deferred_sources: list[SourceType] = []
+        if (
+            was_auto_sourced
+            and settings.fast_path_enabled
+            and target_count is not None
+            and target_count <= settings.fast_path_max_target_count
+            and SourceType.WEB in sources
+        ):
+            deferred_sources = [s for s in sources if s != SourceType.WEB]
+            dispatch_sources = [SourceType.WEB]
+            job_config["_fast_path_remaining_sources"] = [s.value for s in deferred_sources]
+        else:
+            dispatch_sources = sources
 
         status = JobStatus.SCHEDULED if scheduled_start_at else JobStatus.DRAFT
         job = Job(
@@ -73,10 +100,10 @@ class JobService:
             deadline_at=deadline_at,
             scheduled_start_at=scheduled_start_at,
             status=status,
-            config=config or {},
+            config=job_config,
         )
         self.job_repo.create(job)
-        for source in sources:
+        for source in dispatch_sources:
             self.task_repo.create(
                 JobSourceTask(id=uuid.uuid4(), job_id=job.id, source_type=source.value)
             )

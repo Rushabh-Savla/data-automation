@@ -6,7 +6,7 @@ license, resolution, exact NAS path, processing status."""
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -59,7 +59,7 @@ class Asset(Base):
     # timestamp_sec, Roboflow split, Kaggle original_path, coco_image_id, etc.)
     asset_metadata: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
 
-    discovered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default="now()")
+    discovered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=text("now()"))
     promoted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     job: Mapped["Job"] = relationship(back_populates="assets")

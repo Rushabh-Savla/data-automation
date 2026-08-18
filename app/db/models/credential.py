@@ -4,7 +4,7 @@ be managed from the UI instead of editing .env."""
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, LargeBinary, String
+from sqlalchemy import Boolean, DateTime, LargeBinary, String, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -23,8 +23,8 @@ class Credential(Base):
     encrypted_value: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
 
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default="now()")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=text("now()"))
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default="now()", onupdate=lambda: datetime.utcnow()
+        DateTime(timezone=True), server_default=text("now()"), onupdate=lambda: datetime.utcnow()
     )
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

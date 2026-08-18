@@ -9,7 +9,7 @@ import { useJobs } from '@/hooks/useJobs'
 
 export function DashboardPage() {
   const { data: stats, isLoading: statsLoading } = useStats()
-  const { data: jobs, isLoading: jobsLoading } = useJobs({ limit: 8 })
+  const { data: jobsPage, isLoading: jobsLoading } = useJobs({ limit: 8 })
 
   return (
     <>
@@ -37,7 +37,7 @@ export function DashboardPage() {
             </Button>
           </CardHeader>
           <CardContent className="px-0">
-            <JobList jobs={jobs} isLoading={jobsLoading} />
+            <JobList jobs={jobsPage?.items} isLoading={jobsLoading} />
           </CardContent>
         </Card>
       </div>

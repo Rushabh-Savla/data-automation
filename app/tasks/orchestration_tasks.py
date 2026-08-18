@@ -12,11 +12,12 @@ from datetime import datetime, timezone
 from app.core.config import get_settings
 from app.core.logging import bind_job_context, clear_job_context
 from app.core.redis_client import get_redis
+from app.db.models.job_source_task import JobSourceTask
 from app.db.repositories.job_repository import JobRepository
 from app.db.repositories.job_source_task_repository import JobSourceTaskRepository
 from app.db.session import session_scope
 from app.domain.completion import JobCompletionEvaluator, JobSnapshot
-from app.domain.enums import JobSourceTaskStatus, JobStatus
+from app.domain.enums import JobSourceTaskStatus, JobStatus, SourceType
 from app.domain.state_machine import JobStateMachine
 from app.services.cancellation_service import CancellationService
 from app.services.progress_service import ProgressPublisher
@@ -82,15 +83,83 @@ def check_and_advance_job(job_id: str) -> None:
     re-check "is the whole job done" again and the job would sit in `running`
     forever despite every source having already finished. This function is
     the single place that check happens, reachable from both paths.
+
+    Because it's reachable from up to one call per source, two (or more)
+    sources going terminal within the same instant is a real race: multiple
+    concurrent invocations can each read all_terminal_for_job() as True
+    before any of them has committed a side effect that would change that
+    answer, and each would dispatch run_relevance_filter — which processes
+    the same PROMOTED assets more than once and double-counts
+    accepted/rejected on the job (observed in production: accepted_count
+    went negative from a job whose web+kaggle sources finished seconds
+    apart). The Redis NX guard below makes the dispatch atomic across
+    concurrent callers so only the one that actually sees the job through
+    the transition proceeds; it expires quickly so a later resume of the
+    same job can legitimately re-run the pipeline for newly promoted assets.
+
+    Also where fast-path escalation happens: a small-target-count auto-
+    sourced job (see JobService.create()) only creates/dispatches a
+    JobSourceTask for web scraping up front, stashing the remaining sources
+    in job.config["_fast_path_remaining_sources"]. Once web (currently the
+    only tracked task) goes terminal, all_terminal_for_job is trivially
+    True — if the target wasn't actually reached from web alone, this is
+    where the remaining sources get created and dispatched instead of
+    proceeding straight to filtering.
     """
+    job_uuid = uuid.UUID(job_id)
     with session_scope() as db:
         task_repo = JobSourceTaskRepository(db)
-        all_terminal = task_repo.all_terminal_for_job(uuid.UUID(job_id))
+        job_repo = JobRepository(db)
+        all_terminal = task_repo.all_terminal_for_job(job_uuid)
+        if not all_terminal:
+            return
 
-    if not all_terminal:
+        job = job_repo.get(job_uuid)
+        if job is None:
+            return
+
+        remaining_sources = job.config.get("_fast_path_remaining_sources") or []
+        target_reached = job.target_count is not None and job.accepted_count >= job.target_count
+
+        if remaining_sources and not target_reached:
+            redis_client = get_redis()
+            escalate_key = f"job:{job_id}:fast_path_escalated"
+            if not redis_client.set(escalate_key, "1", nx=True, ex=86400):
+                # Another concurrent caller already claimed the escalation —
+                # nothing more to do this round; its own dispatch will make
+                # this job's task set non-terminal again until it finishes.
+                return
+
+            new_config = dict(job.config)
+            new_config.pop("_fast_path_remaining_sources", None)
+            job_repo.set_config(job_uuid, new_config)
+
+            new_tasks = []
+            for source_value in remaining_sources:
+                task = JobSourceTask(id=uuid.uuid4(), job_id=job_uuid, source_type=source_value)
+                task_repo.create(task)
+                new_tasks.append((source_value, task.id))
+            db.flush()
+
+        else:
+            new_tasks = None
+
+    if remaining_sources and not target_reached and new_tasks:
+        from app.services.job_service import _SOURCE_DISCOVERY_TASKS, JobService
+
+        logger.info(f"Fast-path escalation for job {job_id}: target not reached from web, dispatching {remaining_sources}")
+        for source_value, task_id in new_tasks:
+            task_path = _SOURCE_DISCOVERY_TASKS.get(SourceType(source_value))
+            if task_path is not None:
+                JobService._dispatch(task_path, job_id, str(task_id))
         return
 
-    ProgressPublisher(get_redis()).publish(job_id, {"type": "connector_finished"})
+    redis_client = get_redis()
+    dispatch_key = f"job:{job_id}:filtering_dispatched"
+    if not redis_client.set(dispatch_key, "1", nx=True, ex=60):
+        return
+
+    ProgressPublisher(redis_client).publish(job_id, {"type": "connector_finished"})
     # Downstream pipeline: relevance filter -> dedup -> completion evaluation.
     # run_deduplication chains to evaluate_job_completion itself once it
     # finishes (see app/tasks/filtering_tasks.py).

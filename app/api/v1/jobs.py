@@ -13,6 +13,7 @@ from app.db.repositories.job_repository import JobRepository
 from app.db.repositories.job_source_task_repository import JobSourceTaskRepository
 from app.domain.enums import JOB_TERMINAL_STATUSES, JobStatus
 from app.domain.state_machine import IllegalTransitionError
+from app.schemas.common import PageResponse
 from app.schemas.job import (
     JobCreateRequest,
     JobDetailResponse,
@@ -43,15 +44,19 @@ def create_job(payload: JobCreateRequest, db: Session = Depends(get_db)):
     return _to_detail(job, JobSourceTaskRepository(db).list_for_job(job.id))
 
 
-@router.get("", response_model=list[JobResponse])
+@router.get("", response_model=PageResponse[JobResponse])
 def list_jobs(
     status: JobStatus | None = None,
     source: str | None = None,
+    search: str | None = Query(default=None, description="Matches job name or query text"),
     limit: int = Query(default=50, le=200),
     offset: int = 0,
     db: Session = Depends(get_db),
 ):
-    return JobRepository(db).list(status=status, source=source, limit=limit, offset=offset)
+    repo = JobRepository(db)
+    items = repo.list(status=status, source=source, search=search, limit=limit, offset=offset)
+    total = repo.count(status=status, source=source, search=search)
+    return PageResponse(items=items, total=total, limit=limit, offset=offset)
 
 
 @router.get("/{job_id}", response_model=JobDetailResponse)

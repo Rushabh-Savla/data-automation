@@ -14,8 +14,9 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.orm import Session
+from sqlalchemy.sql import ColumnElement
 
 from app.db.models.job import Job
 from app.domain.enums import JobCompletionReason, JobStatus
@@ -39,19 +40,44 @@ class JobRepository:
             raise LookupError(f"Job {job_id} not found")
         return job
 
+    @staticmethod
+    def _filters(status: JobStatus | None, source: str | None, search: str | None) -> list[ColumnElement]:
+        conditions: list[ColumnElement] = []
+        if status is not None:
+            conditions.append(Job.status == status)
+        if source is not None:
+            conditions.append(Job.sources.contains([source]))
+        if search:
+            pattern = f"%{search}%"
+            # Matches either the free-text query or the optional job name —
+            # those are the only two user-authored, human-readable fields on
+            # a job, so together they cover "search for a job" intuitively.
+            conditions.append(or_(Job.query.ilike(pattern), Job.name.ilike(pattern)))
+        return conditions
+
     def list(
         self,
         status: JobStatus | None = None,
         source: str | None = None,
+        search: str | None = None,
         limit: int = 50,
         offset: int = 0,
     ) -> list[Job]:
         stmt = select(Job).order_by(Job.created_at.desc()).limit(limit).offset(offset)
-        if status is not None:
-            stmt = stmt.where(Job.status == status)
-        if source is not None:
-            stmt = stmt.where(Job.sources.contains([source]))
+        for condition in self._filters(status, source, search):
+            stmt = stmt.where(condition)
         return list(self.db.execute(stmt).scalars().all())
+
+    def count(
+        self,
+        status: JobStatus | None = None,
+        source: str | None = None,
+        search: str | None = None,
+    ) -> int:
+        stmt = select(func.count()).select_from(Job)
+        for condition in self._filters(status, source, search):
+            stmt = stmt.where(condition)
+        return self.db.execute(stmt).scalar_one()
 
     def list_due_scheduled(self, now: datetime | None = None) -> list[Job]:
         """Jobs whose scheduled_start_at has passed but haven't started yet —
@@ -115,3 +141,6 @@ class JobRepository:
         if not values:
             return
         self.db.execute(update(Job).where(Job.id == job_id).values(**values))
+
+    def set_config(self, job_id: uuid.UUID, config: dict) -> None:
+        self.db.execute(update(Job).where(Job.id == job_id).values(config=config))

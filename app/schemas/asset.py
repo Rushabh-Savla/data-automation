@@ -14,6 +14,7 @@ class AssetResponse(BaseModel):
     source_url: str | None
     dataset_identifier: str | None
     license: str | None
+    original_name: str | None
     width: int | None
     height: int | None
     file_format: str | None

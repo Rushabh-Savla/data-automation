@@ -1,6 +1,12 @@
+import { useState } from 'react'
+import { DownloadIcon, Loader2Icon } from 'lucide-react'
+import { toast } from 'sonner'
+
 import type { AssetResponse } from '@/api/types'
+import { downloadAsset } from '@/api/assets'
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
 import { useAssetImageUrl } from '@/hooks/useAssetImageUrl'
 import { assetStatusVariant } from '@/lib/statusMaps'
 import { assetStatusLabels, annotationFormatLabels, sourceTypeLabels } from '@/lib/enumLabels'
@@ -17,8 +23,21 @@ export function AssetDetailDialog({
   onOpenChange: (open: boolean) => void
 }) {
   const { url } = useAssetImageUrl(asset?.id ?? '')
+  const [downloading, setDownloading] = useState(false)
 
   if (!asset) return null
+
+  async function handleDownload() {
+    if (!asset) return
+    setDownloading(true)
+    try {
+      await downloadAsset(asset)
+    } catch {
+      toast.error('Download failed')
+    } finally {
+      setDownloading(false)
+    }
+  }
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -66,7 +85,11 @@ export function AssetDetailDialog({
               </div>
             )}
 
-            <div className="mt-auto pt-2">
+            <div className="mt-auto flex items-center gap-2 pt-2">
+              <Button type="button" size="sm" variant="outline" className="gap-1.5" disabled={downloading} onClick={handleDownload}>
+                {downloading ? <Loader2Icon className="size-4 animate-spin" /> : <DownloadIcon className="size-4" />}
+                Download
+              </Button>
               <DeleteAssetButton assetId={asset.id} onDeleted={() => onOpenChange(false)} />
             </div>
           </div>

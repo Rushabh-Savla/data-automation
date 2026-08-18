@@ -4,7 +4,7 @@ and how it should stop (target image count, a deadline, or both)."""
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, Index, Integer, String, Text
+from sqlalchemy import DateTime, ForeignKey, Index, Integer, String, Text, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -42,9 +42,17 @@ class Job(Base):
 
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
 
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default="now()")
+    # server_default must be text("now()") (a live function-call expression),
+    # not the bare string "now()" — SQLAlchemy/Postgres treats a plain quoted
+    # string default as a constant, evaluated once when the DDL runs and then
+    # frozen into the column's catalog default forever after, so every row
+    # ever inserted without an explicit value gets that same table-creation-
+    # time timestamp instead of its own insert time (this is exactly the bug
+    # that made every job's created_at identical and job listings unsortable
+    # by recency).
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=text("now()"))
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default="now()", onupdate=lambda: datetime.utcnow()
+        DateTime(timezone=True), server_default=text("now()"), onupdate=lambda: datetime.utcnow()
     )
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

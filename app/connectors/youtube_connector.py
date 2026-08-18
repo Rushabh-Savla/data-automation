@@ -229,18 +229,31 @@ class YouTubeConnector:
             opts = build_ytdlp_options(video_dir, archive_file, cc_only=self.cc_only)
             error_logger = _ErrorCapturingLogger()
             opts["logger"] = error_logger
+            info = None
             try:
                 with yt_dlp.YoutubeDL(opts) as ydl:
                     info = ydl.extract_info(url, download=True)
+            except yt_dlp.utils.MaxDownloadsReached:
+                # We only ever request one URL per fetch() with
+                # `max_downloads: 1`, but yt-dlp raises this as its stop
+                # signal *after* successfully writing the file, not only
+                # when a limit is exceeded mid-playlist — so this fires on
+                # every ordinary single-video download, not just when
+                # something is actually wrong. Treating it as an error (the
+                # previous behavior) discarded videos that had already
+                # downloaded successfully to disk. Fall through to the same
+                # candidate-file lookup as the success path below, using the
+                # item's own video_id since we have no `info` dict here.
+                pass
             except Exception as e:
                 raise self._classify_error(e, url)
 
-            if info is None:
+            if info is None and not item.external_ref.get("video_id"):
                 raise FatalConnectorError(
                     f"No video info returned for {url} — likely skipped by the CC license filter"
                 )
 
-            video_id = info.get("id")
+            video_id = info.get("id") if info is not None else item.external_ref["video_id"]
             candidates = [
                 p for p in video_dir.glob(f"{video_id}.*")
                 if p.suffix.lower() in _MEDIA_EXTENSIONS
@@ -249,7 +262,7 @@ class YouTubeConnector:
                 reason = error_logger.last_error or "unknown reason (no file produced, no error captured)"
                 raise self._classify_error(RuntimeError(reason), url, video_id=video_id)
             video_path = candidates[0]
-            license_name = info.get("license", "unknown")
+            license_name = info.get("license", "unknown") if info is not None else (item.license_hint or "unknown")
             on_progress({"checkpoint": {"stage": "extracting", "frame_index": 0}, "downloaded": 1})
         else:
             video_id = item.external_ref.get("video_id", "")

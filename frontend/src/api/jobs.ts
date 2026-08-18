@@ -6,17 +6,19 @@ import type {
   JobResponse,
   JobStatus,
   JobUpdateRequest,
+  PageResponse,
 } from '@/api/types'
 
 export interface ListJobsFilters {
   status?: JobStatus
   source?: string
+  search?: string
   limit?: number
   offset?: number
 }
 
-export function listJobs(filters: ListJobsFilters = {}): Promise<JobResponse[]> {
-  return apiFetch<JobResponse[]>('/jobs', { query: filters })
+export function listJobs(filters: ListJobsFilters = {}): Promise<PageResponse<JobResponse>> {
+  return apiFetch<PageResponse<JobResponse>>('/jobs', { query: filters })
 }
 
 export function getJob(jobId: string): Promise<JobDetailResponse> {
