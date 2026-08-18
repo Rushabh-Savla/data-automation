@@ -57,29 +57,49 @@ class RoboflowConnector:
     # -- Discovery -----------------------------------------------------------
 
     def discover(self, query: str, cursor: str | None, limit: int = 20) -> DiscoveryPage:
-        endpoints = [(RF_UNIVERSE_BASE + "/search", {"q": query, "t": "object-detection", "p": 1})]
-        if self.api_key:
-            endpoints.append((RF_API_BASE + "/search", {"api_key": self.api_key, "q": query, "type": "object-detection"}))
-
-        for url, params in endpoints:
-            try:
-                resp = requests.get(url, params=params, headers={"Accept": "application/json"}, timeout=15)
-                resp.raise_for_status()
-                ct = resp.headers.get("content-type", "")
-                if "json" not in ct and not resp.text.strip().startswith("{"):
-                    continue
-                data = resp.json()
-                items = data.get("results", [])
-                if items:
-                    return DiscoveryPage(
-                        items=[self._parse_universe_item(it) for it in items[:limit]],
-                        next_cursor=None,
-                        exhausted=True,
-                    )
-            except Exception as e:
-                logger.debug(f"Search endpoint {url} failed: {e}")
-                continue
-        return DiscoveryPage(items=[], next_cursor=None, exhausted=True)
+        # Note: api.roboflow.com/search is NOT a real search endpoint — it is
+        # Roboflow's GET /:workspace route, and "search" happens to be a real
+        # workspace slug someone owns. Every request to it returns that one
+        # fixed workspace's own projects regardless of `q`/`type`, completely
+        # ignoring the query — verified by hitting it with several unrelated
+        # queries and getting byte-identical responses. It was previously
+        # kept as a "fallback" but never actually performed a search, so it
+        # only risked silently attaching an unrelated workspace's data to a
+        # job; removed rather than fixed forward since Roboflow does not
+        # appear to expose a public, query-based Universe search API.
+        url = RF_UNIVERSE_BASE + "/search"
+        params = {"q": query, "t": "object-detection", "p": 1}
+        try:
+            resp = requests.get(url, params=params, headers={"Accept": "application/json"}, timeout=15)
+            resp.raise_for_status()
+            ct = resp.headers.get("content-type", "")
+            if "json" not in ct and not resp.text.strip().startswith("{"):
+                logger.warning(
+                    f"Roboflow Universe search returned non-JSON (likely an anti-bot challenge page) "
+                    f"for query {query!r} — this network is probably being blocked, not genuinely "
+                    f"returning zero results. Use explicit project overrides instead of auto-search."
+                )
+                return DiscoveryPage(
+                    items=[],
+                    next_cursor=None,
+                    exhausted=True,
+                    error_reason="Roboflow Universe search is unreachable from this network (blocked/anti-bot "
+                    "challenge) — use explicit project overrides instead of auto-search",
+                )
+            data = resp.json()
+            items = data.get("results", [])
+            return DiscoveryPage(
+                items=[self._parse_universe_item(it) for it in items[:limit]], next_cursor=None, exhausted=True
+            )
+        except Exception as e:
+            logger.warning(f"Roboflow Universe search failed for {query!r}: {e}")
+            return DiscoveryPage(
+                items=[],
+                next_cursor=None,
+                exhausted=True,
+                error_reason=f"Roboflow Universe search request failed ({e}) — use explicit project overrides "
+                "instead of auto-search",
+            )
 
     @staticmethod
     def _parse_universe_item(item: dict) -> SourceItem:

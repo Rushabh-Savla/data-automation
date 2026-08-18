@@ -108,6 +108,27 @@ def search_videos(
     return items
 
 
+class _ErrorCapturingLogger:
+    """yt-dlp's `ignoreerrors=True` swallows download failures (extract_info
+    returns a populated info dict even though no file was ever written), so
+    the only way to learn *why* is to intercept the messages yt-dlp would
+    otherwise just print — without this, a real cause like a 403 from
+    YouTube's CDN gets reported to operators as an opaque "file not found",
+    which is indistinguishable from an actual code bug."""
+
+    def __init__(self) -> None:
+        self.last_error: str | None = None
+
+    def debug(self, msg: str) -> None:
+        pass
+
+    def warning(self, msg: str) -> None:
+        pass
+
+    def error(self, msg: str) -> None:
+        self.last_error = msg
+
+
 def build_ytdlp_options(
     output_dir: Path,
     archive_file: Path,
@@ -143,13 +164,27 @@ def build_ytdlp_options(
         "extractor_args": {"youtube": {"client": ["ios", "android"]}},
     }
     if cc_only:
-        import yt_dlp
-
-        try:
-            opts["match_filter"] = yt_dlp.utils.match_filter_func("license = creativecommon")
-        except Exception:
-            logger.warning("Could not set CC license filter — all videos will be downloaded")
+        opts["match_filter"] = _cc_only_match_filter
     return opts
+
+
+def _cc_only_match_filter(info_dict: dict, *, incomplete: bool = False) -> str | None:
+    """Was previously `match_filter_func("license = creativecommon")`, which
+    uses yt-dlp's filter-DSL `=` (exact string equality) operator against
+    `info_dict["license"]`. That field is always yt-dlp's human-readable
+    license label (observed: "Creative Commons Attribution license (reuse
+    allowed)"), which can never equal the literal string "creativecommon" —
+    so the old filter silently rejected every video regardless of its real
+    license, making cc_only=True (the default) download nothing, ever, with
+    no error surfaced (match_filter skips are not failures to yt-dlp). This
+    checks for the substring instead, matching what the field actually
+    contains."""
+    if incomplete:
+        return None
+    license_name = (info_dict.get("license") or "").lower()
+    if "creative commons" in license_name:
+        return None
+    return f"Skipping non-CC-licensed video (license={info_dict.get('license')!r})"
 
 
 @register_connector(SourceType.YOUTUBE)
@@ -192,6 +227,8 @@ class YouTubeConnector:
 
         if stage == "downloading":
             opts = build_ytdlp_options(video_dir, archive_file, cc_only=self.cc_only)
+            error_logger = _ErrorCapturingLogger()
+            opts["logger"] = error_logger
             try:
                 with yt_dlp.YoutubeDL(opts) as ydl:
                     info = ydl.extract_info(url, download=True)
@@ -209,7 +246,8 @@ class YouTubeConnector:
                 if p.suffix.lower() in _MEDIA_EXTENSIONS
             ]
             if not candidates:
-                raise FatalConnectorError(f"Downloaded file not found for video_id={video_id}")
+                reason = error_logger.last_error or "unknown reason (no file produced, no error captured)"
+                raise self._classify_error(RuntimeError(reason), url, video_id=video_id)
             video_path = candidates[0]
             license_name = info.get("license", "unknown")
             on_progress({"checkpoint": {"stage": "extracting", "frame_index": 0}, "downloaded": 1})
@@ -362,8 +400,14 @@ class YouTubeConnector:
                 f.unlink(missing_ok=True)
 
     @staticmethod
-    def _classify_error(e: Exception, url: str) -> Exception:
+    def _classify_error(e: Exception, url: str, video_id: str | None = None) -> Exception:
         msg = str(e).lower()
+        ref = f"video_id={video_id}" if video_id else url
         if "private" in msg or "unavailable" in msg or "removed" in msg or "copyright" in msg:
-            return FatalConnectorError(f"Video unavailable: {url}: {e}")
-        return TransientConnectorError(f"yt-dlp failed for {url}: {e}")
+            return FatalConnectorError(f"Video unavailable ({ref}): {e}")
+        if "403" in msg or "forbidden" in msg:
+            return TransientConnectorError(
+                f"YouTube CDN refused the video download for {ref} (HTTP 403 — this host's network is "
+                f"likely being rate-limited/blocked by YouTube for automated downloads, not a code bug): {e}"
+            )
+        return TransientConnectorError(f"yt-dlp failed for {ref}: {e}")

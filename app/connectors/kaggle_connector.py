@@ -73,10 +73,11 @@ class KaggleConnector:
 
         try:
             kaggle_pkg.api.authenticate()
-            raw = kaggle_pkg.api.dataset_list(search=query, file_type="all")
         except (Exception, SystemExit) as e:
             logger.warning(f"Kaggle search unavailable (missing/invalid credentials?): {e}")
             return DiscoveryPage(items=[], next_cursor=None, exhausted=True)
+
+        raw = self._search_with_singular_fallback(kaggle_pkg, query)
 
         items = []
         for ds in raw[:limit]:
@@ -91,6 +92,37 @@ class KaggleConnector:
                 )
             )
         return DiscoveryPage(items=items, next_cursor=None, exhausted=True)
+
+    @staticmethod
+    def _search_with_singular_fallback(kaggle_pkg, query: str) -> list:
+        """Kaggle's dataset search matches literally rather than stemmed —
+        e.g. "red shirts" returns 0 datasets while "red shirt" returns 11 for
+        the exact same underlying content. Retry once with a naive
+        singularized form of the last word before giving up, so a plural
+        user query doesn't silently starve this source of every candidate."""
+        try:
+            raw = kaggle_pkg.api.dataset_list(search=query, file_type="all")
+        except Exception as e:
+            logger.warning(f"Kaggle search failed for {query!r}: {e}")
+            return []
+        if raw:
+            return raw
+
+        words = query.split()
+        if not words or not words[-1].lower().endswith("s") or len(words[-1]) <= 1:
+            return raw
+
+        singular_query = " ".join([*words[:-1], words[-1][:-1]])
+        try:
+            fallback_raw = kaggle_pkg.api.dataset_list(search=singular_query, file_type="all")
+        except Exception as e:
+            logger.warning(f"Kaggle fallback search failed for {singular_query!r}: {e}")
+            return raw
+        if fallback_raw:
+            logger.info(
+                f"Kaggle: 0 results for {query!r}, found {len(fallback_raw)} for singularized {singular_query!r}"
+            )
+        return fallback_raw
 
     # -- Download ----------------------------------------------------------------
 

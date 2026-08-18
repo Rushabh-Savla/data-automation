@@ -30,6 +30,12 @@ class DiscoveryPage:
     items: list[SourceItem]
     next_cursor: str | None
     exhausted: bool
+    # Set by a connector when it has zero items to report *and* knows why
+    # (e.g. the search endpoint was blocked/unreachable rather than genuinely
+    # returning no matches) — lets task-level error_message text distinguish
+    # "we searched and there's nothing" from "the search itself failed",
+    # which otherwise look identical to an operator.
+    error_reason: str | None = None
 
 
 @dataclass

@@ -38,8 +38,15 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - nas_data:/nas
-      - work_data:/work
+      # Bind mounts (not named volumes): NAS_ROOT/WORK_ROOT stay the same
+      # host folder whether the API/worker run natively (uv run uvicorn,
+      # NAS_ROOT=./nas_data) or via this compose file — a named volume here
+      # would silently diverge into a second, container-only copy the moment
+      # someone switches between the two, which is exactly the class of bug
+      # this comment exists to prevent regressing (assets created one way
+      # become invisible/404 the other way).
+      - ./nas_data:/nas
+      - ./work_data:/work
     depends_on:
       postgres:
         condition: service_healthy
@@ -57,8 +64,15 @@ services:
       NAS_ROOT: /nas
       WORK_ROOT: /work
     volumes:
-      - nas_data:/nas
-      - work_data:/work
+      # Bind mounts (not named volumes): NAS_ROOT/WORK_ROOT stay the same
+      # host folder whether the API/worker run natively (uv run uvicorn,
+      # NAS_ROOT=./nas_data) or via this compose file — a named volume here
+      # would silently diverge into a second, container-only copy the moment
+      # someone switches between the two, which is exactly the class of bug
+      # this comment exists to prevent regressing (assets created one way
+      # become invisible/404 the other way).
+      - ./nas_data:/nas
+      - ./work_data:/work
     depends_on:
       postgres:
         condition: service_healthy
@@ -77,8 +91,15 @@ services:
       NAS_ROOT: /nas
       WORK_ROOT: /work
     volumes:
-      - nas_data:/nas
-      - work_data:/work
+      # Bind mounts (not named volumes): NAS_ROOT/WORK_ROOT stay the same
+      # host folder whether the API/worker run natively (uv run uvicorn,
+      # NAS_ROOT=./nas_data) or via this compose file — a named volume here
+      # would silently diverge into a second, container-only copy the moment
+      # someone switches between the two, which is exactly the class of bug
+      # this comment exists to prevent regressing (assets created one way
+      # become invisible/404 the other way).
+      - ./nas_data:/nas
+      - ./work_data:/work
     depends_on:
       postgres:
         condition: service_healthy
@@ -99,7 +120,16 @@ services:
       redis:
         condition: service_healthy
 
+  frontend:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      - api
+
 volumes:
   postgres_data:
-  nas_data:
-  work_data:
+  # nas_data/work_data are bind mounts (./nas_data, ./work_data), not named
+  # volumes — see the api/worker service definitions above.

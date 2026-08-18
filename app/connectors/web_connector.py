@@ -26,6 +26,8 @@ import csv
 import hashlib
 import json
 import logging
+import subprocess
+import sys
 import urllib.robotparser
 from collections.abc import Iterator
 from pathlib import Path
@@ -50,6 +52,7 @@ _AI_OPTOUT_MARKERS = ("noai", "noimageai")
 _MIN_BYTES = 2_000  # rejects near-empty/placeholder responses
 _MAX_BYTES = 25_000_000
 _ROBOTS_CACHE: dict[str, urllib.robotparser.RobotFileParser] = {}
+_IMG2DATASET_TIMEOUT_S = 600
 
 
 def _robots_allowed(url: str) -> bool:
@@ -165,8 +168,6 @@ class WebScrapeConnector:
         should_stop: ShouldStopFn,
         on_progress: OnProgressFn,
     ) -> Iterator[RawAssetDraft]:
-        from img2dataset import download as img2dataset_download
-
         if should_stop():
             raise JobStopped("should_stop() signalled before web shard download started")
 
@@ -183,25 +184,51 @@ class WebScrapeConnector:
                 writer.writerow([u])
 
         output_dir = shard_workdir / "output"
-        try:
-            img2dataset_download(
-                url_list=str(url_list_path),
-                output_folder=str(output_dir),
-                input_format="csv",
-                url_col="url",
-                output_format="files",
-                thread_count=8,
-                resize_mode="no",
-                encode_format="jpg",
-            )
-        except Exception as e:
-            raise TransientConnectorError(f"img2dataset failed for shard {shard_id}: {e}")
+        self._run_img2dataset(url_list_path, output_dir, shard_id)
 
         if should_stop():
             on_progress({"checkpoint": {}})
             raise JobStopped("should_stop() signalled after web shard download")
 
         yield from self._walk_output(output_dir, item.dataset_identifier or "", on_progress)
+
+    @staticmethod
+    def _run_img2dataset(url_list_path: Path, output_dir: Path, shard_id: str) -> None:
+        """Runs img2dataset as a subprocess rather than calling `download()`
+        in-process. img2dataset always spawns a `multiprocessing.Pool`
+        internally (even with processes_count=1 — see
+        img2dataset.distributor.multiprocessing_distributor), and Celery's
+        prefork pool workers are themselves daemonic child processes, which
+        Python's multiprocessing refuses to let spawn further children
+        ("daemonic processes are not allowed to have children"). Running
+        img2dataset in its own OS process via subprocess sidesteps that
+        restriction entirely, since it's no longer a multiprocessing.Process
+        child of the (daemonic) Celery worker.
+        """
+        cmd = [
+            sys.executable,
+            "-m",
+            "img2dataset.main",
+            f"--url_list={url_list_path}",
+            f"--output_folder={output_dir}",
+            "--input_format=csv",
+            "--url_col=url",
+            "--output_format=files",
+            "--thread_count=8",
+            "--resize_mode=no",
+            "--encode_format=jpg",
+        ]
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=_IMG2DATASET_TIMEOUT_S, check=False
+            )
+        except subprocess.TimeoutExpired as e:
+            raise TransientConnectorError(
+                f"img2dataset timed out after {_IMG2DATASET_TIMEOUT_S}s for shard {shard_id}"
+            ) from e
+        if result.returncode != 0:
+            tail = "\n".join(result.stderr.strip().splitlines()[-20:])
+            raise TransientConnectorError(f"img2dataset failed for shard {shard_id} (exit {result.returncode}): {tail}")
 
     def _walk_output(self, output_dir: Path, query: str, on_progress: OnProgressFn) -> Iterator[RawAssetDraft]:
         from PIL import Image

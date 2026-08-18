@@ -6,7 +6,7 @@
 FROM python:3.13-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ffmpeg curl unzip ca-certificates \
+        ffmpeg curl unzip ca-certificates git \
     && rm -rf /var/lib/apt/lists/*
 
 RUN curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh
@@ -21,4 +21,10 @@ RUN uv sync --no-dev || uv pip install --system -e .
 
 COPY app ./app
 
-CMD ["uv", "run", "celery", "-A", "app.tasks.celery_app", "worker", "--loglevel=info", "--concurrency=4"]
+# -Q is required: task_routes (app/tasks/celery_app.py) sends every real task
+# to a named queue (discovery/download/standardize/cleanup/orchestration/
+# filtering/export), not the "celery" default — a worker started without an
+# explicit -Q only consumes "celery" and silently never picks up any actual
+# work, which is exactly the bug this comment is here to prevent regressing.
+CMD ["uv", "run", "celery", "-A", "app.tasks.celery_app", "worker", "--loglevel=info", "--concurrency=4", \
+     "-Q", "celery,discovery,download,standardize,cleanup,orchestration,filtering,export"]

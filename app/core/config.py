@@ -29,6 +29,13 @@ class Settings(BaseSettings):
     # Comma-separated list of valid API keys. Any one of them is accepted.
     api_keys: str = "dev-local-key"
 
+    # -- CORS --------------------------------------------------------------------
+    # Comma-separated list of allowed frontend origins. Only needed when the
+    # frontend is served from a different origin than the API with no reverse
+    # proxy in front of both (a same-origin dev proxy or prod nginx setup never
+    # triggers CORS at all — see frontend/vite.config.ts and docker/nginx.frontend.conf).
+    cors_allowed_origins: str = "http://localhost:5173"
+
     # -- Credential encryption -----------------------------------------------------
     # Fernet key (32 url-safe base64-encoded bytes). Generate with:
     #   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
@@ -48,6 +55,10 @@ class Settings(BaseSettings):
     @property
     def api_key_set(self) -> set[str]:
         return {k.strip() for k in self.api_keys.split(",") if k.strip()}
+
+    @property
+    def cors_allowed_origins_list(self) -> list[str]:
+        return [o.strip() for o in self.cors_allowed_origins.split(",") if o.strip()]
 
 
 @lru_cache

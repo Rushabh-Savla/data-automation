@@ -50,11 +50,13 @@ def discover_kaggle(self, job_id: str, job_source_task_id: str):
         task_repo.set_status(task_uuid, JobSourceTaskStatus.DISCOVERING)
 
         explicit_slugs: list[tuple[str, str]] = job.config.get("kaggle", {}).get("slugs", [])
+        discovery_error_reason: str | None = None
         if explicit_slugs:
             items = [{"slug": slug, "license": lic} for slug, lic in explicit_slugs]
         else:
             connector = KaggleConnector()
             page = connector.discover(job.query, cursor=None, limit=job.config.get("kaggle", {}).get("max_datasets", 5))
+            discovery_error_reason = page.error_reason
             items = [
                 {"slug": si.external_ref["slug"], "license": si.license_hint or "Unknown"}
                 for si in page.items
@@ -62,7 +64,9 @@ def discover_kaggle(self, job_id: str, job_source_task_id: str):
 
         if not items:
             task_repo.set_status(
-                task_uuid, JobSourceTaskStatus.COMPLETED_PARTIAL, error_message="No Kaggle datasets found for query"
+                task_uuid,
+                JobSourceTaskStatus.COMPLETED_PARTIAL,
+                error_message=discovery_error_reason or "No Kaggle datasets found for query",
             )
             db.commit()
             check_and_advance_job(job_id)
@@ -107,6 +111,7 @@ def discover_roboflow(self, job_id: str, job_source_task_id: str):
 
         rf_config = job.config.get("roboflow", {})
         explicit_projects: list[list] = rf_config.get("projects", [])
+        discovery_error_reason: str | None = None
         if explicit_projects:
             items = [
                 {"workspace": ws, "project": proj, "version": ver, "license": lic}
@@ -116,6 +121,7 @@ def discover_roboflow(self, job_id: str, job_source_task_id: str):
             credentials = CredentialService(CredentialRepository(db)).resolve(SourceType.ROBOFLOW)
             connector = RoboflowConnector(api_key=credentials.get("ROBOFLOW_API_KEY", ""))
             page = connector.discover(job.query, cursor=None, limit=rf_config.get("max_projects", 5))
+            discovery_error_reason = page.error_reason
             items = [
                 {
                     "workspace": si.external_ref["workspace"],
@@ -128,7 +134,9 @@ def discover_roboflow(self, job_id: str, job_source_task_id: str):
 
         if not items:
             task_repo.set_status(
-                task_uuid, JobSourceTaskStatus.COMPLETED_PARTIAL, error_message="No Roboflow projects found for query"
+                task_uuid,
+                JobSourceTaskStatus.COMPLETED_PARTIAL,
+                error_message=discovery_error_reason or "No Roboflow projects found for query",
             )
             db.commit()
             check_and_advance_job(job_id)
@@ -173,6 +181,7 @@ def discover_youtube(self, job_id: str, job_source_task_id: str):
 
         yt_config = job.config.get("youtube", {})
         explicit_urls: list[str] = yt_config.get("urls", [])
+        discovery_error_reason: str | None = None
         if explicit_urls:
             items = [{"url": u, "video_id": _video_id_from_url(u), "license": "unknown"} for u in explicit_urls]
         else:
@@ -182,6 +191,7 @@ def discover_youtube(self, job_id: str, job_source_task_id: str):
                 job.query, cursor=None, limit=yt_config.get("max_videos", 5),
                 api_key=credentials.get("YOUTUBE_API_KEY", ""),
             )
+            discovery_error_reason = page.error_reason
             items = [
                 {
                     "url": si.external_ref["url"],
@@ -193,7 +203,9 @@ def discover_youtube(self, job_id: str, job_source_task_id: str):
 
         if not items:
             task_repo.set_status(
-                task_uuid, JobSourceTaskStatus.COMPLETED_PARTIAL, error_message="No YouTube videos found for query"
+                task_uuid,
+                JobSourceTaskStatus.COMPLETED_PARTIAL,
+                error_message=discovery_error_reason or "No YouTube videos found for query",
             )
             db.commit()
             check_and_advance_job(job_id)
@@ -249,7 +261,9 @@ def discover_web(self, job_id: str, job_source_task_id: str):
 
         if not shards:
             task_repo.set_status(
-                task_uuid, JobSourceTaskStatus.COMPLETED_PARTIAL, error_message="No web images found for query"
+                task_uuid,
+                JobSourceTaskStatus.COMPLETED_PARTIAL,
+                error_message=page.error_reason or "No web images found for query",
             )
             db.commit()
             check_and_advance_job(job_id)
