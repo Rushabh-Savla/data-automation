@@ -19,8 +19,12 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 
 from app.connectors.base import RawAssetDraft, SourceItem
+from app.connectors.coco_connector import CocoConnector
 from app.connectors.kaggle_connector import KaggleConnector
+from app.connectors.open_images_connector import OpenImagesConnector
+from app.connectors.pascal_voc_connector import PascalVocConnector
 from app.connectors.roboflow_connector import RoboflowConnector
+from app.connectors.visual_genome_connector import VisualGenomeConnector
 from app.connectors.web_connector import WebScrapeConnector
 from app.connectors.youtube_connector import YouTubeConnector
 from app.core.config import get_settings
@@ -252,3 +256,135 @@ def download_web_batch(self, job_id: str, job_source_task_id: str, item_dict: di
         yield from connector.fetch(item, workdir, checkpoint, should_stop, on_progress)
 
     return _run_item_download(job_id, job_source_task_id, SourceType.WEB, shard_id, fetch)
+
+
+@celery_app.task(
+    name="app.tasks.ingest_tasks.download_coco_shard",
+    bind=True,
+    autoretry_for=(TransientConnectorError, ConnectionError, TimeoutError),
+    retry_backoff=True,
+    retry_backoff_max=600,
+    retry_jitter=True,
+    max_retries=5,
+)
+def download_coco_shard(self, job_id: str, job_source_task_id: str, item_dict: dict):
+    settings = get_settings()
+    item = SourceItem(
+        source_type=SourceType.COCO,
+        external_ref=item_dict["external_ref"],
+        license_hint=item_dict.get("license_hint"),
+        dataset_identifier=item_dict.get("dataset_identifier"),
+    )
+    shard_id = hashlib.md5(str(item.external_ref["image_ids"]).encode()).hexdigest()[:12]
+    workdir = settings.work_root / job_source_task_id
+    workdir.mkdir(parents=True, exist_ok=True)
+
+    with session_scope() as db:
+        task = JobSourceTaskRepository(db).get(uuid.UUID(job_source_task_id))
+        min_res = tuple(task.job.config.get("min_resolution", (64, 64))) if task and task.job else (64, 64)
+
+    connector = CocoConnector(min_resolution=min_res, split=item.external_ref.get("split", "val2017"))
+
+    def fetch(checkpoint, should_stop, on_progress):
+        yield from connector.fetch(item, workdir, checkpoint, should_stop, on_progress)
+
+    return _run_item_download(job_id, job_source_task_id, SourceType.COCO, shard_id, fetch)
+
+
+@celery_app.task(
+    name="app.tasks.ingest_tasks.download_open_images_shard",
+    bind=True,
+    autoretry_for=(TransientConnectorError, ConnectionError, TimeoutError),
+    retry_backoff=True,
+    retry_backoff_max=600,
+    retry_jitter=True,
+    max_retries=5,
+)
+def download_open_images_shard(self, job_id: str, job_source_task_id: str, item_dict: dict):
+    settings = get_settings()
+    item = SourceItem(
+        source_type=SourceType.OPEN_IMAGES,
+        external_ref=item_dict["external_ref"],
+        license_hint=item_dict.get("license_hint"),
+        dataset_identifier=item_dict.get("dataset_identifier"),
+    )
+    shard_id = hashlib.md5(str(item.external_ref["image_ids"]).encode()).hexdigest()[:12]
+    workdir = settings.work_root / job_source_task_id
+    workdir.mkdir(parents=True, exist_ok=True)
+
+    with session_scope() as db:
+        task = JobSourceTaskRepository(db).get(uuid.UUID(job_source_task_id))
+        min_res = tuple(task.job.config.get("min_resolution", (64, 64))) if task and task.job else (64, 64)
+
+    connector = OpenImagesConnector(min_resolution=min_res, split=item.external_ref.get("split", "validation"))
+
+    def fetch(checkpoint, should_stop, on_progress):
+        yield from connector.fetch(item, workdir, checkpoint, should_stop, on_progress)
+
+    return _run_item_download(job_id, job_source_task_id, SourceType.OPEN_IMAGES, shard_id, fetch)
+
+
+@celery_app.task(
+    name="app.tasks.ingest_tasks.download_pascal_voc_shard",
+    bind=True,
+    autoretry_for=(TransientConnectorError, ConnectionError, TimeoutError),
+    retry_backoff=True,
+    retry_backoff_max=600,
+    retry_jitter=True,
+    max_retries=5,
+)
+def download_pascal_voc_shard(self, job_id: str, job_source_task_id: str, item_dict: dict):
+    settings = get_settings()
+    item = SourceItem(
+        source_type=SourceType.PASCAL_VOC,
+        external_ref=item_dict["external_ref"],
+        license_hint=item_dict.get("license_hint"),
+        dataset_identifier=item_dict.get("dataset_identifier"),
+    )
+    shard_id = hashlib.md5(str(item.external_ref["image_ids"]).encode()).hexdigest()[:12]
+    workdir = settings.work_root / job_source_task_id
+    workdir.mkdir(parents=True, exist_ok=True)
+
+    with session_scope() as db:
+        task = JobSourceTaskRepository(db).get(uuid.UUID(job_source_task_id))
+        min_res = tuple(task.job.config.get("min_resolution", (64, 64))) if task and task.job else (64, 64)
+
+    connector = PascalVocConnector(min_resolution=min_res)
+
+    def fetch(checkpoint, should_stop, on_progress):
+        yield from connector.fetch(item, workdir, checkpoint, should_stop, on_progress)
+
+    return _run_item_download(job_id, job_source_task_id, SourceType.PASCAL_VOC, shard_id, fetch)
+
+
+@celery_app.task(
+    name="app.tasks.ingest_tasks.download_visual_genome_shard",
+    bind=True,
+    autoretry_for=(TransientConnectorError, ConnectionError, TimeoutError),
+    retry_backoff=True,
+    retry_backoff_max=600,
+    retry_jitter=True,
+    max_retries=5,
+)
+def download_visual_genome_shard(self, job_id: str, job_source_task_id: str, item_dict: dict):
+    settings = get_settings()
+    item = SourceItem(
+        source_type=SourceType.VISUAL_GENOME,
+        external_ref=item_dict["external_ref"],
+        license_hint=item_dict.get("license_hint"),
+        dataset_identifier=item_dict.get("dataset_identifier"),
+    )
+    shard_id = hashlib.md5(str(item.external_ref["image_ids"]).encode()).hexdigest()[:12]
+    workdir = settings.work_root / job_source_task_id
+    workdir.mkdir(parents=True, exist_ok=True)
+
+    with session_scope() as db:
+        task = JobSourceTaskRepository(db).get(uuid.UUID(job_source_task_id))
+        min_res = tuple(task.job.config.get("min_resolution", (64, 64))) if task and task.job else (64, 64)
+
+    connector = VisualGenomeConnector(min_resolution=min_res)
+
+    def fetch(checkpoint, should_stop, on_progress):
+        yield from connector.fetch(item, workdir, checkpoint, should_stop, on_progress)
+
+    return _run_item_download(job_id, job_source_task_id, SourceType.VISUAL_GENOME, shard_id, fetch)

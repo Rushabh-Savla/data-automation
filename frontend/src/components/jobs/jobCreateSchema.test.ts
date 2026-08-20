@@ -129,6 +129,38 @@ describe('buildConfigPayload', () => {
     const config = buildConfigPayload({ ...jobCreateDefaultValues, dedupHammingThreshold: 'abc' })
     expect(config.dedup_hamming_threshold).toBeUndefined()
   })
+
+  it('parses explicit coco category overrides, dropping blank rows', () => {
+    const config = buildConfigPayload({
+      ...jobCreateDefaultValues,
+      cocoCategories: [{ category: 'dog' }, { category: '  ' }, { category: 'car' }],
+    })
+    expect(config.coco?.categories).toEqual(['dog', 'car'])
+  })
+
+  it('parses explicit open images class overrides, dropping blank rows', () => {
+    const config = buildConfigPayload({
+      ...jobCreateDefaultValues,
+      openImagesClasses: [{ className: 'Dog' }, { className: '' }],
+    })
+    expect(config.open_images?.classes).toEqual(['Dog'])
+  })
+
+  it('parses explicit pascal voc category overrides, dropping blank rows', () => {
+    const config = buildConfigPayload({
+      ...jobCreateDefaultValues,
+      pascalVocCategories: [{ category: 'person' }, { category: '' }],
+    })
+    expect(config.pascal_voc?.categories).toEqual(['person'])
+  })
+
+  it('parses explicit visual genome object-name overrides, dropping blank rows', () => {
+    const config = buildConfigPayload({
+      ...jobCreateDefaultValues,
+      visualGenomeCategories: [{ category: 'sidewalk' }, { category: '' }],
+    })
+    expect(config.visual_genome?.categories).toEqual(['sidewalk'])
+  })
 })
 
 describe('buildJobCreatePayload', () => {

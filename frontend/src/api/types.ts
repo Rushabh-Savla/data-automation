@@ -10,7 +10,15 @@ export interface PageResponse<T> {
   offset: number
 }
 
-export type SourceType = 'roboflow' | 'kaggle' | 'youtube' | 'web'
+export type SourceType =
+  | 'roboflow'
+  | 'kaggle'
+  | 'youtube'
+  | 'web'
+  | 'coco'
+  | 'open_images'
+  | 'pascal_voc'
+  | 'visual_genome'
 
 export type JobStatus =
   | 'draft'
@@ -102,11 +110,38 @@ export interface WebConfig {
   safesearch?: string
 }
 
+export interface CocoConfig {
+  max_images?: number
+  categories?: string[]
+  split?: string
+  allow_train2017?: boolean
+}
+
+export interface OpenImagesConfig {
+  max_samples?: number
+  classes?: string[]
+  split?: string
+}
+
+export interface PascalVocConfig {
+  max_images?: number
+  categories?: string[]
+}
+
+export interface VisualGenomeConfig {
+  max_images?: number
+  categories?: string[]
+}
+
 export interface JobConfig {
   roboflow?: RoboflowConfig
   kaggle?: KaggleConfig
   youtube?: YoutubeConfig
   web?: WebConfig
+  coco?: CocoConfig
+  open_images?: OpenImagesConfig
+  pascal_voc?: PascalVocConfig
+  visual_genome?: VisualGenomeConfig
   min_resolution?: [width: number, height: number]
   yolo_world_conf_threshold?: number
   dedup_hamming_threshold?: number

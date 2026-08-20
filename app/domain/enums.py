@@ -8,6 +8,10 @@ class SourceType(str, enum.Enum):
     KAGGLE = "kaggle"
     YOUTUBE = "youtube"
     WEB = "web"
+    COCO = "coco"
+    OPEN_IMAGES = "open_images"
+    PASCAL_VOC = "pascal_voc"
+    VISUAL_GENOME = "visual_genome"
 
 
 class JobStatus(str, enum.Enum):

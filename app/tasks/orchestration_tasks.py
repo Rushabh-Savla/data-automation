@@ -267,5 +267,21 @@ def _resume_task(job_id: str, job_source_task_id: str, source_type, checkpoint: 
         from app.tasks.discovery_tasks import discover_kaggle
 
         discover_kaggle.delay(job_id, job_source_task_id)
+    elif source_type == SourceType.COCO:
+        from app.tasks.discovery_tasks import discover_coco
+
+        discover_coco.delay(job_id, job_source_task_id)
+    elif source_type == SourceType.OPEN_IMAGES:
+        from app.tasks.discovery_tasks import discover_open_images
+
+        discover_open_images.delay(job_id, job_source_task_id)
+    elif source_type == SourceType.PASCAL_VOC:
+        from app.tasks.discovery_tasks import discover_pascal_voc
+
+        discover_pascal_voc.delay(job_id, job_source_task_id)
+    elif source_type == SourceType.VISUAL_GENOME:
+        from app.tasks.discovery_tasks import discover_visual_genome
+
+        discover_visual_genome.delay(job_id, job_source_task_id)
     else:
         logger.warning(f"Watchdog: no resume handler yet for source_type={source_type}")

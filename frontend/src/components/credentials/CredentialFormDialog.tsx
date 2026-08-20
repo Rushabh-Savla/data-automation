@@ -24,6 +24,10 @@ const SOURCE_KEY_HINTS: Record<SourceType, string[]> = {
   kaggle: ['KAGGLE_USERNAME', 'KAGGLE_KEY'],
   youtube: ['YOUTUBE_API_KEY'],
   web: [],
+  coco: [],
+  open_images: [],
+  pascal_voc: [],
+  visual_genome: [],
 }
 
 interface CredentialFormDialogProps {

@@ -20,7 +20,7 @@ export const jobCreateSchema = z
     name: z.string().optional(),
 
     useAutoSources: z.boolean(),
-    sources: z.array(z.enum(['roboflow', 'kaggle', 'youtube', 'web'])),
+    sources: z.array(z.enum(['roboflow', 'kaggle', 'youtube', 'web', 'coco', 'open_images', 'pascal_voc', 'visual_genome'])),
 
     targetCountEnabled: z.boolean(),
     // Controlled directly via TargetDeadlinePicker's onChange (already
@@ -57,6 +57,18 @@ export const jobCreateSchema = z
 
     webMaxResults: optionalNumberString,
     webSafesearch: z.string().optional(),
+
+    cocoMaxImages: optionalNumberString,
+    cocoCategories: z.array(z.object({ category: z.string() })).optional(),
+
+    openImagesMaxSamples: optionalNumberString,
+    openImagesClasses: z.array(z.object({ className: z.string() })).optional(),
+
+    pascalVocMaxImages: optionalNumberString,
+    pascalVocCategories: z.array(z.object({ category: z.string() })).optional(),
+
+    visualGenomeMaxImages: optionalNumberString,
+    visualGenomeCategories: z.array(z.object({ category: z.string() })).optional(),
 
     minWidth: optionalNumberString,
     minHeight: optionalNumberString,
@@ -117,6 +129,14 @@ export const jobCreateDefaultValues: JobCreateFormValues = {
   youtubeUrls: [],
   webMaxResults: undefined,
   webSafesearch: undefined,
+  cocoMaxImages: undefined,
+  cocoCategories: [],
+  openImagesMaxSamples: undefined,
+  openImagesClasses: [],
+  pascalVocMaxImages: undefined,
+  pascalVocCategories: [],
+  visualGenomeMaxImages: undefined,
+  visualGenomeCategories: [],
   minWidth: undefined,
   minHeight: undefined,
   yoloWorldConfThreshold: undefined,
@@ -173,6 +193,36 @@ export function buildConfigPayload(values: JobCreateFormValues): JobConfig {
   if (webMaxResults) web.max_results = webMaxResults
   if (values.webSafesearch) web.safesearch = values.webSafesearch
   if (Object.keys(web).length) config.web = web
+
+  const coco: JobConfig['coco'] = {}
+  const cocoMaxImages = toNumber(values.cocoMaxImages)
+  if (cocoMaxImages) coco.max_images = cocoMaxImages
+  const validCocoCategories = (values.cocoCategories ?? []).map((c) => c.category.trim()).filter((c) => c !== '')
+  if (validCocoCategories.length) coco.categories = validCocoCategories
+  if (Object.keys(coco).length) config.coco = coco
+
+  const openImages: JobConfig['open_images'] = {}
+  const openImagesMaxSamples = toNumber(values.openImagesMaxSamples)
+  if (openImagesMaxSamples) openImages.max_samples = openImagesMaxSamples
+  const validClasses = (values.openImagesClasses ?? []).map((c) => c.className.trim()).filter((c) => c !== '')
+  if (validClasses.length) openImages.classes = validClasses
+  if (Object.keys(openImages).length) config.open_images = openImages
+
+  const pascalVoc: JobConfig['pascal_voc'] = {}
+  const pascalVocMaxImages = toNumber(values.pascalVocMaxImages)
+  if (pascalVocMaxImages) pascalVoc.max_images = pascalVocMaxImages
+  const validVocCategories = (values.pascalVocCategories ?? []).map((c) => c.category.trim()).filter((c) => c !== '')
+  if (validVocCategories.length) pascalVoc.categories = validVocCategories
+  if (Object.keys(pascalVoc).length) config.pascal_voc = pascalVoc
+
+  const visualGenome: JobConfig['visual_genome'] = {}
+  const visualGenomeMaxImages = toNumber(values.visualGenomeMaxImages)
+  if (visualGenomeMaxImages) visualGenome.max_images = visualGenomeMaxImages
+  const validVgCategories = (values.visualGenomeCategories ?? [])
+    .map((c) => c.category.trim())
+    .filter((c) => c !== '')
+  if (validVgCategories.length) visualGenome.categories = validVgCategories
+  if (Object.keys(visualGenome).length) config.visual_genome = visualGenome
 
   const minWidth = toNumber(values.minWidth)
   const minHeight = toNumber(values.minHeight)

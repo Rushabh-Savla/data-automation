@@ -26,6 +26,10 @@ _SOURCE_ENV_KEYS: dict[SourceType, dict[str, str]] = {
     },
     SourceType.YOUTUBE: {"YOUTUBE_API_KEY": "youtube_api_key"},
     SourceType.WEB: {},
+    SourceType.COCO: {},
+    SourceType.OPEN_IMAGES: {},
+    SourceType.PASCAL_VOC: {},
+    SourceType.VISUAL_GENOME: {},
 }
 
 

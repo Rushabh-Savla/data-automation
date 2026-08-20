@@ -10,8 +10,12 @@ import uuid
 
 from celery import chord
 
+from app.connectors.coco_connector import CocoConnector
 from app.connectors.kaggle_connector import KaggleConnector
+from app.connectors.open_images_connector import OpenImagesConnector
+from app.connectors.pascal_voc_connector import PascalVocConnector
 from app.connectors.roboflow_connector import RoboflowConnector
+from app.connectors.visual_genome_connector import VisualGenomeConnector
 from app.connectors.web_connector import WebScrapeConnector
 from app.connectors.youtube_connector import YouTubeConnector
 from app.db.repositories.credential_repository import CredentialRepository
@@ -23,8 +27,12 @@ from app.services.job_service import register_source_discovery_task
 from app.tasks._helpers import bind_context, unbind_context
 from app.tasks.celery_app import celery_app
 from app.tasks.ingest_tasks import (
+    download_coco_shard,
     download_kaggle_dataset,
+    download_open_images_shard,
+    download_pascal_voc_shard,
     download_roboflow_item,
+    download_visual_genome_shard,
     download_web_batch,
     download_youtube_video,
 )
@@ -289,3 +297,238 @@ def discover_web(self, job_id: str, job_source_task_id: str):
 
 
 register_source_discovery_task(SourceType.WEB, "app.tasks.discovery_tasks.discover_web")
+
+
+@celery_app.task(name="app.tasks.discovery_tasks.discover_coco", bind=True)
+def discover_coco(self, job_id: str, job_source_task_id: str):
+    job_uuid = uuid.UUID(job_id)
+    task_uuid = uuid.UUID(job_source_task_id)
+    bind_context(job_uuid, task_uuid)
+
+    with session_scope() as db:
+        task_repo = JobSourceTaskRepository(db)
+        task = task_repo.get(task_uuid)
+        if task is None:
+            unbind_context()
+            return
+
+        job = task.job
+        task_repo.set_status(task_uuid, JobSourceTaskStatus.DISCOVERING)
+
+        coco_config = job.config.get("coco", {})
+        connector = CocoConnector(
+            split=coco_config.get("split", "val2017"),
+            allow_train2017=coco_config.get("allow_train2017", False),
+        )
+        page = connector.discover(
+            job.query,
+            cursor=None,
+            limit=coco_config.get("max_images", 200),
+            explicit_categories=coco_config.get("categories"),
+        )
+        shards = page.items
+
+        if not shards:
+            task_repo.set_status(
+                task_uuid,
+                JobSourceTaskStatus.COMPLETED_PARTIAL,
+                error_message=page.error_reason or "No COCO images found for query",
+            )
+            db.commit()
+            check_and_advance_job(job_id)
+            unbind_context()
+            return
+
+        total_images = sum(len(s.external_ref["image_ids"]) for s in shards)
+        task_repo.increment_counts(task_uuid, discovered=total_images)
+        db.flush()
+
+    item_dicts = [
+        {
+            "external_ref": {"image_ids": s.external_ref["image_ids"], "split": s.external_ref["split"]},
+            "license_hint": None,
+            "dataset_identifier": s.dataset_identifier,
+        }
+        for s in shards
+    ]
+
+    download_group = [download_coco_shard.s(job_id, job_source_task_id, item) for item in item_dicts]
+    chord(download_group)(on_source_finished.s(job_id, job_source_task_id))
+    unbind_context()
+
+
+register_source_discovery_task(SourceType.COCO, "app.tasks.discovery_tasks.discover_coco")
+
+
+@celery_app.task(name="app.tasks.discovery_tasks.discover_open_images", bind=True)
+def discover_open_images(self, job_id: str, job_source_task_id: str):
+    job_uuid = uuid.UUID(job_id)
+    task_uuid = uuid.UUID(job_source_task_id)
+    bind_context(job_uuid, task_uuid)
+
+    with session_scope() as db:
+        task_repo = JobSourceTaskRepository(db)
+        task = task_repo.get(task_uuid)
+        if task is None:
+            unbind_context()
+            return
+
+        job = task.job
+        task_repo.set_status(task_uuid, JobSourceTaskStatus.DISCOVERING)
+
+        oi_config = job.config.get("open_images", {})
+        connector = OpenImagesConnector(split=oi_config.get("split", "validation"))
+        page = connector.discover(
+            job.query,
+            cursor=None,
+            limit=oi_config.get("max_samples", 200),
+            explicit_classes=oi_config.get("classes"),
+        )
+        shards = page.items
+
+        if not shards:
+            task_repo.set_status(
+                task_uuid,
+                JobSourceTaskStatus.COMPLETED_PARTIAL,
+                error_message=page.error_reason or "No Open Images samples found for query",
+            )
+            db.commit()
+            check_and_advance_job(job_id)
+            unbind_context()
+            return
+
+        total_images = sum(len(s.external_ref["image_ids"]) for s in shards)
+        task_repo.increment_counts(task_uuid, discovered=total_images)
+        db.flush()
+
+    item_dicts = [
+        {
+            "external_ref": s.external_ref,
+            "license_hint": s.license_hint,
+            "dataset_identifier": s.dataset_identifier,
+        }
+        for s in shards
+    ]
+
+    download_group = [download_open_images_shard.s(job_id, job_source_task_id, item) for item in item_dicts]
+    chord(download_group)(on_source_finished.s(job_id, job_source_task_id))
+    unbind_context()
+
+
+register_source_discovery_task(SourceType.OPEN_IMAGES, "app.tasks.discovery_tasks.discover_open_images")
+
+
+@celery_app.task(name="app.tasks.discovery_tasks.discover_pascal_voc", bind=True)
+def discover_pascal_voc(self, job_id: str, job_source_task_id: str):
+    job_uuid = uuid.UUID(job_id)
+    task_uuid = uuid.UUID(job_source_task_id)
+    bind_context(job_uuid, task_uuid)
+
+    with session_scope() as db:
+        task_repo = JobSourceTaskRepository(db)
+        task = task_repo.get(task_uuid)
+        if task is None:
+            unbind_context()
+            return
+
+        job = task.job
+        task_repo.set_status(task_uuid, JobSourceTaskStatus.DISCOVERING)
+
+        voc_config = job.config.get("pascal_voc", {})
+        connector = PascalVocConnector()
+        page = connector.discover(
+            job.query,
+            cursor=None,
+            limit=voc_config.get("max_images", 200),
+            explicit_categories=voc_config.get("categories"),
+        )
+        shards = page.items
+
+        if not shards:
+            task_repo.set_status(
+                task_uuid,
+                JobSourceTaskStatus.COMPLETED_PARTIAL,
+                error_message=page.error_reason or "No Pascal VOC images found for query",
+            )
+            db.commit()
+            check_and_advance_job(job_id)
+            unbind_context()
+            return
+
+        total_images = sum(len(s.external_ref["image_ids"]) for s in shards)
+        task_repo.increment_counts(task_uuid, discovered=total_images)
+        db.flush()
+
+    item_dicts = [
+        {
+            "external_ref": {"image_ids": s.external_ref["image_ids"]},
+            "license_hint": s.license_hint,
+            "dataset_identifier": s.dataset_identifier,
+        }
+        for s in shards
+    ]
+
+    download_group = [download_pascal_voc_shard.s(job_id, job_source_task_id, item) for item in item_dicts]
+    chord(download_group)(on_source_finished.s(job_id, job_source_task_id))
+    unbind_context()
+
+
+register_source_discovery_task(SourceType.PASCAL_VOC, "app.tasks.discovery_tasks.discover_pascal_voc")
+
+
+@celery_app.task(name="app.tasks.discovery_tasks.discover_visual_genome", bind=True)
+def discover_visual_genome(self, job_id: str, job_source_task_id: str):
+    job_uuid = uuid.UUID(job_id)
+    task_uuid = uuid.UUID(job_source_task_id)
+    bind_context(job_uuid, task_uuid)
+
+    with session_scope() as db:
+        task_repo = JobSourceTaskRepository(db)
+        task = task_repo.get(task_uuid)
+        if task is None:
+            unbind_context()
+            return
+
+        job = task.job
+        task_repo.set_status(task_uuid, JobSourceTaskStatus.DISCOVERING)
+
+        vg_config = job.config.get("visual_genome", {})
+        connector = VisualGenomeConnector()
+        page = connector.discover(
+            job.query,
+            cursor=None,
+            limit=vg_config.get("max_images", 200),
+            explicit_categories=vg_config.get("categories"),
+        )
+        shards = page.items
+
+        if not shards:
+            task_repo.set_status(
+                task_uuid,
+                JobSourceTaskStatus.COMPLETED_PARTIAL,
+                error_message=page.error_reason or "No Visual Genome images found for query",
+            )
+            db.commit()
+            check_and_advance_job(job_id)
+            unbind_context()
+            return
+
+        total_images = sum(len(s.external_ref["image_ids"]) for s in shards)
+        task_repo.increment_counts(task_uuid, discovered=total_images)
+        db.flush()
+
+    item_dicts = [
+        {
+            "external_ref": s.external_ref,
+            "license_hint": s.license_hint,
+            "dataset_identifier": s.dataset_identifier,
+        }
+        for s in shards
+    ]
+
+    download_group = [download_visual_genome_shard.s(job_id, job_source_task_id, item) for item in item_dicts]
+    chord(download_group)(on_source_finished.s(job_id, job_source_task_id))
+    unbind_context()
+
+
+register_source_discovery_task(SourceType.VISUAL_GENOME, "app.tasks.discovery_tasks.discover_visual_genome")

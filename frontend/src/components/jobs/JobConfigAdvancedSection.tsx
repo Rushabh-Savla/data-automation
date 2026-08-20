@@ -13,6 +13,10 @@ import { RoboflowConfigFields } from '@/components/jobs/RoboflowConfigFields'
 import { KaggleConfigFields } from '@/components/jobs/KaggleConfigFields'
 import { YoutubeConfigFields } from '@/components/jobs/YoutubeConfigFields'
 import { WebConfigFields } from '@/components/jobs/WebConfigFields'
+import { CocoConfigFields } from '@/components/jobs/CocoConfigFields'
+import { OpenImagesConfigFields } from '@/components/jobs/OpenImagesConfigFields'
+import { PascalVocConfigFields } from '@/components/jobs/PascalVocConfigFields'
+import { VisualGenomeConfigFields } from '@/components/jobs/VisualGenomeConfigFields'
 
 interface JobConfigAdvancedSectionProps {
   control: Control<JobCreateFormValues>
@@ -71,6 +75,50 @@ export function JobConfigAdvancedSection({ control, register, activeSources }: J
             </CardHeader>
             <CardContent className="p-0">
               <WebConfigFields control={control} register={register} />
+            </CardContent>
+          </Card>
+        )}
+
+        {activeSources.includes('coco') && (
+          <Card className="gap-2 p-4">
+            <CardHeader className="p-0">
+              <CardTitle className="text-sm">COCO</CardTitle>
+            </CardHeader>
+            <CardContent className="p-0">
+              <CocoConfigFields control={control} register={register} />
+            </CardContent>
+          </Card>
+        )}
+
+        {activeSources.includes('open_images') && (
+          <Card className="gap-2 p-4">
+            <CardHeader className="p-0">
+              <CardTitle className="text-sm">Open Images</CardTitle>
+            </CardHeader>
+            <CardContent className="p-0">
+              <OpenImagesConfigFields control={control} register={register} />
+            </CardContent>
+          </Card>
+        )}
+
+        {activeSources.includes('pascal_voc') && (
+          <Card className="gap-2 p-4">
+            <CardHeader className="p-0">
+              <CardTitle className="text-sm">Pascal VOC</CardTitle>
+            </CardHeader>
+            <CardContent className="p-0">
+              <PascalVocConfigFields control={control} register={register} />
+            </CardContent>
+          </Card>
+        )}
+
+        {activeSources.includes('visual_genome') && (
+          <Card className="gap-2 p-4">
+            <CardHeader className="p-0">
+              <CardTitle className="text-sm">Visual Genome</CardTitle>
+            </CardHeader>
+            <CardContent className="p-0">
+              <VisualGenomeConfigFields control={control} register={register} />
             </CardContent>
           </Card>
         )}
