@@ -37,6 +37,7 @@ class AssetRepository:
                 file_format=asset.file_format,
                 checksum_sha256=asset.checksum_sha256,
                 phash=asset.phash,
+                embedding=asset.embedding,
                 nas_path=asset.nas_path,
                 annotation_format=asset.annotation_format,
                 annotation_nas_path=asset.annotation_nas_path,
@@ -140,7 +141,7 @@ class AssetRepository:
         stmt = select(Asset).where(
             Asset.job_id == job_id,
             Asset.status.in_([AssetStatus.PROMOTED, AssetStatus.RELEVANCE_PASSED]),
-            Asset.phash.is_not(None),
+            or_(Asset.phash.is_not(None), Asset.embedding.is_not(None)),
         )
         return list(self.db.execute(stmt).scalars().all())
 

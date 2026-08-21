@@ -15,7 +15,7 @@ from app.db.repositories.asset_repository import AssetRepository
 from app.db.repositories.job_repository import JobRepository
 from app.db.session import session_scope
 from app.domain.enums import AssetStatus, SourceType
-from app.filtering.dedup import PerceptualDeduplicator
+from app.filtering.dedup import HybridDeduplicator
 from app.filtering.yolo_world_filter import RelevanceFilter, derive_prompt_classes
 from app.services.progress_service import ProgressPublisher
 from app.core.redis_client import get_redis
@@ -92,9 +92,12 @@ def run_deduplication(self, job_id: str):
             return
 
         assets = asset_repo.list_for_dedup(job_uuid)
-        pairs = [(str(a.id), a.phash) for a in assets]
+        pairs = [(str(a.id), a.phash, a.embedding) for a in assets]
 
-        deduper = PerceptualDeduplicator(hamming_threshold=job.config.get("dedup_hamming_threshold", 5))
+        deduper = HybridDeduplicator(
+            hamming_threshold=job.config.get("dedup_hamming_threshold", 5),
+            cosine_threshold=job.config.get("dedup_cosine_threshold", 0.97),
+        )
         groups = deduper.find_duplicate_groups(pairs)
 
         duplicate_count = 0

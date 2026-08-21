@@ -39,6 +39,10 @@ class Asset(Base):
     file_format: Mapped[str | None] = mapped_column(String(16), nullable=True)
     checksum_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
     phash: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    # CLIP image embedding (512-dim, L2-normalized) — the additive "vector
+    # matching" signal for hybrid duplicate detection (app/filtering/dedup.py),
+    # alongside phash. Nullable: computation can legitimately fail/be skipped.
+    embedding: Mapped[list[float] | None] = mapped_column(JSONB, nullable=True)
 
     nas_path: Mapped[str | None] = mapped_column(Text, nullable=True)
     annotation_format: Mapped[AnnotationFormat] = mapped_column(

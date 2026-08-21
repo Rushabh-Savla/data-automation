@@ -173,6 +173,7 @@ export interface JobConfig {
   min_resolution?: [width: number, height: number]
   yolo_world_conf_threshold?: number
   dedup_hamming_threshold?: number
+  dedup_cosine_threshold?: number
 }
 
 // -- Jobs

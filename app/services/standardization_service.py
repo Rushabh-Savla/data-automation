@@ -6,6 +6,7 @@ to NAS + record provenance" happens, shared by every connector.
 import hashlib
 import uuid
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 
 from PIL import Image
@@ -22,6 +23,21 @@ Image.MAX_IMAGE_PIXELS = None  # suppress DecompressionBomb warnings on large da
 class AssetRejected(Exception):
     """Raised when a draft fails validation (corrupt, too small, etc.) —
     caller should count it toward JobSourceTask.rejected_count, not error_count."""
+
+
+@lru_cache(maxsize=1)
+def _load_clip_model(name: str = "ViT-B/32"):
+    """Lazily-loaded, process-wide CLIP model for standalone image-embedding
+    extraction — decoupled from YOLO-World's own internal CLIP text-encoder
+    (app/filtering/yolo_world_filter.py), which never exposes its embeddings
+    for application-level use."""
+    import clip
+    import torch
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model, preprocess = clip.load(name, device=device)
+    model.eval()
+    return model, preprocess, device
 
 
 class StandardizationService:
@@ -60,6 +76,7 @@ class StandardizationService:
         # cheap, already-open-the-file operation — avoids a second I/O pass
         # over every image later just to hash it.
         phash = self._compute_phash(draft.local_tmp_path)
+        embedding = self._compute_embedding(draft.local_tmp_path)
 
         asset = Asset(
             id=uuid.uuid4(),
@@ -76,6 +93,7 @@ class StandardizationService:
             file_format=draft.local_tmp_path.suffix.lstrip(".").lower(),
             checksum_sha256=checksum,
             phash=phash,
+            embedding=embedding,
             nas_path=nas_path,
             annotation_format=annotation_format,
             annotation_nas_path=annotation_nas_path,
@@ -109,6 +127,30 @@ class StandardizationService:
 
             with Image.open(path) as img:
                 return str(imagehash.phash(img))
+        except Exception:
+            return None
+
+    @staticmethod
+    def _compute_embedding(path: Path) -> list[float] | None:
+        """CLIP image embedding — the additive "vector matching" signal for
+        hybrid duplicate detection (app/filtering/dedup.py). Swallowed to
+        None on any failure (model load, corrupt image, OOM), exactly like
+        _compute_phash — a CLIP failure degrades that one asset to
+        phash-only dedup rather than failing standardization."""
+        try:
+            import torch
+            from PIL import Image
+
+            model, preprocess, device = _load_clip_model()
+            with Image.open(path) as img:
+                image_input = preprocess(img.convert("RGB")).unsqueeze(0).to(device)
+            with torch.no_grad():
+                features = model.encode_image(image_input)
+                # Pre-normalize so dedup's "cosine similarity" comparison is
+                # a plain dot product instead of re-normalizing at compare
+                # time on every pair.
+                features = features / features.norm(dim=-1, keepdim=True)
+            return features.squeeze(0).cpu().tolist()
         except Exception:
             return None
 

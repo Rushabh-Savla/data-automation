@@ -130,6 +130,14 @@ describe('buildConfigPayload', () => {
     expect(config.dedup_hamming_threshold).toBeUndefined()
   })
 
+  it('sets dedup_cosine_threshold only when provided', () => {
+    const untouched = buildConfigPayload(jobCreateDefaultValues)
+    expect(untouched.dedup_cosine_threshold).toBeUndefined()
+
+    const touched = buildConfigPayload({ ...jobCreateDefaultValues, dedupCosineThreshold: '0.95' })
+    expect(touched.dedup_cosine_threshold).toBe(0.95)
+  })
+
   it('parses explicit coco category overrides, dropping blank rows', () => {
     const config = buildConfigPayload({
       ...jobCreateDefaultValues,

@@ -197,13 +197,27 @@ export function JobConfigAdvancedSection({ control, register, activeSources }: J
                 />
               </div>
               <div className="flex flex-col gap-1.5">
-                <Label>Dedup sensitivity</Label>
+                <Label>Dedup sensitivity (hash)</Label>
                 <Input type="number" min={0} placeholder="5" {...register('dedupHammingThreshold')} />
+              </div>
+              <div className="flex flex-col gap-1.5">
+                <Label>Dedup sensitivity (vector)</Label>
+                <Input
+                  type="number"
+                  min={0}
+                  max={1}
+                  step={0.01}
+                  placeholder="0.97"
+                  {...register('dedupCosineThreshold')}
+                />
               </div>
             </div>
             <p className="text-xs text-muted-foreground">
               Leave width/height blank to use each source's own default — setting only one of the two
-              is ignored.
+              is ignored. Two duplicate-detection signals run together: a perceptual-hash match (exact
+              resizes/recompressions) or a CLIP embedding similarity match (the same photo cropped,
+              watermarked, or re-encoded differently across sources) — either one flags a pair as a
+              duplicate.
             </p>
           </CardContent>
         </Card>

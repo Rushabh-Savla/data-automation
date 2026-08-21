@@ -101,6 +101,7 @@ export const jobCreateSchema = z
     minHeight: optionalNumberString,
     yoloWorldConfThreshold: optionalNumberString,
     dedupHammingThreshold: optionalNumberString,
+    dedupCosineThreshold: optionalNumberString,
   })
   .superRefine((data, ctx) => {
     if (!data.targetCountEnabled && !data.deadlineEnabled) {
@@ -176,6 +177,7 @@ export const jobCreateDefaultValues: JobCreateFormValues = {
   minHeight: undefined,
   yoloWorldConfThreshold: undefined,
   dedupHammingThreshold: undefined,
+  dedupCosineThreshold: undefined,
 }
 
 function toNumber(value: string | undefined): number | undefined {
@@ -296,6 +298,9 @@ export function buildConfigPayload(values: JobCreateFormValues): JobConfig {
 
   const dedupHammingThreshold = toNumber(values.dedupHammingThreshold)
   if (dedupHammingThreshold !== undefined) config.dedup_hamming_threshold = dedupHammingThreshold
+
+  const dedupCosineThreshold = toNumber(values.dedupCosineThreshold)
+  if (dedupCosineThreshold !== undefined) config.dedup_cosine_threshold = dedupCosineThreshold
 
   return config
 }
