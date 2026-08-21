@@ -165,10 +165,18 @@ class CocoConnector:
 
     @staticmethod
     def _match_categories(query: str, categories: list[dict]) -> set[int]:
-        """Substring match (case-insensitive, prefer exact when multiple hit)
-        — ported from the reference script's COCOScraper.search_categories()."""
+        """Two-directional substring match (case-insensitive, prefer exact
+        when multiple hit) — same convention as every other connector added
+        this session (pascal_voc_connector.py, visual_genome_connector.py,
+        etc.). The reference script's original one-directional check
+        (`keyword in name`) missed plain plurals like "cats" not being a
+        substring of "cat", which a real job caught (query="cats" failed to
+        match COCO's "cat" category while every other source succeeded)."""
         keyword_lower = query.strip().lower()
-        matches = [cat for cat in categories if keyword_lower in cat["name"].lower()]
+        matches = [
+            cat for cat in categories
+            if keyword_lower in cat["name"].lower() or cat["name"].lower() in keyword_lower
+        ]
         if len(matches) > 1:
             exact = [c for c in matches if c["name"].lower() == keyword_lower]
             if exact:

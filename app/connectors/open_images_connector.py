@@ -164,10 +164,16 @@ class OpenImagesConnector:
 
     @staticmethod
     def _match_classes(query: str, descriptions: dict[str, str]) -> set[str]:
-        """Substring match (case-insensitive, prefer exact when multiple hit)
-        — ported from the reference script's OpenImagesScraper.search_categories()."""
+        """Two-directional substring match (case-insensitive, prefer exact
+        when multiple hit) — same convention as every other connector added
+        this session. The reference script's original one-directional check
+        (`keyword in name`) missed plain plurals like "cats" not being a
+        substring of "cat", which a real job caught."""
         keyword_lower = query.strip().lower()
-        matches = [(lid, name) for lid, name in descriptions.items() if keyword_lower in name.lower()]
+        matches = [
+            (lid, name) for lid, name in descriptions.items()
+            if keyword_lower in name.lower() or name.lower() in keyword_lower
+        ]
         if len(matches) > 1:
             exact = [(lid, name) for lid, name in matches if name.lower() == keyword_lower]
             if exact:

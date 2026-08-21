@@ -25,6 +25,13 @@ class TestMatchClasses:
         matched = OpenImagesConnector._match_classes("dog", _DESCRIPTIONS)
         assert matched == {"/m/0bt9lr"}
 
+    def test_matches_plural_query_against_singular_class(self):
+        # Real bug caught in production: a plural query failed to match a
+        # singular class name under the old one-directional-only substring
+        # check ("Dogs" is not a substring of "Dog").
+        matched = OpenImagesConnector._match_classes("dogs", _DESCRIPTIONS)
+        assert matched == {"/m/0bt9lr"}
+
     def test_no_match_returns_empty_set(self):
         matched = OpenImagesConnector._match_classes("xylophone", _DESCRIPTIONS)
         assert matched == set()

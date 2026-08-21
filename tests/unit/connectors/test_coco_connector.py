@@ -36,15 +36,20 @@ _FAKE_COCO_DATA = {
 
 class TestMatchCategories:
     def test_matches_single_word_category(self):
-        # One-directional substring match (query in category name), matching
-        # the reference script's COCOScraper.search_categories() exactly —
-        # "dogs" (plural) intentionally does NOT match "dog" here.
         matched = CocoConnector._match_categories("dog", _FAKE_COCO_DATA["categories"])
         assert matched == {18}
 
     def test_matches_multi_word_category_via_substring(self):
         matched = CocoConnector._match_categories("ball", _FAKE_COCO_DATA["categories"])
         assert matched == {37}
+
+    def test_matches_plural_query_against_singular_category(self):
+        # Real bug caught in production: query="cats" against COCO's "cat"
+        # category failed under the old one-directional-only substring
+        # check ("cats" is not a substring of "cat"). Reproduced here with
+        # the fixture's "dog" category via query="dogs".
+        matched = CocoConnector._match_categories("dogs", _FAKE_COCO_DATA["categories"])
+        assert matched == {18}
 
     def test_no_match_returns_empty_set(self):
         matched = CocoConnector._match_categories("xylophone", _FAKE_COCO_DATA["categories"])
