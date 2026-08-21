@@ -30,6 +30,10 @@ _SOURCE_ENV_KEYS: dict[SourceType, dict[str, str]] = {
     SourceType.OPEN_IMAGES: {},
     SourceType.PASCAL_VOC: {},
     SourceType.VISUAL_GENOME: {},
+    SourceType.DAVIS: {},
+    SourceType.SUN_RGBD: {},
+    SourceType.NUSCENES: {},
+    SourceType.KITTI: {},
 }
 
 

@@ -12,6 +12,10 @@ class SourceType(str, enum.Enum):
     OPEN_IMAGES = "open_images"
     PASCAL_VOC = "pascal_voc"
     VISUAL_GENOME = "visual_genome"
+    DAVIS = "davis"
+    SUN_RGBD = "sun_rgbd"
+    NUSCENES = "nuscenes"
+    KITTI = "kitti"
 
 
 class JobStatus(str, enum.Enum):

@@ -161,6 +161,38 @@ describe('buildConfigPayload', () => {
     })
     expect(config.visual_genome?.categories).toEqual(['sidewalk'])
   })
+
+  it('parses explicit davis sequence overrides, dropping blank rows', () => {
+    const config = buildConfigPayload({
+      ...jobCreateDefaultValues,
+      davisSequences: [{ sequence: 'dog' }, { sequence: '' }],
+    })
+    expect(config.davis?.sequences).toEqual(['dog'])
+  })
+
+  it('parses explicit sun rgbd category overrides, dropping blank rows', () => {
+    const config = buildConfigPayload({
+      ...jobCreateDefaultValues,
+      sunRgbdCategories: [{ category: 'chair' }, { category: '' }],
+    })
+    expect(config.sun_rgbd?.categories).toEqual(['chair'])
+  })
+
+  it('parses explicit nuscenes category overrides, dropping blank rows', () => {
+    const config = buildConfigPayload({
+      ...jobCreateDefaultValues,
+      nuscenesCategories: [{ category: 'vehicle.car' }, { category: '' }],
+    })
+    expect(config.nuscenes?.categories).toEqual(['vehicle.car'])
+  })
+
+  it('parses explicit kitti category overrides, dropping blank rows', () => {
+    const config = buildConfigPayload({
+      ...jobCreateDefaultValues,
+      kittiCategories: [{ category: 'Car' }, { category: '' }],
+    })
+    expect(config.kitti?.categories).toEqual(['Car'])
+  })
 })
 
 describe('buildJobCreatePayload', () => {

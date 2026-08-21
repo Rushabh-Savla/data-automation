@@ -17,6 +17,10 @@ import { CocoConfigFields } from '@/components/jobs/CocoConfigFields'
 import { OpenImagesConfigFields } from '@/components/jobs/OpenImagesConfigFields'
 import { PascalVocConfigFields } from '@/components/jobs/PascalVocConfigFields'
 import { VisualGenomeConfigFields } from '@/components/jobs/VisualGenomeConfigFields'
+import { DavisConfigFields } from '@/components/jobs/DavisConfigFields'
+import { SunRgbdConfigFields } from '@/components/jobs/SunRgbdConfigFields'
+import { NuscenesConfigFields } from '@/components/jobs/NuscenesConfigFields'
+import { KittiConfigFields } from '@/components/jobs/KittiConfigFields'
 
 interface JobConfigAdvancedSectionProps {
   control: Control<JobCreateFormValues>
@@ -119,6 +123,50 @@ export function JobConfigAdvancedSection({ control, register, activeSources }: J
             </CardHeader>
             <CardContent className="p-0">
               <VisualGenomeConfigFields control={control} register={register} />
+            </CardContent>
+          </Card>
+        )}
+
+        {activeSources.includes('davis') && (
+          <Card className="gap-2 p-4">
+            <CardHeader className="p-0">
+              <CardTitle className="text-sm">DAVIS 2017</CardTitle>
+            </CardHeader>
+            <CardContent className="p-0">
+              <DavisConfigFields control={control} register={register} />
+            </CardContent>
+          </Card>
+        )}
+
+        {activeSources.includes('sun_rgbd') && (
+          <Card className="gap-2 p-4">
+            <CardHeader className="p-0">
+              <CardTitle className="text-sm">SUN RGB-D</CardTitle>
+            </CardHeader>
+            <CardContent className="p-0">
+              <SunRgbdConfigFields control={control} register={register} />
+            </CardContent>
+          </Card>
+        )}
+
+        {activeSources.includes('nuscenes') && (
+          <Card className="gap-2 p-4">
+            <CardHeader className="p-0">
+              <CardTitle className="text-sm">nuScenes</CardTitle>
+            </CardHeader>
+            <CardContent className="p-0">
+              <NuscenesConfigFields control={control} register={register} />
+            </CardContent>
+          </Card>
+        )}
+
+        {activeSources.includes('kitti') && (
+          <Card className="gap-2 p-4">
+            <CardHeader className="p-0">
+              <CardTitle className="text-sm">KITTI</CardTitle>
+            </CardHeader>
+            <CardContent className="p-0">
+              <KittiConfigFields control={control} register={register} />
             </CardContent>
           </Card>
         )}

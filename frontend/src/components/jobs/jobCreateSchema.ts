@@ -20,7 +20,22 @@ export const jobCreateSchema = z
     name: z.string().optional(),
 
     useAutoSources: z.boolean(),
-    sources: z.array(z.enum(['roboflow', 'kaggle', 'youtube', 'web', 'coco', 'open_images', 'pascal_voc', 'visual_genome'])),
+    sources: z.array(
+      z.enum([
+        'roboflow',
+        'kaggle',
+        'youtube',
+        'web',
+        'coco',
+        'open_images',
+        'pascal_voc',
+        'visual_genome',
+        'davis',
+        'sun_rgbd',
+        'nuscenes',
+        'kitti',
+      ]),
+    ),
 
     targetCountEnabled: z.boolean(),
     // Controlled directly via TargetDeadlinePicker's onChange (already
@@ -69,6 +84,18 @@ export const jobCreateSchema = z
 
     visualGenomeMaxImages: optionalNumberString,
     visualGenomeCategories: z.array(z.object({ category: z.string() })).optional(),
+
+    davisMaxImages: optionalNumberString,
+    davisSequences: z.array(z.object({ sequence: z.string() })).optional(),
+
+    sunRgbdMaxImages: optionalNumberString,
+    sunRgbdCategories: z.array(z.object({ category: z.string() })).optional(),
+
+    nuscenesMaxSamples: optionalNumberString,
+    nuscenesCategories: z.array(z.object({ category: z.string() })).optional(),
+
+    kittiMaxImages: optionalNumberString,
+    kittiCategories: z.array(z.object({ category: z.string() })).optional(),
 
     minWidth: optionalNumberString,
     minHeight: optionalNumberString,
@@ -137,6 +164,14 @@ export const jobCreateDefaultValues: JobCreateFormValues = {
   pascalVocCategories: [],
   visualGenomeMaxImages: undefined,
   visualGenomeCategories: [],
+  davisMaxImages: undefined,
+  davisSequences: [],
+  sunRgbdMaxImages: undefined,
+  sunRgbdCategories: [],
+  nuscenesMaxSamples: undefined,
+  nuscenesCategories: [],
+  kittiMaxImages: undefined,
+  kittiCategories: [],
   minWidth: undefined,
   minHeight: undefined,
   yoloWorldConfThreshold: undefined,
@@ -223,6 +258,34 @@ export function buildConfigPayload(values: JobCreateFormValues): JobConfig {
     .filter((c) => c !== '')
   if (validVgCategories.length) visualGenome.categories = validVgCategories
   if (Object.keys(visualGenome).length) config.visual_genome = visualGenome
+
+  const davis: JobConfig['davis'] = {}
+  const davisMaxImages = toNumber(values.davisMaxImages)
+  if (davisMaxImages) davis.max_images = davisMaxImages
+  const validSequences = (values.davisSequences ?? []).map((s) => s.sequence.trim()).filter((s) => s !== '')
+  if (validSequences.length) davis.sequences = validSequences
+  if (Object.keys(davis).length) config.davis = davis
+
+  const sunRgbd: JobConfig['sun_rgbd'] = {}
+  const sunRgbdMaxImages = toNumber(values.sunRgbdMaxImages)
+  if (sunRgbdMaxImages) sunRgbd.max_images = sunRgbdMaxImages
+  const validSunCategories = (values.sunRgbdCategories ?? []).map((c) => c.category.trim()).filter((c) => c !== '')
+  if (validSunCategories.length) sunRgbd.categories = validSunCategories
+  if (Object.keys(sunRgbd).length) config.sun_rgbd = sunRgbd
+
+  const nuscenes: JobConfig['nuscenes'] = {}
+  const nuscenesMaxSamples = toNumber(values.nuscenesMaxSamples)
+  if (nuscenesMaxSamples) nuscenes.max_samples = nuscenesMaxSamples
+  const validNuCategories = (values.nuscenesCategories ?? []).map((c) => c.category.trim()).filter((c) => c !== '')
+  if (validNuCategories.length) nuscenes.categories = validNuCategories
+  if (Object.keys(nuscenes).length) config.nuscenes = nuscenes
+
+  const kitti: JobConfig['kitti'] = {}
+  const kittiMaxImages = toNumber(values.kittiMaxImages)
+  if (kittiMaxImages) kitti.max_images = kittiMaxImages
+  const validKittiCategories = (values.kittiCategories ?? []).map((c) => c.category.trim()).filter((c) => c !== '')
+  if (validKittiCategories.length) kitti.categories = validKittiCategories
+  if (Object.keys(kitti).length) config.kitti = kitti
 
   const minWidth = toNumber(values.minWidth)
   const minHeight = toNumber(values.minHeight)

@@ -10,6 +10,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends git \
 
 RUN pip install --no-cache-dir uv
 
+# ultralytics pulls in the full torch/CUDA wheel stack (nvidia-cublas alone
+# is 400MB+) — uv's default 30s per-request timeout is too short for these
+# on a slow/congested connection and the build fails with a network-timeout
+# error that looks unrelated (e.g. failing on an unrelated small package
+# like lxml, whichever request lands during the slow window).
+ENV UV_HTTP_TIMEOUT=300
+
 COPY pyproject.toml uv.lock* ./
 RUN uv sync --no-dev || uv pip install --system -e .
 

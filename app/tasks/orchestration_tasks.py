@@ -283,5 +283,21 @@ def _resume_task(job_id: str, job_source_task_id: str, source_type, checkpoint: 
         from app.tasks.discovery_tasks import discover_visual_genome
 
         discover_visual_genome.delay(job_id, job_source_task_id)
+    elif source_type == SourceType.DAVIS:
+        from app.tasks.discovery_tasks import discover_davis
+
+        discover_davis.delay(job_id, job_source_task_id)
+    elif source_type == SourceType.SUN_RGBD:
+        from app.tasks.discovery_tasks import discover_sun_rgbd
+
+        discover_sun_rgbd.delay(job_id, job_source_task_id)
+    elif source_type == SourceType.NUSCENES:
+        from app.tasks.discovery_tasks import discover_nuscenes
+
+        discover_nuscenes.delay(job_id, job_source_task_id)
+    elif source_type == SourceType.KITTI:
+        from app.tasks.discovery_tasks import discover_kitti
+
+        discover_kitti.delay(job_id, job_source_task_id)
     else:
         logger.warning(f"Watchdog: no resume handler yet for source_type={source_type}")

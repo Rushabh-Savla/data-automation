@@ -20,10 +20,14 @@ from pathlib import Path
 
 from app.connectors.base import RawAssetDraft, SourceItem
 from app.connectors.coco_connector import CocoConnector
+from app.connectors.davis_connector import DavisConnector
 from app.connectors.kaggle_connector import KaggleConnector
+from app.connectors.kitti_connector import KittiConnector
+from app.connectors.nuimages_connector import NuImagesConnector
 from app.connectors.open_images_connector import OpenImagesConnector
 from app.connectors.pascal_voc_connector import PascalVocConnector
 from app.connectors.roboflow_connector import RoboflowConnector
+from app.connectors.sun_rgbd_connector import SunRgbdConnector
 from app.connectors.visual_genome_connector import VisualGenomeConnector
 from app.connectors.web_connector import WebScrapeConnector
 from app.connectors.youtube_connector import YouTubeConnector
@@ -388,3 +392,135 @@ def download_visual_genome_shard(self, job_id: str, job_source_task_id: str, ite
         yield from connector.fetch(item, workdir, checkpoint, should_stop, on_progress)
 
     return _run_item_download(job_id, job_source_task_id, SourceType.VISUAL_GENOME, shard_id, fetch)
+
+
+@celery_app.task(
+    name="app.tasks.ingest_tasks.download_davis_shard",
+    bind=True,
+    autoretry_for=(TransientConnectorError, ConnectionError, TimeoutError),
+    retry_backoff=True,
+    retry_backoff_max=600,
+    retry_jitter=True,
+    max_retries=5,
+)
+def download_davis_shard(self, job_id: str, job_source_task_id: str, item_dict: dict):
+    settings = get_settings()
+    item = SourceItem(
+        source_type=SourceType.DAVIS,
+        external_ref=item_dict["external_ref"],
+        license_hint=item_dict.get("license_hint"),
+        dataset_identifier=item_dict.get("dataset_identifier"),
+    )
+    shard_id = hashlib.md5(str(item.external_ref["frames"]).encode()).hexdigest()[:12]
+    workdir = settings.work_root / job_source_task_id
+    workdir.mkdir(parents=True, exist_ok=True)
+
+    with session_scope() as db:
+        task = JobSourceTaskRepository(db).get(uuid.UUID(job_source_task_id))
+        min_res = tuple(task.job.config.get("min_resolution", (64, 64))) if task and task.job else (64, 64)
+
+    connector = DavisConnector(min_resolution=min_res)
+
+    def fetch(checkpoint, should_stop, on_progress):
+        yield from connector.fetch(item, workdir, checkpoint, should_stop, on_progress)
+
+    return _run_item_download(job_id, job_source_task_id, SourceType.DAVIS, shard_id, fetch)
+
+
+@celery_app.task(
+    name="app.tasks.ingest_tasks.download_sun_rgbd_shard",
+    bind=True,
+    autoretry_for=(TransientConnectorError, ConnectionError, TimeoutError),
+    retry_backoff=True,
+    retry_backoff_max=600,
+    retry_jitter=True,
+    max_retries=5,
+)
+def download_sun_rgbd_shard(self, job_id: str, job_source_task_id: str, item_dict: dict):
+    settings = get_settings()
+    item = SourceItem(
+        source_type=SourceType.SUN_RGBD,
+        external_ref=item_dict["external_ref"],
+        license_hint=item_dict.get("license_hint"),
+        dataset_identifier=item_dict.get("dataset_identifier"),
+    )
+    shard_id = hashlib.md5(str(item.external_ref["record_indices"]).encode()).hexdigest()[:12]
+    workdir = settings.work_root / job_source_task_id
+    workdir.mkdir(parents=True, exist_ok=True)
+
+    with session_scope() as db:
+        task = JobSourceTaskRepository(db).get(uuid.UUID(job_source_task_id))
+        min_res = tuple(task.job.config.get("min_resolution", (64, 64))) if task and task.job else (64, 64)
+
+    connector = SunRgbdConnector(min_resolution=min_res)
+
+    def fetch(checkpoint, should_stop, on_progress):
+        yield from connector.fetch(item, workdir, checkpoint, should_stop, on_progress)
+
+    return _run_item_download(job_id, job_source_task_id, SourceType.SUN_RGBD, shard_id, fetch)
+
+
+@celery_app.task(
+    name="app.tasks.ingest_tasks.download_nuscenes_shard",
+    bind=True,
+    autoretry_for=(TransientConnectorError, ConnectionError, TimeoutError),
+    retry_backoff=True,
+    retry_backoff_max=600,
+    retry_jitter=True,
+    max_retries=5,
+)
+def download_nuscenes_shard(self, job_id: str, job_source_task_id: str, item_dict: dict):
+    settings = get_settings()
+    item = SourceItem(
+        source_type=SourceType.NUSCENES,
+        external_ref=item_dict["external_ref"],
+        license_hint=item_dict.get("license_hint"),
+        dataset_identifier=item_dict.get("dataset_identifier"),
+    )
+    shard_id = hashlib.md5(str(item.external_ref["sample_data_tokens"]).encode()).hexdigest()[:12]
+    workdir = settings.work_root / job_source_task_id
+    workdir.mkdir(parents=True, exist_ok=True)
+
+    with session_scope() as db:
+        task = JobSourceTaskRepository(db).get(uuid.UUID(job_source_task_id))
+        min_res = tuple(task.job.config.get("min_resolution", (64, 64))) if task and task.job else (64, 64)
+
+    connector = NuImagesConnector(min_resolution=min_res)
+
+    def fetch(checkpoint, should_stop, on_progress):
+        yield from connector.fetch(item, workdir, checkpoint, should_stop, on_progress)
+
+    return _run_item_download(job_id, job_source_task_id, SourceType.NUSCENES, shard_id, fetch)
+
+
+@celery_app.task(
+    name="app.tasks.ingest_tasks.download_kitti_shard",
+    bind=True,
+    autoretry_for=(TransientConnectorError, ConnectionError, TimeoutError),
+    retry_backoff=True,
+    retry_backoff_max=600,
+    retry_jitter=True,
+    max_retries=5,
+)
+def download_kitti_shard(self, job_id: str, job_source_task_id: str, item_dict: dict):
+    settings = get_settings()
+    item = SourceItem(
+        source_type=SourceType.KITTI,
+        external_ref=item_dict["external_ref"],
+        license_hint=item_dict.get("license_hint"),
+        dataset_identifier=item_dict.get("dataset_identifier"),
+    )
+    shard_id = hashlib.md5(str(item.external_ref["image_ids"]).encode()).hexdigest()[:12]
+    workdir = settings.work_root / job_source_task_id
+    workdir.mkdir(parents=True, exist_ok=True)
+
+    with session_scope() as db:
+        task = JobSourceTaskRepository(db).get(uuid.UUID(job_source_task_id))
+        min_res = tuple(task.job.config.get("min_resolution", (64, 64))) if task and task.job else (64, 64)
+
+    connector = KittiConnector(min_resolution=min_res)
+
+    def fetch(checkpoint, should_stop, on_progress):
+        yield from connector.fetch(item, workdir, checkpoint, should_stop, on_progress)
+
+    return _run_item_download(job_id, job_source_task_id, SourceType.KITTI, shard_id, fetch)

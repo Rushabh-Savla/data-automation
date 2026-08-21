@@ -28,6 +28,10 @@ const SOURCE_KEY_HINTS: Record<SourceType, string[]> = {
   open_images: [],
   pascal_voc: [],
   visual_genome: [],
+  davis: [],
+  sun_rgbd: [],
+  nuscenes: [],
+  kitti: [],
 }
 
 interface CredentialFormDialogProps {

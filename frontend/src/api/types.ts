@@ -19,6 +19,10 @@ export type SourceType =
   | 'open_images'
   | 'pascal_voc'
   | 'visual_genome'
+  | 'davis'
+  | 'sun_rgbd'
+  | 'nuscenes'
+  | 'kitti'
 
 export type JobStatus =
   | 'draft'
@@ -133,6 +137,26 @@ export interface VisualGenomeConfig {
   categories?: string[]
 }
 
+export interface DavisConfig {
+  max_images?: number
+  sequences?: string[]
+}
+
+export interface SunRgbdConfig {
+  max_images?: number
+  categories?: string[]
+}
+
+export interface NuscenesConfig {
+  max_samples?: number
+  categories?: string[]
+}
+
+export interface KittiConfig {
+  max_images?: number
+  categories?: string[]
+}
+
 export interface JobConfig {
   roboflow?: RoboflowConfig
   kaggle?: KaggleConfig
@@ -142,6 +166,10 @@ export interface JobConfig {
   open_images?: OpenImagesConfig
   pascal_voc?: PascalVocConfig
   visual_genome?: VisualGenomeConfig
+  davis?: DavisConfig
+  sun_rgbd?: SunRgbdConfig
+  nuscenes?: NuscenesConfig
+  kitti?: KittiConfig
   min_resolution?: [width: number, height: number]
   yolo_world_conf_threshold?: number
   dedup_hamming_threshold?: number

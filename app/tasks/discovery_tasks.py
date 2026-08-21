@@ -11,10 +11,14 @@ import uuid
 from celery import chord
 
 from app.connectors.coco_connector import CocoConnector
+from app.connectors.davis_connector import DavisConnector
 from app.connectors.kaggle_connector import KaggleConnector
+from app.connectors.kitti_connector import KittiConnector
+from app.connectors.nuimages_connector import NuImagesConnector
 from app.connectors.open_images_connector import OpenImagesConnector
 from app.connectors.pascal_voc_connector import PascalVocConnector
 from app.connectors.roboflow_connector import RoboflowConnector
+from app.connectors.sun_rgbd_connector import SunRgbdConnector
 from app.connectors.visual_genome_connector import VisualGenomeConnector
 from app.connectors.web_connector import WebScrapeConnector
 from app.connectors.youtube_connector import YouTubeConnector
@@ -28,10 +32,14 @@ from app.tasks._helpers import bind_context, unbind_context
 from app.tasks.celery_app import celery_app
 from app.tasks.ingest_tasks import (
     download_coco_shard,
+    download_davis_shard,
     download_kaggle_dataset,
+    download_kitti_shard,
+    download_nuscenes_shard,
     download_open_images_shard,
     download_pascal_voc_shard,
     download_roboflow_item,
+    download_sun_rgbd_shard,
     download_visual_genome_shard,
     download_web_batch,
     download_youtube_video,
@@ -532,3 +540,235 @@ def discover_visual_genome(self, job_id: str, job_source_task_id: str):
 
 
 register_source_discovery_task(SourceType.VISUAL_GENOME, "app.tasks.discovery_tasks.discover_visual_genome")
+
+
+@celery_app.task(name="app.tasks.discovery_tasks.discover_davis", bind=True)
+def discover_davis(self, job_id: str, job_source_task_id: str):
+    job_uuid = uuid.UUID(job_id)
+    task_uuid = uuid.UUID(job_source_task_id)
+    bind_context(job_uuid, task_uuid)
+
+    with session_scope() as db:
+        task_repo = JobSourceTaskRepository(db)
+        task = task_repo.get(task_uuid)
+        if task is None:
+            unbind_context()
+            return
+
+        job = task.job
+        task_repo.set_status(task_uuid, JobSourceTaskStatus.DISCOVERING)
+
+        davis_config = job.config.get("davis", {})
+        connector = DavisConnector()
+        page = connector.discover(
+            job.query,
+            cursor=None,
+            limit=davis_config.get("max_images", 200),
+            explicit_categories=davis_config.get("sequences"),
+        )
+        shards = page.items
+
+        if not shards:
+            task_repo.set_status(
+                task_uuid,
+                JobSourceTaskStatus.COMPLETED_PARTIAL,
+                error_message=page.error_reason or "No DAVIS frames found for query",
+            )
+            db.commit()
+            check_and_advance_job(job_id)
+            unbind_context()
+            return
+
+        total_frames = sum(len(s.external_ref["frames"]) for s in shards)
+        task_repo.increment_counts(task_uuid, discovered=total_frames)
+        db.flush()
+
+    item_dicts = [
+        {
+            "external_ref": {"frames": s.external_ref["frames"]},
+            "license_hint": s.license_hint,
+            "dataset_identifier": s.dataset_identifier,
+        }
+        for s in shards
+    ]
+
+    download_group = [download_davis_shard.s(job_id, job_source_task_id, item) for item in item_dicts]
+    chord(download_group)(on_source_finished.s(job_id, job_source_task_id))
+    unbind_context()
+
+
+register_source_discovery_task(SourceType.DAVIS, "app.tasks.discovery_tasks.discover_davis")
+
+
+@celery_app.task(name="app.tasks.discovery_tasks.discover_sun_rgbd", bind=True)
+def discover_sun_rgbd(self, job_id: str, job_source_task_id: str):
+    job_uuid = uuid.UUID(job_id)
+    task_uuid = uuid.UUID(job_source_task_id)
+    bind_context(job_uuid, task_uuid)
+
+    with session_scope() as db:
+        task_repo = JobSourceTaskRepository(db)
+        task = task_repo.get(task_uuid)
+        if task is None:
+            unbind_context()
+            return
+
+        job = task.job
+        task_repo.set_status(task_uuid, JobSourceTaskStatus.DISCOVERING)
+
+        sun_config = job.config.get("sun_rgbd", {})
+        connector = SunRgbdConnector()
+        page = connector.discover(
+            job.query,
+            cursor=None,
+            limit=sun_config.get("max_images", 200),
+            explicit_categories=sun_config.get("categories"),
+        )
+        shards = page.items
+
+        if not shards:
+            task_repo.set_status(
+                task_uuid,
+                JobSourceTaskStatus.COMPLETED_PARTIAL,
+                error_message=page.error_reason or "No SUN RGB-D images found for query",
+            )
+            db.commit()
+            check_and_advance_job(job_id)
+            unbind_context()
+            return
+
+        total_images = sum(len(s.external_ref["record_indices"]) for s in shards)
+        task_repo.increment_counts(task_uuid, discovered=total_images)
+        db.flush()
+
+    item_dicts = [
+        {
+            "external_ref": {"record_indices": s.external_ref["record_indices"]},
+            "license_hint": s.license_hint,
+            "dataset_identifier": s.dataset_identifier,
+        }
+        for s in shards
+    ]
+
+    download_group = [download_sun_rgbd_shard.s(job_id, job_source_task_id, item) for item in item_dicts]
+    chord(download_group)(on_source_finished.s(job_id, job_source_task_id))
+    unbind_context()
+
+
+register_source_discovery_task(SourceType.SUN_RGBD, "app.tasks.discovery_tasks.discover_sun_rgbd")
+
+
+@celery_app.task(name="app.tasks.discovery_tasks.discover_nuscenes", bind=True)
+def discover_nuscenes(self, job_id: str, job_source_task_id: str):
+    job_uuid = uuid.UUID(job_id)
+    task_uuid = uuid.UUID(job_source_task_id)
+    bind_context(job_uuid, task_uuid)
+
+    with session_scope() as db:
+        task_repo = JobSourceTaskRepository(db)
+        task = task_repo.get(task_uuid)
+        if task is None:
+            unbind_context()
+            return
+
+        job = task.job
+        task_repo.set_status(task_uuid, JobSourceTaskStatus.DISCOVERING)
+
+        nu_config = job.config.get("nuscenes", {})
+        connector = NuImagesConnector()
+        page = connector.discover(
+            job.query,
+            cursor=None,
+            limit=nu_config.get("max_samples", 200),
+            explicit_categories=nu_config.get("categories"),
+        )
+        shards = page.items
+
+        if not shards:
+            task_repo.set_status(
+                task_uuid,
+                JobSourceTaskStatus.COMPLETED_PARTIAL,
+                error_message=page.error_reason or "No nuImages samples found for query",
+            )
+            db.commit()
+            check_and_advance_job(job_id)
+            unbind_context()
+            return
+
+        total_samples = sum(len(s.external_ref["sample_data_tokens"]) for s in shards)
+        task_repo.increment_counts(task_uuid, discovered=total_samples)
+        db.flush()
+
+    item_dicts = [
+        {
+            "external_ref": {"sample_data_tokens": s.external_ref["sample_data_tokens"]},
+            "license_hint": s.license_hint,
+            "dataset_identifier": s.dataset_identifier,
+        }
+        for s in shards
+    ]
+
+    download_group = [download_nuscenes_shard.s(job_id, job_source_task_id, item) for item in item_dicts]
+    chord(download_group)(on_source_finished.s(job_id, job_source_task_id))
+    unbind_context()
+
+
+register_source_discovery_task(SourceType.NUSCENES, "app.tasks.discovery_tasks.discover_nuscenes")
+
+
+@celery_app.task(name="app.tasks.discovery_tasks.discover_kitti", bind=True)
+def discover_kitti(self, job_id: str, job_source_task_id: str):
+    job_uuid = uuid.UUID(job_id)
+    task_uuid = uuid.UUID(job_source_task_id)
+    bind_context(job_uuid, task_uuid)
+
+    with session_scope() as db:
+        task_repo = JobSourceTaskRepository(db)
+        task = task_repo.get(task_uuid)
+        if task is None:
+            unbind_context()
+            return
+
+        job = task.job
+        task_repo.set_status(task_uuid, JobSourceTaskStatus.DISCOVERING)
+
+        kitti_config = job.config.get("kitti", {})
+        connector = KittiConnector()
+        page = connector.discover(
+            job.query,
+            cursor=None,
+            limit=kitti_config.get("max_images", 200),
+            explicit_categories=kitti_config.get("categories"),
+        )
+        shards = page.items
+
+        if not shards:
+            task_repo.set_status(
+                task_uuid,
+                JobSourceTaskStatus.COMPLETED_PARTIAL,
+                error_message=page.error_reason or "No KITTI images found for query",
+            )
+            db.commit()
+            check_and_advance_job(job_id)
+            unbind_context()
+            return
+
+        total_images = sum(len(s.external_ref["image_ids"]) for s in shards)
+        task_repo.increment_counts(task_uuid, discovered=total_images)
+        db.flush()
+
+    item_dicts = [
+        {
+            "external_ref": {"image_ids": s.external_ref["image_ids"]},
+            "license_hint": s.license_hint,
+            "dataset_identifier": s.dataset_identifier,
+        }
+        for s in shards
+    ]
+
+    download_group = [download_kitti_shard.s(job_id, job_source_task_id, item) for item in item_dicts]
+    chord(download_group)(on_source_finished.s(job_id, job_source_task_id))
+    unbind_context()
+
+
+register_source_discovery_task(SourceType.KITTI, "app.tasks.discovery_tasks.discover_kitti")
