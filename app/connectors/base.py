@@ -20,8 +20,11 @@ from app.domain.enums import SourceType
 # `User-Agent: python-requests/x.y.z` by default — an obvious bot signature
 # some hosts (particularly the smaller academic servers this platform pulls
 # from: rgbd.cs.princeton.edu, data.vision.ee.ethz.ch, host.robots.ox.ac.uk)
-# rate-limit or block more readily than a normal browser UA. Kaggle/Roboflow
-# go through their own official SDKs/APIs and don't need this.
+# rate-limit or block more readily than a normal browser UA. Also used by
+# RoboflowConnector's Universe search scrape (universe.roboflow.com/search
+# is a Cloudflare-fronted page, not a documented API, and 403'd every query
+# without this). Kaggle and Roboflow's actual REST API calls (kagglehub,
+# api.roboflow.com) go through official SDKs/clients and don't need this.
 HTTP_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "

@@ -28,6 +28,7 @@ from pathlib import Path
 import requests
 
 from app.connectors.base import (
+    HTTP_HEADERS,
     DiscoveryPage,
     OnProgressFn,
     RawAssetDraft,
@@ -70,7 +71,9 @@ class RoboflowConnector:
         url = RF_UNIVERSE_BASE + "/search"
         params = {"q": query, "t": "object-detection", "p": 1}
         try:
-            resp = requests.get(url, params=params, headers={"Accept": "application/json"}, timeout=15)
+            resp = requests.get(
+                url, params=params, headers={**HTTP_HEADERS, "Accept": "application/json"}, timeout=15
+            )
             resp.raise_for_status()
             ct = resp.headers.get("content-type", "")
             if "json" not in ct and not resp.text.strip().startswith("{"):

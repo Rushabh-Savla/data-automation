@@ -2,9 +2,26 @@
 triggered by `connector_finished`, run as background tasks so large,
 high-noise sources (web scraping, YouTube) don't block ingestion workers.
 
-Per the architecture doc, only web/YouTube assets go through YOLO-World
-relevance filtering — Kaggle/Roboflow assets are already curated/labeled
-datasets, not noisy scraped content, so they stay `promoted` untouched.
+Every source's PROMOTED assets go through relevance filtering, not just
+web/YouTube — dataset-title-level matches (Kaggle) and video-sequence-name
+matches (DAVIS) can both let visually-mismatched images through even
+though the connector itself never raised an error (e.g. a Kaggle dataset
+titled "Dog vs Cat Classification" matching a "dog" query, then yielding
+its cat images too). Two independent signals vote on relevance: YOLO-World
+(region/object-detection based, app/filtering/yolo_world_filter.py) and
+SmolVLM (whole-image yes/no VQA, app/filtering/smolvlm_filter.py) — an
+asset passes if EITHER signal says yes (OR, like dedup's OR-combine).
+This is deliberately permissive rather than requiring both to agree:
+SmolVLM-256M (a small model) is reliable on clear single-subject images
+but unreliably says "no" on busy scenes with a small/background instance
+of the query object — testing on real pipeline images confirmed this
+(a genuine COCO dog image, correctly matched by COCO's own ground-truth
+annotation, got a false "no" from SmolVLM alone on a cluttered scene).
+Requiring both signals to agree (AND) would have meant SmolVLM's blind
+spots could reject already-correct images from sources that never had
+the mismatch problem in the first place; OR-combining means SmolVLM only
+ever *adds* a second way to pass, never a second way to unfairly fail.
+
 Deduplication runs across every source's assets for the job.
 """
 
@@ -14,16 +31,15 @@ import uuid
 from app.db.repositories.asset_repository import AssetRepository
 from app.db.repositories.job_repository import JobRepository
 from app.db.session import session_scope
-from app.domain.enums import AssetStatus, SourceType
+from app.domain.enums import AssetStatus
 from app.filtering.dedup import HybridDeduplicator
+from app.filtering.smolvlm_filter import VisualVerifier
 from app.filtering.yolo_world_filter import RelevanceFilter, derive_prompt_classes
 from app.services.progress_service import ProgressPublisher
 from app.core.redis_client import get_redis
 from app.tasks.celery_app import celery_app
 
 logger = logging.getLogger(__name__)
-
-_FILTERED_SOURCES = {SourceType.WEB, SourceType.YOUTUBE}
 
 
 @celery_app.task(name="app.tasks.filtering_tasks.run_relevance_filter", bind=True)
@@ -37,10 +53,7 @@ def run_relevance_filter(self, job_id: str):
         if job is None:
             return
 
-        candidates = [
-            a for a in asset_repo.list_for_job(job_uuid, status=AssetStatus.PROMOTED, limit=100_000)
-            if SourceType(a.source_type) in _FILTERED_SOURCES
-        ]
+        candidates = asset_repo.list_for_job(job_uuid, status=AssetStatus.PROMOTED, limit=100_000)
         if not candidates:
             run_deduplication.delay(job_id)
             return
@@ -48,6 +61,7 @@ def run_relevance_filter(self, job_id: str):
         prompt_classes = derive_prompt_classes(job.query)
         conf_threshold = job.config.get("yolo_world_conf_threshold", 0.15)
         relevance_filter = RelevanceFilter(conf_threshold=conf_threshold)
+        visual_verifier = VisualVerifier()
 
         passed = rejected = 0
         for asset in candidates:
@@ -59,7 +73,13 @@ def run_relevance_filter(self, job_id: str):
                 logger.warning(f"Relevance scoring failed for asset {asset.id}: {e}")
                 score = 0.0
 
-            if score >= conf_threshold:
+            try:
+                vlm_pass = visual_verifier.verify(asset.nas_path, job.query)
+            except Exception as e:
+                logger.warning(f"SmolVLM verification failed for asset {asset.id}: {e}")
+                vlm_pass = False
+
+            if score >= conf_threshold or vlm_pass:
                 asset_repo.set_status(asset.id, AssetStatus.RELEVANCE_PASSED, relevance_score=score)
                 passed += 1
             else:

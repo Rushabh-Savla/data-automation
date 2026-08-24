@@ -50,6 +50,8 @@ dependencies = [
     "clip @ git+https://github.com/ultralytics/CLIP.git",
     "imagehash>=4.3.1",
     "numpy>=1.26.0",
+    # SmolVLM-256M second-opinion visual check (app/filtering/smolvlm_filter.py)
+    "transformers>=4.45.0",
 ]
 
 [dependency-groups]
