@@ -7,20 +7,24 @@ web/YouTube — dataset-title-level matches (Kaggle) and video-sequence-name
 matches (DAVIS) can both let visually-mismatched images through even
 though the connector itself never raised an error (e.g. a Kaggle dataset
 titled "Dog vs Cat Classification" matching a "dog" query, then yielding
-its cat images too). Two independent signals vote on relevance: YOLO-World
-(region/object-detection based, app/filtering/yolo_world_filter.py) and
-SmolVLM (whole-image yes/no VQA, app/filtering/smolvlm_filter.py) — an
-asset passes if EITHER signal says yes (OR, like dedup's OR-combine).
-This is deliberately permissive rather than requiring both to agree:
-SmolVLM-256M (a small model) is reliable on clear single-subject images
-but unreliably says "no" on busy scenes with a small/background instance
-of the query object — testing on real pipeline images confirmed this
-(a genuine COCO dog image, correctly matched by COCO's own ground-truth
-annotation, got a false "no" from SmolVLM alone on a cluttered scene).
-Requiring both signals to agree (AND) would have meant SmolVLM's blind
-spots could reject already-correct images from sources that never had
-the mismatch problem in the first place; OR-combining means SmolVLM only
-ever *adds* a second way to pass, never a second way to unfairly fail.
+its cat images too).
+
+Filtering is a hybrid two-stage search, not a single model: YOLO-World
+(app/filtering/yolo_world_filter.py) proposes a candidate region for the
+query's keyword-derived classes — cheap, general, works for any query —
+then SmolVLM (app/filtering/smolvlm_filter.py) answers the *full original
+query* as a yes/no question against that region, and SmolVLM's answer is
+the sole accept/reject decision. YOLO-World's own confidence score is
+never used to gate the decision (only stored on the asset for
+observability) because it structurally can't represent compound queries —
+"red cane" or "people wearing helmet" would both pass on a bare "cane"/
+"people" class match regardless of color or whether a helmet was actually
+present, which is exactly the bug this replaced. There's no fixed keyword
+list that can enumerate every way a query can be compound (color,
+negation, counting, spatial relations...), so nothing here classifies the
+query — every query is treated the same way: detect a candidate region,
+then let a real language-grounded model judge the whole sentence against
+it.
 
 Deduplication runs across every source's assets for the job.
 """
@@ -34,7 +38,7 @@ from app.db.session import session_scope
 from app.domain.enums import AssetStatus
 from app.filtering.dedup import HybridDeduplicator
 from app.filtering.smolvlm_filter import VisualVerifier
-from app.filtering.yolo_world_filter import RelevanceFilter, derive_prompt_classes
+from app.filtering.yolo_world_filter import DetectionResult, RelevanceFilter, derive_prompt_classes
 from app.services.progress_service import ProgressPublisher
 from app.core.redis_client import get_redis
 from app.tasks.celery_app import celery_app
@@ -68,18 +72,19 @@ def run_relevance_filter(self, job_id: str):
             if not asset.nas_path:
                 continue
             try:
-                score = relevance_filter.score(asset.nas_path, prompt_classes)
+                detection = relevance_filter.detect(asset.nas_path, prompt_classes)
             except Exception as e:
-                logger.warning(f"Relevance scoring failed for asset {asset.id}: {e}")
-                score = 0.0
+                logger.warning(f"Relevance detection failed for asset {asset.id}: {e}")
+                detection = DetectionResult(score=0.0, box=None)
 
             try:
-                vlm_pass = visual_verifier.verify(asset.nas_path, job.query)
+                vlm_pass = visual_verifier.verify(asset.nas_path, job.query, box=detection.box)
             except Exception as e:
                 logger.warning(f"SmolVLM verification failed for asset {asset.id}: {e}")
                 vlm_pass = False
 
-            if score >= conf_threshold or vlm_pass:
+            score = detection.score
+            if vlm_pass:
                 asset_repo.set_status(asset.id, AssetStatus.RELEVANCE_PASSED, relevance_score=score)
                 passed += 1
             else:

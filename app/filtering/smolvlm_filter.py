@@ -1,21 +1,30 @@
-"""VisualVerifier — whole-image yes/no relevance check using SmolVLM-256M,
-used alongside YOLO-World (app/filtering/yolo_world_filter.py) as a second
-opinion in run_relevance_filter.
+"""VisualVerifier — hybrid two-stage relevance check: YOLO-World
+(app/filtering/yolo_world_filter.py) proposes *where* in the image to look,
+SmolVLM-256M judges the full natural-language query against that region —
+used from app/tasks/filtering_tasks.py::run_relevance_filter as the sole
+accept/reject decision for every source.
 
-YOLO-World is an open-vocabulary *object detector*: it looks for a
-region of the image matching a class prompt. That's a good fit for "is
-there a red bag somewhere in this image" but a weaker fit for a query
-that's really a whole-image classification question ("is this a dog
-photo, or a cat photo") — which is exactly the failure mode that let
-mismatched images (e.g. cats from a Kaggle "dog vs cat classification"
-dataset) through undetected. SmolVLM-256M is a small vision-language
-model that can answer a direct yes/no question about the whole image,
-complementing YOLO-World's region-based signal.
+YOLO-World is an open-vocabulary *object detector*: it can only answer
+"does some region match one of these class prompts," which structurally
+can't represent a compound query like "red cane" (no color understanding)
+or "people wearing helmet" (no compositional "wearing" relationship) — its
+score alone previously let mismatched images through (e.g. any cane at all
+satisfying a bare "cane" fallback class, regardless of color). There's no
+fixed keyword list that can enumerate every way a query can be compound
+(color, negation, counting, spatial relations...), so instead of trying to
+classify query types, YOLO-World's detection is used only to crop toward
+the relevant region, and SmolVLM — a real language-grounded VQA model —
+answers the full original query against that crop. This also incidentally
+helps SmolVLM's own known weakness (missing a small/background object in a
+busy full-image downscale), since the crop presents a zoomed, more
+prominent view of the candidate region instead of a shrunk full scene.
 """
 
 import logging
 from functools import lru_cache
 from pathlib import Path
+
+from PIL import Image
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +37,7 @@ _AFFIRMATIVE_PREFIXES = ("yes",)
 # the image is downscaled first — measured at ~6 seconds per image with no
 # accuracy change on clear single-subject test images.
 _MAX_DIMENSION = 384
+_CROP_MARGIN_RATIO = 0.25
 
 
 def _is_affirmative(text: str) -> bool:
@@ -35,6 +45,32 @@ def _is_affirmative(text: str) -> bool:
     tolerant of a leading article like "Yes." or "yes, it does")."""
     cleaned = text.strip().lower().lstrip(".,!? ")
     return cleaned.startswith(_AFFIRMATIVE_PREFIXES)
+
+
+def _crop_with_margin(
+    image: Image.Image, box: tuple[float, float, float, float] | None, margin_ratio: float = _CROP_MARGIN_RATIO
+) -> Image.Image:
+    """Crops `image` to `box` (xyxy) expanded by `margin_ratio` on each side
+    and clamped to the image bounds. The margin keeps surrounding context a
+    relational query needs (e.g. "wearing" depends on something *near* the
+    detected region, not just the region itself). Returns `image` unchanged
+    if `box` is None — the caller had no detection to crop toward."""
+    if box is None:
+        return image
+
+    width, height = image.size
+    x1, y1, x2, y2 = box
+    box_w, box_h = x2 - x1, y2 - y1
+    pad_x, pad_y = box_w * margin_ratio, box_h * margin_ratio
+
+    left = max(0, x1 - pad_x)
+    top = max(0, y1 - pad_y)
+    right = min(width, x2 + pad_x)
+    bottom = min(height, y2 + pad_y)
+
+    if right <= left or bottom <= top:
+        return image
+    return image.crop((left, top, right, bottom))
 
 
 @lru_cache(maxsize=1)
@@ -50,12 +86,14 @@ class VisualVerifier:
     def __init__(self, model_id: str = "HuggingFaceTB/SmolVLM-256M-Instruct"):
         self._processor, self._model = _load_model(model_id)
 
-    def verify(self, image_path: Path, query: str) -> bool:
-        """Yes/no whole-image check: does this image actually show `query`?"""
+    def verify(self, image_path: Path, query: str, box: tuple[float, float, float, float] | None = None) -> bool:
+        """Yes/no check: does this image (cropped to `box`, if given) show
+        `query`? `query` is the full, unmodified natural-language query —
+        no keyword extraction — so any phrasing (color, "wearing X",
+        negation, counting...) is judged as the user actually wrote it."""
         try:
-            from PIL import Image
-
             image = Image.open(image_path).convert("RGB")
+            image = _crop_with_margin(image, box)
             image.thumbnail((_MAX_DIMENSION, _MAX_DIMENSION))
             messages = [
                 {

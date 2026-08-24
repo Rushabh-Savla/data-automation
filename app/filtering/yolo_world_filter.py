@@ -11,10 +11,17 @@ which a closed-vocabulary detector cannot do.
 
 import logging
 import re
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class DetectionResult:
+    score: float
+    box: tuple[float, float, float, float] | None  # xyxy, in the source image's own pixel coordinates
 
 _STOPWORDS = {"a", "an", "the", "with", "and", "or", "of", "in", "on", "at", "wearing"}
 
@@ -60,11 +67,17 @@ class RelevanceFilter:
         self._model = _load_model(weights)
         self._current_classes: list[str] | None = None
 
-    def score(self, image_path: Path, prompt_classes: list[str]) -> float:
-        """Returns the highest detection confidence across any prompt class,
-        or 0.0 if nothing was detected."""
+    def detect(self, image_path: Path, prompt_classes: list[str]) -> DetectionResult:
+        """Runs one inference pass and returns both the highest detection
+        confidence across any prompt class AND that detection's own box —
+        the box is a region-proposal hint for a downstream semantic check
+        (see app/filtering/smolvlm_filter.py), not a standalone pass/fail
+        signal: YOLO-World's flat "does any prompt class match anywhere"
+        design can't represent compound queries (color, "wearing X", etc.),
+        so the actual accept/reject decision belongs to whatever looks at
+        this box next, not to this score alone."""
         if not prompt_classes:
-            return 0.0
+            return DetectionResult(score=0.0, box=None)
         if prompt_classes != self._current_classes:
             self._model.set_classes(prompt_classes)
             self._current_classes = prompt_classes
@@ -73,11 +86,20 @@ class RelevanceFilter:
             results = self._model.predict(source=str(image_path), conf=self.conf_threshold, verbose=False)
         except Exception as e:
             logger.warning(f"YOLO-World inference failed for {image_path}: {e}")
-            return 0.0
+            return DetectionResult(score=0.0, box=None)
 
         if not results:
-            return 0.0
+            return DetectionResult(score=0.0, box=None)
         boxes = results[0].boxes
         if boxes is None or len(boxes) == 0:
-            return 0.0
-        return float(boxes.conf.max())
+            return DetectionResult(score=0.0, box=None)
+
+        best_idx = int(boxes.conf.argmax())
+        score = float(boxes.conf[best_idx])
+        box = tuple(float(v) for v in boxes.xyxy[best_idx].tolist())
+        return DetectionResult(score=score, box=box)
+
+    def score(self, image_path: Path, prompt_classes: list[str]) -> float:
+        """Returns the highest detection confidence across any prompt class,
+        or 0.0 if nothing was detected."""
+        return self.detect(image_path, prompt_classes).score
