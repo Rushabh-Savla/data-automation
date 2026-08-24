@@ -203,6 +203,9 @@ class SunRgbdConnector:
 
         from PIL import Image
 
+        if should_stop():
+            raise JobStopped("should_stop() signalled before SUN RGB-D shard fetch began")
+
         try:
             records = _ensure_records_cached()
             cache_dir = _ensure_images_cached()

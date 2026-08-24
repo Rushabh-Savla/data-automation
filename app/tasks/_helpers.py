@@ -2,8 +2,10 @@
 callables injected into connectors, and error classification for retry policy.
 """
 
+import contextlib
 import logging
 import math
+import threading
 import uuid
 from collections.abc import Callable
 
@@ -17,6 +19,8 @@ from app.services.cancellation_service import CancellationService
 from app.services.progress_service import ProgressPublisher
 
 logger = logging.getLogger(__name__)
+
+_HEARTBEAT_PING_INTERVAL_S = 60
 
 # Fair-share cap on how many images a single source can contribute before
 # the job's target_count is otherwise reached (see build_on_progress's
@@ -34,6 +38,41 @@ def per_source_cap(target_count: int, num_sources: int) -> int:
     fixture — see build_on_progress for where it's actually used."""
     num_sources = max(1, num_sources)
     return max(_MIN_PER_SOURCE_CAP, math.ceil(target_count / num_sources * _PER_SOURCE_FAIRNESS_BUFFER))
+
+
+@contextlib.contextmanager
+def heartbeat_during(task_uuid: uuid.UUID):
+    """Pings JobSourceTask.last_heartbeat_at every _HEARTBEAT_PING_INTERVAL_S
+    seconds for the duration of the wrapped block, on a background thread
+    with its own DB session (the caller's session may be busy inside a
+    single long blocking call — e.g. Kaggle's kagglehub.dataset_download(),
+    or the one-time shared-cache archive downloads several connectors
+    (Pascal VOC/DAVIS/SUN RGB-D/KITTI/nuImages) do inside discover() —
+    for far longer than one interval). Without this, the watchdog
+    (app/core/config.py::watchdog_stall_threshold_s) marks a genuinely-
+    progressing discovery as stalled and re-dispatches it from scratch,
+    which on a slow connection with a large archive means it never
+    finishes — every restart re-downloads from the beginning."""
+    from app.db.session import session_scope
+
+    stop = threading.Event()
+
+    def _run() -> None:
+        while not stop.wait(_HEARTBEAT_PING_INTERVAL_S):
+            try:
+                with session_scope() as hb_db:
+                    JobSourceTaskRepository(hb_db).heartbeat(task_uuid)
+                    hb_db.commit()
+            except Exception:
+                logger.exception("heartbeat_during: ping failed for task %s", task_uuid)
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        thread.join(timeout=5)
 
 
 def build_should_stop(job_id: uuid.UUID, job_source_task_id: uuid.UUID | None = None) -> Callable[[], bool]:

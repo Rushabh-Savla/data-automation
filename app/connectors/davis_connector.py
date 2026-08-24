@@ -208,6 +208,9 @@ class DavisConnector:
     ) -> Iterator[RawAssetDraft]:
         from PIL import Image
 
+        if should_stop():
+            raise JobStopped("should_stop() signalled before DAVIS shard fetch began")
+
         try:
             davis_dir = _ensure_dataset_cached()
         except Exception as e:

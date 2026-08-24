@@ -186,6 +186,9 @@ class KittiConnector:
 
         from PIL import Image
 
+        if should_stop():
+            raise JobStopped("should_stop() signalled before KITTI shard fetch began")
+
         try:
             cache_dir = _ensure_dataset_cached()
         except Exception as e:

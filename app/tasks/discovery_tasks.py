@@ -28,7 +28,7 @@ from app.db.session import session_scope
 from app.domain.enums import JobSourceTaskStatus, SourceType
 from app.services.credential_service import CredentialService
 from app.services.job_service import register_source_discovery_task
-from app.tasks._helpers import bind_context, unbind_context
+from app.tasks._helpers import bind_context, heartbeat_during, unbind_context
 from app.tasks.celery_app import celery_app
 from app.tasks.ingest_tasks import (
     download_coco_shard,
@@ -84,7 +84,10 @@ def discover_kaggle(self, job_id: str, job_source_task_id: str):
             items = [{"slug": slug, "license": lic} for slug, lic in explicit_slugs]
         else:
             connector = KaggleConnector()
-            page = connector.discover(job.query, cursor=None, limit=job.config.get("kaggle", {}).get("max_datasets", 5))
+            with heartbeat_during(task_uuid):
+                page = connector.discover(
+                    job.query, cursor=None, limit=job.config.get("kaggle", {}).get("max_datasets", 5)
+                )
             discovery_error_reason = page.error_reason
             items = [
                 {"slug": si.external_ref["slug"], "license": si.license_hint or "Unknown"}
@@ -162,7 +165,8 @@ def discover_roboflow(self, job_id: str, job_source_task_id: str):
         else:
             credentials = CredentialService(CredentialRepository(db)).resolve(SourceType.ROBOFLOW)
             connector = RoboflowConnector(api_key=credentials.get("ROBOFLOW_API_KEY", ""))
-            page = connector.discover(job.query, cursor=None, limit=rf_config.get("max_projects", 5))
+            with heartbeat_during(task_uuid):
+                page = connector.discover(job.query, cursor=None, limit=rf_config.get("max_projects", 5))
             discovery_error_reason = page.error_reason
             items = [
                 {
@@ -242,10 +246,11 @@ def discover_youtube(self, job_id: str, job_source_task_id: str):
         else:
             credentials = CredentialService(CredentialRepository(db)).resolve(SourceType.YOUTUBE)
             connector = YouTubeConnector(cc_only=yt_config.get("cc_only", True))
-            page = connector.discover(
-                job.query, cursor=None, limit=yt_config.get("max_videos", 5),
-                api_key=credentials.get("YOUTUBE_API_KEY", ""),
-            )
+            with heartbeat_during(task_uuid):
+                page = connector.discover(
+                    job.query, cursor=None, limit=yt_config.get("max_videos", 5),
+                    api_key=credentials.get("YOUTUBE_API_KEY", ""),
+                )
             discovery_error_reason = page.error_reason
             items = [
                 {
@@ -324,7 +329,8 @@ def discover_web(self, job_id: str, job_source_task_id: str):
 
         web_config = job.config.get("web", {})
         connector = WebScrapeConnector(safesearch=web_config.get("safesearch", "moderate"))
-        page = connector.discover(job.query, cursor=None, limit=web_config.get("max_results", 200))
+        with heartbeat_during(task_uuid):
+            page = connector.discover(job.query, cursor=None, limit=web_config.get("max_results", 200))
         shards = page.items
 
         if not shards:
@@ -393,12 +399,13 @@ def discover_coco(self, job_id: str, job_source_task_id: str):
             split=coco_config.get("split", "val2017"),
             allow_train2017=coco_config.get("allow_train2017", False),
         )
-        page = connector.discover(
-            job.query,
-            cursor=None,
-            limit=coco_config.get("max_images", 200),
-            explicit_categories=coco_config.get("categories"),
-        )
+        with heartbeat_during(task_uuid):
+            page = connector.discover(
+                job.query,
+                cursor=None,
+                limit=coco_config.get("max_images", 200),
+                explicit_categories=coco_config.get("categories"),
+            )
         shards = page.items
 
         if not shards:
@@ -464,12 +471,13 @@ def discover_open_images(self, job_id: str, job_source_task_id: str):
 
         oi_config = job.config.get("open_images", {})
         connector = OpenImagesConnector(split=oi_config.get("split", "validation"))
-        page = connector.discover(
-            job.query,
-            cursor=None,
-            limit=oi_config.get("max_samples", 200),
-            explicit_classes=oi_config.get("classes"),
-        )
+        with heartbeat_during(task_uuid):
+            page = connector.discover(
+                job.query,
+                cursor=None,
+                limit=oi_config.get("max_samples", 200),
+                explicit_classes=oi_config.get("classes"),
+            )
         shards = page.items
 
         if not shards:
@@ -535,12 +543,13 @@ def discover_pascal_voc(self, job_id: str, job_source_task_id: str):
 
         voc_config = job.config.get("pascal_voc", {})
         connector = PascalVocConnector()
-        page = connector.discover(
-            job.query,
-            cursor=None,
-            limit=voc_config.get("max_images", 200),
-            explicit_categories=voc_config.get("categories"),
-        )
+        with heartbeat_during(task_uuid):
+            page = connector.discover(
+                job.query,
+                cursor=None,
+                limit=voc_config.get("max_images", 200),
+                explicit_categories=voc_config.get("categories"),
+            )
         shards = page.items
 
         if not shards:
@@ -606,12 +615,13 @@ def discover_visual_genome(self, job_id: str, job_source_task_id: str):
 
         vg_config = job.config.get("visual_genome", {})
         connector = VisualGenomeConnector()
-        page = connector.discover(
-            job.query,
-            cursor=None,
-            limit=vg_config.get("max_images", 200),
-            explicit_categories=vg_config.get("categories"),
-        )
+        with heartbeat_during(task_uuid):
+            page = connector.discover(
+                job.query,
+                cursor=None,
+                limit=vg_config.get("max_images", 200),
+                explicit_categories=vg_config.get("categories"),
+            )
         shards = page.items
 
         if not shards:
@@ -677,12 +687,13 @@ def discover_davis(self, job_id: str, job_source_task_id: str):
 
         davis_config = job.config.get("davis", {})
         connector = DavisConnector()
-        page = connector.discover(
-            job.query,
-            cursor=None,
-            limit=davis_config.get("max_images", 200),
-            explicit_categories=davis_config.get("sequences"),
-        )
+        with heartbeat_during(task_uuid):
+            page = connector.discover(
+                job.query,
+                cursor=None,
+                limit=davis_config.get("max_images", 200),
+                explicit_categories=davis_config.get("sequences"),
+            )
         shards = page.items
 
         if not shards:
@@ -748,12 +759,13 @@ def discover_sun_rgbd(self, job_id: str, job_source_task_id: str):
 
         sun_config = job.config.get("sun_rgbd", {})
         connector = SunRgbdConnector()
-        page = connector.discover(
-            job.query,
-            cursor=None,
-            limit=sun_config.get("max_images", 200),
-            explicit_categories=sun_config.get("categories"),
-        )
+        with heartbeat_during(task_uuid):
+            page = connector.discover(
+                job.query,
+                cursor=None,
+                limit=sun_config.get("max_images", 200),
+                explicit_categories=sun_config.get("categories"),
+            )
         shards = page.items
 
         if not shards:
@@ -819,12 +831,13 @@ def discover_nuscenes(self, job_id: str, job_source_task_id: str):
 
         nu_config = job.config.get("nuscenes", {})
         connector = NuImagesConnector()
-        page = connector.discover(
-            job.query,
-            cursor=None,
-            limit=nu_config.get("max_samples", 200),
-            explicit_categories=nu_config.get("categories"),
-        )
+        with heartbeat_during(task_uuid):
+            page = connector.discover(
+                job.query,
+                cursor=None,
+                limit=nu_config.get("max_samples", 200),
+                explicit_categories=nu_config.get("categories"),
+            )
         shards = page.items
 
         if not shards:
@@ -890,12 +903,13 @@ def discover_kitti(self, job_id: str, job_source_task_id: str):
 
         kitti_config = job.config.get("kitti", {})
         connector = KittiConnector()
-        page = connector.discover(
-            job.query,
-            cursor=None,
-            limit=kitti_config.get("max_images", 200),
-            explicit_categories=kitti_config.get("categories"),
-        )
+        with heartbeat_during(task_uuid):
+            page = connector.discover(
+                job.query,
+                cursor=None,
+                limit=kitti_config.get("max_images", 200),
+                explicit_categories=kitti_config.get("categories"),
+            )
         shards = page.items
 
         if not shards:

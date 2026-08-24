@@ -177,6 +177,9 @@ class NuImagesConnector:
 
         from PIL import Image
 
+        if should_stop():
+            raise JobStopped("should_stop() signalled before nuImages shard fetch began")
+
         try:
             cache_dir = _ensure_dataset_cached()
             categories, sample_data, object_ann = _load_tables(cache_dir)
