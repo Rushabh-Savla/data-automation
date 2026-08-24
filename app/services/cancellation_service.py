@@ -16,6 +16,7 @@ _PAUSE_KEY = "job:{job_id}:paused"
 _CANCEL_KEY = "job:{job_id}:cancelled"
 _TARGET_REACHED_KEY = "job:{job_id}:target_reached"
 _ACTIVE_TASKS_KEY = "job:{job_id}:active_task_ids"
+_SOURCE_CAP_REACHED_KEY = "job:{job_id}:source:{source_task_id}:cap_reached"
 
 
 class CancellationService:
@@ -49,15 +50,38 @@ class CancellationService:
     def is_target_reached(self, job_id: str) -> bool:
         return bool(self.redis.exists(_TARGET_REACHED_KEY.format(job_id=job_id)))
 
-    def should_stop(self, job_id: str) -> bool:
-        return self.is_cancelled(job_id) or self.is_paused(job_id) or self.is_target_reached(job_id)
+    # -- Per-source fair-share cap: lets one source's own connector loop stop
+    # itself (so other sources keep running) without touching the job-wide
+    # cancel/pause/target flags above. See app/tasks/_helpers.py::build_on_progress
+    # for where this gets set, and the bug it fixes: a single fast source
+    # (e.g. one whose data was already cached) reaching the job's whole
+    # target_count on its own used to flip should_stop() for *every* source,
+    # starving the others of any contribution at all. --
 
-    def raise_if_stopped(self, job_id: str) -> None:
+    def mark_source_cap_reached(self, job_id: str, source_task_id: str) -> None:
+        self.redis.set(_SOURCE_CAP_REACHED_KEY.format(job_id=job_id, source_task_id=source_task_id), "1")
+
+    def clear_source_cap_reached(self, job_id: str, source_task_id: str) -> None:
+        self.redis.delete(_SOURCE_CAP_REACHED_KEY.format(job_id=job_id, source_task_id=source_task_id))
+
+    def is_source_cap_reached(self, job_id: str, source_task_id: str) -> bool:
+        return bool(self.redis.exists(_SOURCE_CAP_REACHED_KEY.format(job_id=job_id, source_task_id=source_task_id)))
+
+    def should_stop(self, job_id: str, source_task_id: str | None = None) -> bool:
+        if self.is_cancelled(job_id) or self.is_paused(job_id) or self.is_target_reached(job_id):
+            return True
+        if source_task_id is not None and self.is_source_cap_reached(job_id, source_task_id):
+            return True
+        return False
+
+    def raise_if_stopped(self, job_id: str, source_task_id: str | None = None) -> None:
         if self.is_cancelled(job_id):
             raise JobCancelled(job_id)
         if self.is_paused(job_id):
             raise JobPaused(job_id)
         if self.is_target_reached(job_id):
+            raise JobTargetReached(job_id)
+        if source_task_id is not None and self.is_source_cap_reached(job_id, source_task_id):
             raise JobTargetReached(job_id)
 
     # -- Active-task tracking, used by cancel to revoke in-flight Celery tasks --

@@ -64,6 +64,19 @@ def discover_kaggle(self, job_id: str, job_source_task_id: str):
 
         job = task.job
         task_repo.set_status(task_uuid, JobSourceTaskStatus.DISCOVERING)
+        # Reset the stall clock to discovery-start — several sources
+        # (Pascal VOC/DAVIS/SUN RGB-D/KITTI/nuImages) do a long blocking
+        # shared-cache download inside discover() itself, before returning
+        # anything; without a fresh heartbeat here the watchdog could mark
+        # a genuinely-progressing discovery as stalled (see
+        # app/tasks/ingest_tasks.py::_run_item_download for the same fix).
+        task_repo.heartbeat(task_uuid)
+        # commit (not flush): this discover() call can block for a long time
+        # (large one-time shared-cache downloads) inside this same open
+        # transaction — a flush alone stays invisible to the watchdog's
+        # separate session until the whole call finishes, which would
+        # defeat the point of writing an early heartbeat.
+        db.commit()
 
         explicit_slugs: list[tuple[str, str]] = job.config.get("kaggle", {}).get("slugs", [])
         discovery_error_reason: str | None = None
@@ -124,6 +137,19 @@ def discover_roboflow(self, job_id: str, job_source_task_id: str):
 
         job = task.job
         task_repo.set_status(task_uuid, JobSourceTaskStatus.DISCOVERING)
+        # Reset the stall clock to discovery-start — several sources
+        # (Pascal VOC/DAVIS/SUN RGB-D/KITTI/nuImages) do a long blocking
+        # shared-cache download inside discover() itself, before returning
+        # anything; without a fresh heartbeat here the watchdog could mark
+        # a genuinely-progressing discovery as stalled (see
+        # app/tasks/ingest_tasks.py::_run_item_download for the same fix).
+        task_repo.heartbeat(task_uuid)
+        # commit (not flush): this discover() call can block for a long time
+        # (large one-time shared-cache downloads) inside this same open
+        # transaction — a flush alone stays invisible to the watchdog's
+        # separate session until the whole call finishes, which would
+        # defeat the point of writing an early heartbeat.
+        db.commit()
 
         rf_config = job.config.get("roboflow", {})
         explicit_projects: list[list] = rf_config.get("projects", [])
@@ -194,6 +220,19 @@ def discover_youtube(self, job_id: str, job_source_task_id: str):
 
         job = task.job
         task_repo.set_status(task_uuid, JobSourceTaskStatus.DISCOVERING)
+        # Reset the stall clock to discovery-start — several sources
+        # (Pascal VOC/DAVIS/SUN RGB-D/KITTI/nuImages) do a long blocking
+        # shared-cache download inside discover() itself, before returning
+        # anything; without a fresh heartbeat here the watchdog could mark
+        # a genuinely-progressing discovery as stalled (see
+        # app/tasks/ingest_tasks.py::_run_item_download for the same fix).
+        task_repo.heartbeat(task_uuid)
+        # commit (not flush): this discover() call can block for a long time
+        # (large one-time shared-cache downloads) inside this same open
+        # transaction — a flush alone stays invisible to the watchdog's
+        # separate session until the whole call finishes, which would
+        # defeat the point of writing an early heartbeat.
+        db.commit()
 
         yt_config = job.config.get("youtube", {})
         explicit_urls: list[str] = yt_config.get("urls", [])
@@ -269,6 +308,19 @@ def discover_web(self, job_id: str, job_source_task_id: str):
 
         job = task.job
         task_repo.set_status(task_uuid, JobSourceTaskStatus.DISCOVERING)
+        # Reset the stall clock to discovery-start — several sources
+        # (Pascal VOC/DAVIS/SUN RGB-D/KITTI/nuImages) do a long blocking
+        # shared-cache download inside discover() itself, before returning
+        # anything; without a fresh heartbeat here the watchdog could mark
+        # a genuinely-progressing discovery as stalled (see
+        # app/tasks/ingest_tasks.py::_run_item_download for the same fix).
+        task_repo.heartbeat(task_uuid)
+        # commit (not flush): this discover() call can block for a long time
+        # (large one-time shared-cache downloads) inside this same open
+        # transaction — a flush alone stays invisible to the watchdog's
+        # separate session until the whole call finishes, which would
+        # defeat the point of writing an early heartbeat.
+        db.commit()
 
         web_config = job.config.get("web", {})
         connector = WebScrapeConnector(safesearch=web_config.get("safesearch", "moderate"))
@@ -322,6 +374,19 @@ def discover_coco(self, job_id: str, job_source_task_id: str):
 
         job = task.job
         task_repo.set_status(task_uuid, JobSourceTaskStatus.DISCOVERING)
+        # Reset the stall clock to discovery-start — several sources
+        # (Pascal VOC/DAVIS/SUN RGB-D/KITTI/nuImages) do a long blocking
+        # shared-cache download inside discover() itself, before returning
+        # anything; without a fresh heartbeat here the watchdog could mark
+        # a genuinely-progressing discovery as stalled (see
+        # app/tasks/ingest_tasks.py::_run_item_download for the same fix).
+        task_repo.heartbeat(task_uuid)
+        # commit (not flush): this discover() call can block for a long time
+        # (large one-time shared-cache downloads) inside this same open
+        # transaction — a flush alone stays invisible to the watchdog's
+        # separate session until the whole call finishes, which would
+        # defeat the point of writing an early heartbeat.
+        db.commit()
 
         coco_config = job.config.get("coco", {})
         connector = CocoConnector(
@@ -383,6 +448,19 @@ def discover_open_images(self, job_id: str, job_source_task_id: str):
 
         job = task.job
         task_repo.set_status(task_uuid, JobSourceTaskStatus.DISCOVERING)
+        # Reset the stall clock to discovery-start — several sources
+        # (Pascal VOC/DAVIS/SUN RGB-D/KITTI/nuImages) do a long blocking
+        # shared-cache download inside discover() itself, before returning
+        # anything; without a fresh heartbeat here the watchdog could mark
+        # a genuinely-progressing discovery as stalled (see
+        # app/tasks/ingest_tasks.py::_run_item_download for the same fix).
+        task_repo.heartbeat(task_uuid)
+        # commit (not flush): this discover() call can block for a long time
+        # (large one-time shared-cache downloads) inside this same open
+        # transaction — a flush alone stays invisible to the watchdog's
+        # separate session until the whole call finishes, which would
+        # defeat the point of writing an early heartbeat.
+        db.commit()
 
         oi_config = job.config.get("open_images", {})
         connector = OpenImagesConnector(split=oi_config.get("split", "validation"))
@@ -441,6 +519,19 @@ def discover_pascal_voc(self, job_id: str, job_source_task_id: str):
 
         job = task.job
         task_repo.set_status(task_uuid, JobSourceTaskStatus.DISCOVERING)
+        # Reset the stall clock to discovery-start — several sources
+        # (Pascal VOC/DAVIS/SUN RGB-D/KITTI/nuImages) do a long blocking
+        # shared-cache download inside discover() itself, before returning
+        # anything; without a fresh heartbeat here the watchdog could mark
+        # a genuinely-progressing discovery as stalled (see
+        # app/tasks/ingest_tasks.py::_run_item_download for the same fix).
+        task_repo.heartbeat(task_uuid)
+        # commit (not flush): this discover() call can block for a long time
+        # (large one-time shared-cache downloads) inside this same open
+        # transaction — a flush alone stays invisible to the watchdog's
+        # separate session until the whole call finishes, which would
+        # defeat the point of writing an early heartbeat.
+        db.commit()
 
         voc_config = job.config.get("pascal_voc", {})
         connector = PascalVocConnector()
@@ -499,6 +590,19 @@ def discover_visual_genome(self, job_id: str, job_source_task_id: str):
 
         job = task.job
         task_repo.set_status(task_uuid, JobSourceTaskStatus.DISCOVERING)
+        # Reset the stall clock to discovery-start — several sources
+        # (Pascal VOC/DAVIS/SUN RGB-D/KITTI/nuImages) do a long blocking
+        # shared-cache download inside discover() itself, before returning
+        # anything; without a fresh heartbeat here the watchdog could mark
+        # a genuinely-progressing discovery as stalled (see
+        # app/tasks/ingest_tasks.py::_run_item_download for the same fix).
+        task_repo.heartbeat(task_uuid)
+        # commit (not flush): this discover() call can block for a long time
+        # (large one-time shared-cache downloads) inside this same open
+        # transaction — a flush alone stays invisible to the watchdog's
+        # separate session until the whole call finishes, which would
+        # defeat the point of writing an early heartbeat.
+        db.commit()
 
         vg_config = job.config.get("visual_genome", {})
         connector = VisualGenomeConnector()
@@ -557,6 +661,19 @@ def discover_davis(self, job_id: str, job_source_task_id: str):
 
         job = task.job
         task_repo.set_status(task_uuid, JobSourceTaskStatus.DISCOVERING)
+        # Reset the stall clock to discovery-start — several sources
+        # (Pascal VOC/DAVIS/SUN RGB-D/KITTI/nuImages) do a long blocking
+        # shared-cache download inside discover() itself, before returning
+        # anything; without a fresh heartbeat here the watchdog could mark
+        # a genuinely-progressing discovery as stalled (see
+        # app/tasks/ingest_tasks.py::_run_item_download for the same fix).
+        task_repo.heartbeat(task_uuid)
+        # commit (not flush): this discover() call can block for a long time
+        # (large one-time shared-cache downloads) inside this same open
+        # transaction — a flush alone stays invisible to the watchdog's
+        # separate session until the whole call finishes, which would
+        # defeat the point of writing an early heartbeat.
+        db.commit()
 
         davis_config = job.config.get("davis", {})
         connector = DavisConnector()
@@ -615,6 +732,19 @@ def discover_sun_rgbd(self, job_id: str, job_source_task_id: str):
 
         job = task.job
         task_repo.set_status(task_uuid, JobSourceTaskStatus.DISCOVERING)
+        # Reset the stall clock to discovery-start — several sources
+        # (Pascal VOC/DAVIS/SUN RGB-D/KITTI/nuImages) do a long blocking
+        # shared-cache download inside discover() itself, before returning
+        # anything; without a fresh heartbeat here the watchdog could mark
+        # a genuinely-progressing discovery as stalled (see
+        # app/tasks/ingest_tasks.py::_run_item_download for the same fix).
+        task_repo.heartbeat(task_uuid)
+        # commit (not flush): this discover() call can block for a long time
+        # (large one-time shared-cache downloads) inside this same open
+        # transaction — a flush alone stays invisible to the watchdog's
+        # separate session until the whole call finishes, which would
+        # defeat the point of writing an early heartbeat.
+        db.commit()
 
         sun_config = job.config.get("sun_rgbd", {})
         connector = SunRgbdConnector()
@@ -673,6 +803,19 @@ def discover_nuscenes(self, job_id: str, job_source_task_id: str):
 
         job = task.job
         task_repo.set_status(task_uuid, JobSourceTaskStatus.DISCOVERING)
+        # Reset the stall clock to discovery-start — several sources
+        # (Pascal VOC/DAVIS/SUN RGB-D/KITTI/nuImages) do a long blocking
+        # shared-cache download inside discover() itself, before returning
+        # anything; without a fresh heartbeat here the watchdog could mark
+        # a genuinely-progressing discovery as stalled (see
+        # app/tasks/ingest_tasks.py::_run_item_download for the same fix).
+        task_repo.heartbeat(task_uuid)
+        # commit (not flush): this discover() call can block for a long time
+        # (large one-time shared-cache downloads) inside this same open
+        # transaction — a flush alone stays invisible to the watchdog's
+        # separate session until the whole call finishes, which would
+        # defeat the point of writing an early heartbeat.
+        db.commit()
 
         nu_config = job.config.get("nuscenes", {})
         connector = NuImagesConnector()
@@ -731,6 +874,19 @@ def discover_kitti(self, job_id: str, job_source_task_id: str):
 
         job = task.job
         task_repo.set_status(task_uuid, JobSourceTaskStatus.DISCOVERING)
+        # Reset the stall clock to discovery-start — several sources
+        # (Pascal VOC/DAVIS/SUN RGB-D/KITTI/nuImages) do a long blocking
+        # shared-cache download inside discover() itself, before returning
+        # anything; without a fresh heartbeat here the watchdog could mark
+        # a genuinely-progressing discovery as stalled (see
+        # app/tasks/ingest_tasks.py::_run_item_download for the same fix).
+        task_repo.heartbeat(task_uuid)
+        # commit (not flush): this discover() call can block for a long time
+        # (large one-time shared-cache downloads) inside this same open
+        # transaction — a flush alone stays invisible to the watchdog's
+        # separate session until the whole call finishes, which would
+        # defeat the point of writing an early heartbeat.
+        db.commit()
 
         kitti_config = job.config.get("kitti", {})
         connector = KittiConnector()

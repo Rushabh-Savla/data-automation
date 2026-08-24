@@ -22,6 +22,7 @@ from pathlib import Path
 import requests
 
 from app.connectors.base import (
+    HTTP_HEADERS,
     DiscoveryPage,
     OnProgressFn,
     RawAssetDraft,
@@ -48,7 +49,7 @@ def _cache_dir() -> Path:
 
 def _download_and_unzip(url: str, dest_json: Path) -> None:
     tmp_zip = dest_json.with_suffix(".zip.tmp")
-    with requests.get(url, stream=True, timeout=300) as r:
+    with requests.get(url, stream=True, timeout=300, headers=HTTP_HEADERS) as r:
         r.raise_for_status()
         with open(tmp_zip, "wb") as f:
             for chunk in r.iter_content(chunk_size=1 << 20):
@@ -195,7 +196,7 @@ class VisualGenomeConnector:
             url = info["url"]
             dest = workdir / f"vg_{image_id}.jpg"
             try:
-                with requests.get(url, stream=True, timeout=30) as r:
+                with requests.get(url, stream=True, timeout=30, headers=HTTP_HEADERS) as r:
                     r.raise_for_status()
                     with open(dest, "wb") as f:
                         for chunk in r.iter_content(chunk_size=65536):

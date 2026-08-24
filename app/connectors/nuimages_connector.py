@@ -23,6 +23,7 @@ from pathlib import Path
 import requests
 
 from app.connectors.base import (
+    HTTP_HEADERS,
     DiscoveryPage,
     OnProgressFn,
     RawAssetDraft,
@@ -63,7 +64,7 @@ def _ensure_dataset_cached() -> Path:
         logger.info(f"Downloading nuImages v1.0-mini ({_ARCHIVE_URL})")
         tmp_path = tgz_path.with_suffix(".tgz.tmp")
         try:
-            with requests.get(_ARCHIVE_URL, stream=True, timeout=120) as r:
+            with requests.get(_ARCHIVE_URL, stream=True, timeout=120, headers=HTTP_HEADERS) as r:
                 r.raise_for_status()
                 with open(tmp_path, "wb") as f:
                     for chunk in r.iter_content(chunk_size=1 << 20):

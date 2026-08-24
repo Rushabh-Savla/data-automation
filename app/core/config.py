@@ -42,9 +42,15 @@ class Settings(BaseSettings):
     credential_encryption_key: str = ""
 
     # -- Celery tuning -------------------------------------------------------------
-    celery_task_soft_time_limit_s: int = 1800
-    celery_task_time_limit_s: int = 2100
-    watchdog_stall_threshold_s: int = 300
+    # Raised from 1800/2100 (30/35 min): several connectors' shared one-time
+    # cache downloads (KITTI ~12GB, SUN RGB-D ~6.9GB) can legitimately take
+    # longer than 30 minutes on a real connection — the old limits would
+    # kill those tasks outright regardless of the watchdog/heartbeat fix
+    # below. watchdog_stall_threshold_s is set well under these so the
+    # stall safety net still fires with headroom before Celery's own kill.
+    celery_task_soft_time_limit_s: int = 3600
+    celery_task_time_limit_s: int = 3900
+    watchdog_stall_threshold_s: int = 900
 
     # -- Fast-path source selection --------------------------------------------------
     # For small target counts, fanning out to every connector at once wastes time —

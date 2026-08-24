@@ -76,8 +76,20 @@ def _run_item_download(
 
         checkpoint = (task.checkpoint or {}).get(checkpoint_key, {})
         task_repo.set_status(task_uuid, JobSourceTaskStatus.DOWNLOADING)
+        # Reset the stall clock to task-start rather than inheriting a
+        # null/stale heartbeat from an earlier phase. Several connectors
+        # (Kaggle's kagglehub.dataset_download(), and every connector with a
+        # large one-time shared-cache download — Pascal VOC/DAVIS/SUN RGB-D/
+        # KITTI/nuImages) spend minutes inside a single blocking call before
+        # their fetch() loop ever yields its first item and triggers a
+        # progress-based heartbeat. Without this, the watchdog (see
+        # app/core/config.py::watchdog_stall_threshold_s) can mark a
+        # genuinely-progressing task "stalled" and re-dispatch it from
+        # scratch, causing duplicate downloads of the same content.
+        task_repo.heartbeat(task_uuid)
+        db.commit()
 
-        should_stop = build_should_stop(job_uuid)
+        should_stop = build_should_stop(job_uuid, task_uuid)
         base_on_progress = build_on_progress(db, job_uuid, task_uuid)
 
         def on_progress(delta: dict) -> None:

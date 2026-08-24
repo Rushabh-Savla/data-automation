@@ -14,6 +14,21 @@ from typing import Protocol
 
 from app.domain.enums import SourceType
 
+# Shared request headers for connectors' direct `requests.get()`/`.head()`
+# calls to public dataset archives (COCO/Open Images/Pascal VOC/Visual
+# Genome/DAVIS/SUN RGB-D/KITTI/nuImages). Plain `requests` sends
+# `User-Agent: python-requests/x.y.z` by default — an obvious bot signature
+# some hosts (particularly the smaller academic servers this platform pulls
+# from: rgbd.cs.princeton.edu, data.vision.ee.ethz.ch, host.robots.ox.ac.uk)
+# rate-limit or block more readily than a normal browser UA. Kaggle/Roboflow
+# go through their own official SDKs/APIs and don't need this.
+HTTP_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    )
+}
+
 
 @dataclass
 class SourceItem:

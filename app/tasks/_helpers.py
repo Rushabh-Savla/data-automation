@@ -3,6 +3,7 @@ callables injected into connectors, and error classification for retry policy.
 """
 
 import logging
+import math
 import uuid
 from collections.abc import Callable
 
@@ -17,14 +18,34 @@ from app.services.progress_service import ProgressPublisher
 
 logger = logging.getLogger(__name__)
 
+# Fair-share cap on how many images a single source can contribute before
+# the job's target_count is otherwise reached (see build_on_progress's
+# per-source check below). MIN keeps small-target jobs from starving a
+# source down to near-zero; BUFFER gives headroom so sources that legitimately
+# find fewer matches don't stop others from covering the shortfall.
+_MIN_PER_SOURCE_CAP = 10
+_PER_SOURCE_FAIRNESS_BUFFER = 2.0
 
-def build_should_stop(job_id: uuid.UUID) -> Callable[[], bool]:
-    """Returns True if the job has been paused, cancelled, or has already
-    reached its target_count (see build_on_progress's fast-path check)."""
+
+def per_source_cap(target_count: int, num_sources: int) -> int:
+    """How many accepted images a single source may contribute before it
+    stops itself in favor of the other selected sources. Pulled out as a
+    pure function so the fairness math is unit-testable without a DB/Redis
+    fixture — see build_on_progress for where it's actually used."""
+    num_sources = max(1, num_sources)
+    return max(_MIN_PER_SOURCE_CAP, math.ceil(target_count / num_sources * _PER_SOURCE_FAIRNESS_BUFFER))
+
+
+def build_should_stop(job_id: uuid.UUID, job_source_task_id: uuid.UUID | None = None) -> Callable[[], bool]:
+    """Returns True if the job has been paused, cancelled, has already
+    reached its target_count (see build_on_progress's fast-path check), or —
+    when job_source_task_id is given — this one source has hit its own
+    fair-share cap while other selected sources are still working."""
     cancellation = CancellationService(get_redis())
+    source_task_str = str(job_source_task_id) if job_source_task_id is not None else None
 
     def should_stop() -> bool:
-        return cancellation.should_stop(str(job_id))
+        return cancellation.should_stop(str(job_id), source_task_str)
 
     return should_stop
 
@@ -86,8 +107,22 @@ def build_on_progress(
         # source's discovery/download to fully exhaust itself.
         if delta.get("accepted"):
             job = job_repo.get(job_id)
-            if job is not None and job.target_count is not None and job.accepted_count >= job.target_count:
-                cancellation.mark_target_reached(str(job_id))
+            if job is not None and job.target_count is not None:
+                if job.accepted_count >= job.target_count:
+                    cancellation.mark_target_reached(str(job_id))
+                else:
+                    # Per-source fair-share cap: without this, whichever
+                    # source happens to be fastest (e.g. its data was
+                    # already cached) can single-handedly reach the job's
+                    # whole target_count before the other selected sources
+                    # get a single item accepted — should_stop() is job-wide,
+                    # so that one source's speed silently starves every
+                    # other source of any contribution at all. Capping each
+                    # source's own accepted_count keeps room for the rest.
+                    cap = per_source_cap(job.target_count, len(job.sources or []))
+                    task = task_repo.get(job_source_task_id)
+                    if task is not None and task.accepted_count >= cap:
+                        cancellation.mark_source_cap_reached(str(job_id), str(job_source_task_id))
 
         publisher.publish(
             str(job_id),

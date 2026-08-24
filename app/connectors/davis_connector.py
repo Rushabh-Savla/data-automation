@@ -25,6 +25,7 @@ from pathlib import Path
 import requests
 
 from app.connectors.base import (
+    HTTP_HEADERS,
     DiscoveryPage,
     OnProgressFn,
     RawAssetDraft,
@@ -65,7 +66,7 @@ def _ensure_dataset_cached() -> Path:
         logger.info(f"Downloading DAVIS 2017 trainval-480p ({_ARCHIVE_URL})")
         tmp_path = zip_path.with_suffix(".zip.tmp")
         try:
-            with requests.get(_ARCHIVE_URL, stream=True, timeout=300) as r:
+            with requests.get(_ARCHIVE_URL, stream=True, timeout=300, headers=HTTP_HEADERS) as r:
                 r.raise_for_status()
                 with open(tmp_path, "wb") as f:
                     for chunk in r.iter_content(chunk_size=1 << 20):
@@ -115,6 +116,16 @@ def _mask_to_boxes(mask_path: Path, sequence_name: str) -> list[BBox]:
     return boxes
 
 
+def _evenly_sample(paths: list[Path], k: int) -> list[Path]:
+    """Up to k items spread evenly across the (already-sorted) list, rather
+    than the first k — see discover()'s frame-sampling comment for why."""
+    n = len(paths)
+    if n <= k:
+        return paths
+    stride = n / k
+    return [paths[int(i * stride)] for i in range(k)]
+
+
 @register_connector(SourceType.DAVIS)
 class DavisConnector:
     def __init__(self, min_resolution: tuple[int, int] = (64, 64)):
@@ -152,13 +163,22 @@ class DavisConnector:
                 ),
             )
 
+        # Evenly-spaced sampling per matched sequence, not the first N
+        # consecutive frames: consecutive video frames are near-identical
+        # (same scene, a few pixels of motion apart), so grabbing them in a
+        # single burst floods the job with near-duplicates of one source
+        # before dedup ever runs (dedup only runs once every source in the
+        # job is terminal — see app/tasks/orchestration_tasks.py). Spreading
+        # the same budget across the whole sequence gives real visual
+        # variety instead.
+        per_sequence_limit = max(1, limit // len(matched_sequences))
         frames: list[dict] = []
         for seq in sorted(matched_sequences):
             frame_dir = davis_dir / "JPEGImages" / "480p" / seq
-            for frame_path in sorted(frame_dir.glob("*.jpg")):
+            all_frame_paths = sorted(frame_dir.glob("*.jpg"))
+            sampled = _evenly_sample(all_frame_paths, per_sequence_limit)
+            for frame_path in sampled:
                 frames.append({"sequence": seq, "frame": frame_path.stem})
-                if len(frames) >= limit:
-                    break
             if len(frames) >= limit:
                 break
         if not frames:

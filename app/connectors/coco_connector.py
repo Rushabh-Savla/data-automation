@@ -28,6 +28,7 @@ from pathlib import Path
 import requests
 
 from app.connectors.base import (
+    HTTP_HEADERS,
     DiscoveryPage,
     OnProgressFn,
     RawAssetDraft,
@@ -65,7 +66,7 @@ def _ensure_annotations_cached(split: str) -> Path:
     if not zip_path.exists():
         logger.info(f"Downloading COCO annotations ({_ANNOTATIONS_ZIP_URL})")
         tmp_path = zip_path.with_suffix(".zip.tmp")
-        with requests.get(_ANNOTATIONS_ZIP_URL, stream=True, timeout=120) as r:
+        with requests.get(_ANNOTATIONS_ZIP_URL, stream=True, timeout=120, headers=HTTP_HEADERS) as r:
             r.raise_for_status()
             with open(tmp_path, "wb") as f:
                 for chunk in r.iter_content(chunk_size=1 << 20):
@@ -238,7 +239,7 @@ class CocoConnector:
             url = image_info.get("coco_url")
             dest = workdir / image_info["file_name"]
             try:
-                with requests.get(url, stream=True, timeout=30) as r:
+                with requests.get(url, stream=True, timeout=30, headers=HTTP_HEADERS) as r:
                     r.raise_for_status()
                     with open(dest, "wb") as f:
                         for chunk in r.iter_content(chunk_size=65536):

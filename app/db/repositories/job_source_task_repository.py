@@ -4,8 +4,14 @@ from datetime import datetime, timezone
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
+from app.db.models.job import Job
 from app.db.models.job_source_task import JobSourceTask
-from app.domain.enums import JOB_SOURCE_TASK_TERMINAL_STATUSES, JobSourceTaskStatus, SourceType
+from app.domain.enums import (
+    JOB_SOURCE_TASK_TERMINAL_STATUSES,
+    JOB_TERMINAL_STATUSES,
+    JobSourceTaskStatus,
+    SourceType,
+)
 
 
 class JobSourceTaskRepository:
@@ -39,15 +45,25 @@ class JobSourceTaskRepository:
         return all(t.status in JOB_SOURCE_TASK_TERMINAL_STATUSES for t in tasks)
 
     def list_stalled(self, stall_threshold_s: int, now: datetime | None = None) -> list[JobSourceTask]:
+        # Excludes tasks whose parent Job already reached a terminal status
+        # (cancelled/completed/failed) — otherwise a task that stalled right
+        # before its job was cancelled sits in a non-terminal task status
+        # forever and the watchdog resurrects it (re-dispatches discovery)
+        # on every scan, indefinitely, wasting worker capacity on dead jobs.
         now = now or datetime.now(timezone.utc)
         cutoff = now.timestamp() - stall_threshold_s
-        stmt = select(JobSourceTask).where(
-            JobSourceTask.status.in_(
-                [
-                    JobSourceTaskStatus.DISCOVERING,
-                    JobSourceTaskStatus.DOWNLOADING,
-                    JobSourceTaskStatus.STANDARDIZING,
-                ]
+        stmt = (
+            select(JobSourceTask)
+            .join(Job, JobSourceTask.job_id == Job.id)
+            .where(
+                JobSourceTask.status.in_(
+                    [
+                        JobSourceTaskStatus.DISCOVERING,
+                        JobSourceTaskStatus.DOWNLOADING,
+                        JobSourceTaskStatus.STANDARDIZING,
+                    ]
+                ),
+                Job.status.notin_(JOB_TERMINAL_STATUSES),
             )
         )
         stalled = []

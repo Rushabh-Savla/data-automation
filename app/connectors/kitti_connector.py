@@ -22,6 +22,7 @@ from pathlib import Path
 import requests
 
 from app.connectors.base import (
+    HTTP_HEADERS,
     DiscoveryPage,
     OnProgressFn,
     RawAssetDraft,
@@ -57,7 +58,7 @@ def _download_and_extract(url: str, cache_dir: Path, marker_dir: Path) -> None:
         logger.info(f"Downloading KITTI archive ({url})")
         tmp_path = zip_path.with_suffix(".zip.tmp")
         try:
-            with requests.get(url, stream=True, timeout=300) as r:
+            with requests.get(url, stream=True, timeout=300, headers=HTTP_HEADERS) as r:
                 r.raise_for_status()
                 with open(tmp_path, "wb") as f:
                     for chunk in r.iter_content(chunk_size=1 << 20):

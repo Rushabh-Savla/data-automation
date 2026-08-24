@@ -21,6 +21,7 @@ from pathlib import Path
 import requests
 
 from app.connectors.base import (
+    HTTP_HEADERS,
     DiscoveryPage,
     OnProgressFn,
     RawAssetDraft,
@@ -62,7 +63,7 @@ def _ensure_dataset_cached() -> Path:
         logger.info(f"Downloading Pascal VOC 2012 trainval ({_ARCHIVE_URL})")
         tmp_path = tar_path.with_suffix(".tar.tmp")
         try:
-            with requests.get(_ARCHIVE_URL, stream=True, timeout=300) as r:
+            with requests.get(_ARCHIVE_URL, stream=True, timeout=300, headers=HTTP_HEADERS) as r:
                 r.raise_for_status()
                 with open(tmp_path, "wb") as f:
                     for chunk in r.iter_content(chunk_size=1 << 20):

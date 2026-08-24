@@ -24,6 +24,7 @@ from pathlib import Path
 import requests
 
 from app.connectors.base import (
+    HTTP_HEADERS,
     DiscoveryPage,
     OnProgressFn,
     RawAssetDraft,
@@ -61,7 +62,7 @@ def _download_once(url: str, dest: Path, timeout: int = 300) -> None:
         return
     logger.info(f"Downloading Open Images file ({url})")
     tmp_path = dest.with_suffix(dest.suffix + ".tmp")
-    with requests.get(url, stream=True, timeout=timeout) as r:
+    with requests.get(url, stream=True, timeout=timeout, headers=HTTP_HEADERS) as r:
         r.raise_for_status()
         with open(tmp_path, "wb") as f:
             for chunk in r.iter_content(chunk_size=1 << 20):
@@ -237,7 +238,7 @@ class OpenImagesConnector:
             url = f"{_IMAGE_BASE_URL}/{split}/{image_id}.jpg"
             dest = workdir / f"{image_id}.jpg"
             try:
-                with requests.get(url, stream=True, timeout=30) as r:
+                with requests.get(url, stream=True, timeout=30, headers=HTTP_HEADERS) as r:
                     r.raise_for_status()
                     with open(dest, "wb") as f:
                         for chunk in r.iter_content(chunk_size=65536):
