@@ -7,12 +7,18 @@ writing one class and registering it, with zero changes to Celery tasks,
 API routes, or the Job state machine (Open/Closed principle).
 """
 
+import logging
+import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
+import requests
+
 from app.domain.enums import SourceType
+
+logger = logging.getLogger(__name__)
 
 # Shared request headers for connectors' direct `requests.get()`/`.head()`
 # calls to public dataset archives (COCO/Open Images/Pascal VOC/Visual
@@ -31,6 +37,75 @@ HTTP_HEADERS = {
         "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     )
 }
+
+
+def download_with_retry(
+    url: str,
+    tmp_path: Path,
+    *,
+    timeout: int = 300,
+    max_attempts: int = 5,
+    headers: dict | None = None,
+) -> None:
+    """Streams `url` into `tmp_path`, retrying with HTTP Range resume on a
+    dropped connection instead of failing outright on the first transient
+    blip — the one-time shared-cache archive downloads (KITTI ~12GB, DAVIS
+    ~830MB, Pascal VOC ~2GB, SUN RGB-D ~6.9GB, Visual Genome/nuImages
+    metadata) routinely hit a mid-stream connection drop on a real network
+    (observed in production: `IncompleteRead`/`ConnectionError` after
+    hundreds of MB), and without retry a single drop failed the whole
+    discovery task — the caller's own outer try/except just reports it as
+    a permanent failure, never retries, and (without resume) even a manual
+    re-run would have re-downloaded from byte zero.
+
+    Raises `requests.HTTPError` immediately without retrying — a 403/404
+    won't fix itself. Any other exception (dropped connection, timeout,
+    chunked-encoding error) is retried up to `max_attempts` times with
+    capped exponential backoff before being re-raised, so a genuinely
+    unreachable host still surfaces as an error rather than retrying
+    forever.
+
+    Callers keep doing their own `tmp_path.replace(dest)` once this
+    returns, exactly as before — this only replaces the inner write loop,
+    not the surrounding cache/atomic-rename structure every connector
+    already has."""
+    req_headers = dict(headers or {})
+    last_error: Exception | None = None
+
+    for attempt in range(max_attempts):
+        resume_from = tmp_path.stat().st_size if tmp_path.exists() else 0
+        attempt_headers = dict(req_headers)
+        mode = "wb"
+        if resume_from:
+            attempt_headers["Range"] = f"bytes={resume_from}-"
+            mode = "ab"
+
+        try:
+            with requests.get(url, stream=True, timeout=timeout, headers=attempt_headers) as r:
+                if resume_from and r.status_code == 200:
+                    # Server ignored the Range request (doesn't support
+                    # resume for this URL) — the response body is the whole
+                    # file again, so start over rather than append a full
+                    # copy after the partial bytes already on disk.
+                    mode = "wb"
+                r.raise_for_status()
+                with open(tmp_path, mode) as f:
+                    for chunk in r.iter_content(chunk_size=1 << 20):
+                        f.write(chunk)
+            return
+        except requests.HTTPError:
+            raise
+        except Exception as e:
+            last_error = e
+            if attempt < max_attempts - 1:
+                wait = min(2**attempt, 30)
+                logger.warning(
+                    f"Download of {url} interrupted ({e}); retrying in {wait}s "
+                    f"(attempt {attempt + 2}/{max_attempts})"
+                )
+                time.sleep(wait)
+
+    raise last_error
 
 
 @dataclass

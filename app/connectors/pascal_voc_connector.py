@@ -27,6 +27,7 @@ from app.connectors.base import (
     RawAssetDraft,
     ShouldStopFn,
     SourceItem,
+    download_with_retry,
     register_connector,
 )
 from app.core.config import get_settings
@@ -63,11 +64,7 @@ def _ensure_dataset_cached() -> Path:
         logger.info(f"Downloading Pascal VOC 2012 trainval ({_ARCHIVE_URL})")
         tmp_path = tar_path.with_suffix(".tar.tmp")
         try:
-            with requests.get(_ARCHIVE_URL, stream=True, timeout=300, headers=HTTP_HEADERS) as r:
-                r.raise_for_status()
-                with open(tmp_path, "wb") as f:
-                    for chunk in r.iter_content(chunk_size=1 << 20):
-                        f.write(chunk)
+            download_with_retry(_ARCHIVE_URL, tmp_path, timeout=300, headers=HTTP_HEADERS)
         except requests.HTTPError as e:
             raise FatalConnectorError(f"Pascal VOC archive not accessible: {e}") from e
         tmp_path.replace(tar_path)

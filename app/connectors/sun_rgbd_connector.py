@@ -31,6 +31,7 @@ from app.connectors.base import (
     RawAssetDraft,
     ShouldStopFn,
     SourceItem,
+    download_with_retry,
     register_connector,
 )
 from app.core.config import get_settings
@@ -68,11 +69,7 @@ def _ensure_records_cached() -> list[dict]:
     if not mat_path.exists():
         logger.info(f"Downloading SUN RGB-D 2D bbox metadata ({_META_URL})")
         tmp_path = mat_path.with_suffix(".mat.tmp")
-        with requests.get(_META_URL, stream=True, timeout=60, headers=HTTP_HEADERS) as r:
-            r.raise_for_status()
-            with open(tmp_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=1 << 20):
-                    f.write(chunk)
+        download_with_retry(_META_URL, tmp_path, timeout=60, headers=HTTP_HEADERS)
         tmp_path.replace(mat_path)
 
     import scipy.io as sio
@@ -115,11 +112,7 @@ def _ensure_images_cached() -> Path:
         logger.info(f"Downloading SUN RGB-D images ({_IMAGES_URL})")
         tmp_path = zip_path.with_suffix(".zip.tmp")
         try:
-            with requests.get(_IMAGES_URL, stream=True, timeout=300, headers=HTTP_HEADERS) as r:
-                r.raise_for_status()
-                with open(tmp_path, "wb") as f:
-                    for chunk in r.iter_content(chunk_size=1 << 20):
-                        f.write(chunk)
+            download_with_retry(_IMAGES_URL, tmp_path, timeout=300, headers=HTTP_HEADERS)
         except requests.HTTPError as e:
             raise FatalConnectorError(f"SUN RGB-D image archive not accessible: {e}") from e
         tmp_path.replace(zip_path)

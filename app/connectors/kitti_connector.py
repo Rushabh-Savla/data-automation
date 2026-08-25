@@ -28,6 +28,7 @@ from app.connectors.base import (
     RawAssetDraft,
     ShouldStopFn,
     SourceItem,
+    download_with_retry,
     register_connector,
 )
 from app.core.config import get_settings
@@ -58,11 +59,7 @@ def _download_and_extract(url: str, cache_dir: Path, marker_dir: Path) -> None:
         logger.info(f"Downloading KITTI archive ({url})")
         tmp_path = zip_path.with_suffix(".zip.tmp")
         try:
-            with requests.get(url, stream=True, timeout=300, headers=HTTP_HEADERS) as r:
-                r.raise_for_status()
-                with open(tmp_path, "wb") as f:
-                    for chunk in r.iter_content(chunk_size=1 << 20):
-                        f.write(chunk)
+            download_with_retry(url, tmp_path, timeout=300, headers=HTTP_HEADERS)
         except requests.HTTPError as e:
             raise FatalConnectorError(f"KITTI archive not accessible: {e}") from e
         tmp_path.replace(zip_path)

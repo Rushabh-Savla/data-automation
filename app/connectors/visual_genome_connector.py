@@ -28,6 +28,7 @@ from app.connectors.base import (
     RawAssetDraft,
     ShouldStopFn,
     SourceItem,
+    download_with_retry,
     register_connector,
 )
 from app.core.config import get_settings
@@ -49,11 +50,7 @@ def _cache_dir() -> Path:
 
 def _download_and_unzip(url: str, dest_json: Path) -> None:
     tmp_zip = dest_json.with_suffix(".zip.tmp")
-    with requests.get(url, stream=True, timeout=300, headers=HTTP_HEADERS) as r:
-        r.raise_for_status()
-        with open(tmp_zip, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1 << 20):
-                f.write(chunk)
+    download_with_retry(url, tmp_zip, timeout=300, headers=HTTP_HEADERS)
     with zipfile.ZipFile(tmp_zip) as zf:
         member = next(n for n in zf.namelist() if n.endswith(".json"))
         with zf.open(member) as src, open(dest_json.with_suffix(".json.tmp"), "wb") as dst:
