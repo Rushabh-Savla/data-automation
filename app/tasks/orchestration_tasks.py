@@ -207,7 +207,7 @@ def evaluate_job_completion(self, job_id: str):
             clear_job_context()
             return
 
-        success = JobCompletionEvaluator.is_success(reason, job.accepted_count)
+        success = JobCompletionEvaluator.is_success(reason, job.accepted_count, job.target_count)
         event = "complete" if success else ("fail" if job.accepted_count == 0 else "complete_partial")
         new_status = JobStateMachine.transition(job.status, event)
         job_repo.set_status(job_uuid, new_status, completion_reason=reason)

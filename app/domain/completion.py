@@ -42,11 +42,19 @@ class JobCompletionEvaluator:
         return None
 
     @staticmethod
-    def is_success(reason: JobCompletionReason, accepted_count: int) -> bool:
-        """Whether the terminal status should be `completed` vs `completed_partial`/`failed`."""
-        if reason in (
-            JobCompletionReason.TARGET_COUNT_REACHED,
-            JobCompletionReason.SOURCES_EXHAUSTED,
-        ):
+    def is_success(reason: JobCompletionReason, accepted_count: int, target_count: int | None = None) -> bool:
+        """Whether the terminal status should be `completed` vs `completed_partial`/`failed`.
+
+        SOURCES_EXHAUSTED with a target_count set means every source ran dry
+        before target_count was reached — that's a genuine shortfall, not a
+        success, even though *some* assets were delivered. Without this, a
+        job that asked for 100 and delivered 60 once real supply ran out
+        was reported as a plain `completed` success, silently masking that
+        it under-delivered against what was actually requested."""
+        if reason == JobCompletionReason.TARGET_COUNT_REACHED:
+            return accepted_count > 0
+        if reason == JobCompletionReason.SOURCES_EXHAUSTED:
+            if target_count is not None:
+                return accepted_count >= target_count > 0
             return accepted_count > 0
         return False

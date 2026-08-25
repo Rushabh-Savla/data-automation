@@ -63,6 +63,17 @@ class Settings(BaseSettings):
     fast_path_enabled: bool = True
     fast_path_max_target_count: int = 50
 
+    # -- Target count vs delivered count ----------------------------------------------
+    # Discovery/download stops as soon as target_count PROMOTED assets exist, but
+    # relevance filtering and dedup run afterward and can only reduce that count —
+    # with no buffer, a job that fetches exactly target_count often delivers fewer
+    # once irrelevant/duplicate assets are removed. Fetching this many times
+    # target_count up front gives filtering enough raw material that the survivors
+    # still land on target_count in the common case (see build_on_progress in
+    # app/tasks/_helpers.py); trim_excess_assets (app/tasks/filtering_tasks.py)
+    # trims any overshoot back down to exactly target_count afterward.
+    target_overfetch_buffer: float = 1.5
+
     # -- Source credentials (fallback if not set via the Credential API) -----------
     roboflow_api_key: str = ""
     kaggle_username: str = ""

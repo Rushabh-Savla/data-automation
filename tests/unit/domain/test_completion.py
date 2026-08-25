@@ -56,5 +56,34 @@ class TestJobCompletionEvaluator:
             (JobCompletionReason.CANCELLED, 5, False),
         ],
     )
-    def test_is_success(self, reason, accepted_count, expected):
+    def test_is_success_without_target_count(self, reason, accepted_count, expected):
+        # No target_count passed (defaults to None) — unchanged from before
+        # target_count-aware success was added: any positive count counts
+        # as success for these two reasons.
         assert JobCompletionEvaluator.is_success(reason, accepted_count) is expected
+
+    def test_sources_exhausted_short_of_target_is_not_success(self):
+        # The actual bug this fixes: sources ran dry at 60/100 requested —
+        # this used to report as a plain `completed` success, silently
+        # masking that it under-delivered against target_count.
+        assert (
+            JobCompletionEvaluator.is_success(JobCompletionReason.SOURCES_EXHAUSTED, 60, target_count=100) is False
+        )
+
+    def test_sources_exhausted_meeting_target_is_success(self):
+        assert (
+            JobCompletionEvaluator.is_success(JobCompletionReason.SOURCES_EXHAUSTED, 100, target_count=100) is True
+        )
+
+    def test_sources_exhausted_exceeding_target_is_success(self):
+        assert (
+            JobCompletionEvaluator.is_success(JobCompletionReason.SOURCES_EXHAUSTED, 150, target_count=100) is True
+        )
+
+    def test_target_count_reached_ignores_target_count_param(self):
+        # Redundant with the stop-condition already having required
+        # accepted_count >= target_count to reach this reason at all — the
+        # success check itself doesn't need to re-compare.
+        assert (
+            JobCompletionEvaluator.is_success(JobCompletionReason.TARGET_COUNT_REACHED, 10, target_count=100) is True
+        )

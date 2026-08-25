@@ -1,4 +1,4 @@
-from app.tasks.filtering_tasks import _chunk
+from app.tasks.filtering_tasks import _chunk, _select_trim_candidates
 
 
 class TestChunk:
@@ -19,3 +19,23 @@ class TestChunk:
         # zero or producing an empty/infinite range
         assert _chunk([1, 2, 3], 0) == [[1], [2], [3]]
         assert _chunk([1, 2, 3], -5) == [[1], [2], [3]]
+
+
+class TestSelectTrimCandidates:
+    def test_no_excess_selects_nothing(self):
+        assert _select_trim_candidates([("a", 0.9), ("b", 0.5)], excess=0) == []
+        assert _select_trim_candidates([("a", 0.9), ("b", 0.5)], excess=-1) == []
+
+    def test_cuts_the_worst_scoring_first(self):
+        assets = [("a", 0.9), ("b", 0.2), ("c", 0.6), ("d", 0.4)]
+        assert _select_trim_candidates(assets, excess=2) == ["b", "d"]
+
+    def test_none_scores_are_cut_before_any_scored_asset(self):
+        assets = [("a", 0.9), ("b", None), ("c", 0.1)]
+        # "b" (no score at all) is treated as the least confident match —
+        # cut before "c", which at least has a (low) real score.
+        assert _select_trim_candidates(assets, excess=1) == ["b"]
+
+    def test_excess_larger_than_input_returns_everything(self):
+        assets = [("a", 0.9), ("b", 0.5)]
+        assert set(_select_trim_candidates(assets, excess=5)) == {"a", "b"}

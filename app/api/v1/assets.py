@@ -14,6 +14,7 @@ from app.db.repositories.asset_repository import AssetRepository
 from app.domain.enums import AssetStatus, SourceType
 from app.schemas.asset import AssetResponse
 from app.schemas.common import PageResponse
+from app.services.standardization_service import delete_asset_files
 
 logger = logging.getLogger(__name__)
 
@@ -103,7 +104,9 @@ def get_asset_thumbnail(asset_id: uuid.UUID, db: Session = Depends(get_db)):
 @router.delete("/assets/{asset_id}", status_code=204)
 def delete_asset(asset_id: uuid.UUID, db: Session = Depends(get_db)):
     repo = AssetRepository(db)
-    if repo.get(asset_id) is None:
+    asset = repo.get(asset_id)
+    if asset is None:
         raise HTTPException(404, f"Asset {asset_id} not found")
+    delete_asset_files(asset)
     repo.delete(asset_id)
     db.commit()

@@ -55,6 +55,7 @@ from app.filtering.dedup import HybridDeduplicator
 from app.filtering.smolvlm_filter import VisualVerifier
 from app.filtering.yolo_world_filter import DetectionResult, RelevanceFilter, derive_prompt_classes
 from app.services.progress_service import ProgressPublisher
+from app.services.standardization_service import delete_asset_files
 from app.core.redis_client import get_redis
 from app.tasks.celery_app import celery_app
 
@@ -137,6 +138,11 @@ def relevance_filter_batch(self, job_id: str, asset_ids: list[str]) -> dict:
                 passed += 1
             else:
                 asset_repo.set_status(asset.id, AssetStatus.RELEVANCE_REJECTED, relevance_score=score)
+                # Only the relevant/filtered set should ever sit on NAS —
+                # delete the file now that it's known to be irrelevant,
+                # rather than leaving it orphaned forever (see
+                # delete_asset_files' docstring).
+                delete_asset_files(asset)
                 # This asset was already counted in job.accepted_count at
                 # promotion time (the target_count fast-path needs a running
                 # count before filtering can possibly have run) — correct it
@@ -190,9 +196,13 @@ def run_deduplication(self, job_id: str):
         duplicate_count = 0
         for group in groups:
             for dup_id in group.duplicate_asset_ids:
+                dup_asset = asset_repo.get(uuid.UUID(dup_id))
                 asset_repo.set_status(
                     uuid.UUID(dup_id), AssetStatus.DUPLICATE, is_duplicate_of=uuid.UUID(group.keep_asset_id)
                 )
+                # Only the kept (non-duplicate) copy should remain on NAS.
+                if dup_asset is not None:
+                    delete_asset_files(dup_asset)
                 duplicate_count += 1
 
         if duplicate_count:
@@ -203,6 +213,58 @@ def run_deduplication(self, job_id: str):
 
     ProgressPublisher(get_redis()).publish(job_id, {"type": "dedup_complete", "duplicate_count": duplicate_count})
 
+    trim_excess_assets(job_id)
+
     from app.tasks.orchestration_tasks import evaluate_job_completion
 
     evaluate_job_completion.delay(job_id)
+
+
+def _select_trim_candidates(assets: list[tuple[str, float | None]], excess: int) -> list[str]:
+    """Pure selection logic for trim_excess_assets: given (asset_id,
+    relevance_score) pairs and how many need to be cut, returns the
+    `excess` worst-scoring asset ids to remove — None scores sort first
+    (treated as the least-confident matches, cut before any scored asset)."""
+    if excess <= 0:
+        return []
+    ordered = sorted(assets, key=lambda pair: (pair[1] is not None, pair[1]))
+    return [asset_id for asset_id, _ in ordered[:excess]]
+
+
+def trim_excess_assets(job_id: str) -> None:
+    """If a job over-fetched past target_count (see the over-fetch buffer
+    in app/tasks/_helpers.py::build_on_progress, which deliberately fetches
+    more than target_count up front so relevance/dedup attrition still
+    lands on target), trims the worst-scoring surplus back down to exactly
+    target_count — reusing RELEVANCE_REJECTED + delete_asset_files rather
+    than introducing a new status or deletion path. Runs synchronously
+    inside run_deduplication's flow (cheap: one query + a handful of
+    status updates, not per-asset model inference) rather than as its own
+    Celery task."""
+    job_uuid = uuid.UUID(job_id)
+
+    with session_scope() as db:
+        job_repo = JobRepository(db)
+        asset_repo = AssetRepository(db)
+        job = job_repo.get(job_uuid)
+        if job is None or job.target_count is None:
+            return
+
+        excess = job.accepted_count - job.target_count
+        if excess <= 0:
+            return
+
+        kept = asset_repo.list_for_job(job_uuid, status=AssetStatus.RELEVANCE_PASSED, limit=100_000)
+        trim_ids = _select_trim_candidates([(str(a.id), a.relevance_score) for a in kept], excess)
+        if not trim_ids:
+            return
+
+        by_id = {str(a.id): a for a in kept}
+        for asset_id in trim_ids:
+            asset = by_id[asset_id]
+            asset_repo.set_status(asset.id, AssetStatus.RELEVANCE_REJECTED)
+            delete_asset_files(asset)
+
+        job_repo.increment_counts(job_uuid, accepted=-len(trim_ids), rejected=len(trim_ids))
+        db.flush()
+        logger.info(f"Trimmed {len(trim_ids)} excess asset(s) for job {job_id} to match target_count")

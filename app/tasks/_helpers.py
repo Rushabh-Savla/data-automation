@@ -11,6 +11,7 @@ from collections.abc import Callable
 
 from sqlalchemy.orm import Session
 
+from app.core.config import get_settings
 from app.core.logging import bind_job_context, clear_job_context
 from app.core.redis_client import get_redis
 from app.db.repositories.job_repository import JobRepository
@@ -38,6 +39,15 @@ def per_source_cap(target_count: int, num_sources: int) -> int:
     fixture — see build_on_progress for where it's actually used."""
     num_sources = max(1, num_sources)
     return max(_MIN_PER_SOURCE_CAP, math.ceil(target_count / num_sources * _PER_SOURCE_FAIRNESS_BUFFER))
+
+
+def buffered_target(target_count: int, buffer: float) -> int:
+    """How many PROMOTED assets to fetch before stopping, given the job's
+    raw target_count — see build_on_progress for why this is bigger than
+    target_count itself (relevance filtering/dedup run afterward and can
+    only reduce the count). Pulled out as a pure function for the same
+    testability reason as per_source_cap above."""
+    return math.ceil(target_count * buffer)
 
 
 @contextlib.contextmanager
@@ -140,25 +150,38 @@ def build_on_progress(
         # rollups and checkpoint to the same durability granularity.
         db.commit()
 
-        # Fast-path completion check: as soon as a count-based job's target is
-        # hit, flag it so should_stop() (checked by every connector loop)
-        # stops issuing new work immediately, without waiting for every
-        # source's discovery/download to fully exhaust itself.
+        # Fast-path completion check: as soon as a count-based job's
+        # (buffered) target is hit, flag it so should_stop() (checked by
+        # every connector loop) stops issuing new work immediately, without
+        # waiting for every source's discovery/download to fully exhaust
+        # itself. The raw target_count is buffered up (not checked as-is)
+        # because relevance filtering/dedup run afterward and can only
+        # reduce accepted_count — fetching only exactly target_count up
+        # front routinely delivers fewer once irrelevant/duplicate assets
+        # are removed. Fetching target_overfetch_buffer x target_count
+        # instead gives filtering enough raw material that the survivors
+        # still land on target_count in the common case; trim_excess_assets
+        # (app/tasks/filtering_tasks.py) trims any overshoot back down
+        # afterward.
         if delta.get("accepted"):
             job = job_repo.get(job_id)
             if job is not None and job.target_count is not None:
-                if job.accepted_count >= job.target_count:
+                target = buffered_target(job.target_count, get_settings().target_overfetch_buffer)
+                if job.accepted_count >= target:
                     cancellation.mark_target_reached(str(job_id))
                 else:
                     # Per-source fair-share cap: without this, whichever
                     # source happens to be fastest (e.g. its data was
                     # already cached) can single-handedly reach the job's
-                    # whole target_count before the other selected sources
-                    # get a single item accepted — should_stop() is job-wide,
-                    # so that one source's speed silently starves every
-                    # other source of any contribution at all. Capping each
-                    # source's own accepted_count keeps room for the rest.
-                    cap = per_source_cap(job.target_count, len(job.sources or []))
+                    # whole (buffered) target before the other selected
+                    # sources get a single item accepted — should_stop() is
+                    # job-wide, so that one source's speed silently starves
+                    # every other source of any contribution at all. Capping
+                    # each source's own accepted_count keeps room for the
+                    # rest; sized off the same buffered target as the
+                    # job-wide check above, not the raw target_count, so
+                    # per-source ceilings scale with it consistently.
+                    cap = per_source_cap(target, len(job.sources or []))
                     task = task_repo.get(job_source_task_id)
                     if task is not None and task.accepted_count >= cap:
                         cancellation.mark_source_cap_reached(str(job_id), str(job_source_task_id))

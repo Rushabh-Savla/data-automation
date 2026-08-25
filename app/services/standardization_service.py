@@ -4,6 +4,7 @@ to NAS + record provenance" happens, shared by every connector.
 """
 
 import hashlib
+import logging
 import uuid
 from datetime import datetime, timezone
 from functools import lru_cache
@@ -19,10 +20,33 @@ from app.storage.base import StorageBackend
 
 Image.MAX_IMAGE_PIXELS = None  # suppress DecompressionBomb warnings on large datasets
 
+logger = logging.getLogger(__name__)
+
 
 class AssetRejected(Exception):
     """Raised when a draft fails validation (corrupt, too small, etc.) —
     caller should count it toward JobSourceTask.rejected_count, not error_count."""
+
+
+def delete_asset_files(asset: Asset) -> None:
+    """Removes an asset's promoted files from NAS — the symmetric operation
+    to standardize_and_promote's write. Called once an asset stops being
+    part of the kept set (relevance-rejected, deduped, trimmed for
+    exceeding target_count, or explicitly deleted via the API) so NAS only
+    ever holds the final filtered set, not every raw download. nas_path/
+    annotation_nas_path are already absolute (see standardize_and_promote),
+    so this uses them directly rather than going through StorageBackend
+    (whose delete() expects a path relative to its own root) — the same
+    convention get_asset_file already follows for reads. Per-file
+    try/except: a deletion failure is logged and never raised, matching
+    the fail-open pattern used throughout the filtering pipeline."""
+    for path_str in (asset.nas_path, asset.annotation_nas_path):
+        if not path_str:
+            continue
+        try:
+            Path(path_str).unlink(missing_ok=True)
+        except Exception as e:
+            logger.warning(f"Failed to delete asset file {path_str} for asset {asset.id}: {e}")
 
 
 @lru_cache(maxsize=1)
