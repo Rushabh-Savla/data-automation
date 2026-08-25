@@ -137,6 +137,16 @@ class AssetRepository:
         )
         return list(self.db.execute(stmt).scalars().all())
 
+    def list_ids_for_job(self, job_id: uuid.UUID, status: AssetStatus | None = None, limit: int = 100_000) -> list[uuid.UUID]:
+        """Like list_for_job but selects only the id column — avoids
+        hydrating full Asset rows (and their relationships) when a caller
+        only needs to chunk work by id, e.g. run_relevance_filter dispatching
+        a batch of ids per task instead of looping over full rows in-process."""
+        stmt = select(Asset.id).limit(limit)
+        for condition in self._filters(job_id, status, None, None):
+            stmt = stmt.where(condition)
+        return list(self.db.execute(stmt).scalars().all())
+
     def list_for_dedup(self, job_id: uuid.UUID) -> list[Asset]:
         stmt = select(Asset).where(
             Asset.job_id == job_id,

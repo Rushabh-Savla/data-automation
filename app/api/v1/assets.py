@@ -1,6 +1,8 @@
 """Asset browsing, streaming, and deletion."""
 
+import logging
 import uuid
+from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import FileResponse
@@ -13,7 +15,35 @@ from app.domain.enums import AssetStatus, SourceType
 from app.schemas.asset import AssetResponse
 from app.schemas.common import PageResponse
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter(tags=["assets"], dependencies=[Depends(require_api_key)])
+
+_THUMBNAIL_MAX_DIMENSION = 320
+_THUMBNAIL_JPEG_QUALITY = 82
+
+
+def _thumbnail_path_for(nas_path: Path) -> Path:
+    """Derives a sibling cache path for an asset's thumbnail — no DB column
+    or migration needed, since it's always re-derivable from nas_path
+    (already stored). e.g. .../coco_val2017_143961.jpg -> .../coco_val2017_143961.thumb.jpg"""
+    return nas_path.with_name(f"{nas_path.stem}.thumb.jpg")
+
+
+def _generate_thumbnail(src: Path, dest: Path) -> None:
+    """Resizes src to fit within _THUMBNAIL_MAX_DIMENSION (aspect preserved)
+    and writes it to dest as a JPEG. A no-op on any failure (corrupt file,
+    unreadable format) — the route falls back to serving the original file,
+    so a thumbnail-generation hiccup never breaks the grid."""
+    try:
+        from PIL import Image
+
+        with Image.open(src) as img:
+            img = img.convert("RGB")
+            img.thumbnail((_THUMBNAIL_MAX_DIMENSION, _THUMBNAIL_MAX_DIMENSION))
+            img.save(dest, format="JPEG", quality=_THUMBNAIL_JPEG_QUALITY)
+    except Exception as e:
+        logger.warning(f"Thumbnail generation failed for {src}: {e}")
 
 
 @router.get("/jobs/{job_id}/assets", response_model=PageResponse[AssetResponse])
@@ -46,6 +76,28 @@ def get_asset_file(asset_id: uuid.UUID, db: Session = Depends(get_db)):
     if asset is None or not asset.nas_path:
         raise HTTPException(404, f"Asset {asset_id} not found or has no stored file")
     return FileResponse(asset.nas_path)
+
+
+@router.get("/assets/{asset_id}/thumbnail")
+def get_asset_thumbnail(asset_id: uuid.UUID, db: Session = Depends(get_db)):
+    """A small resized JPEG for grid display — the Assets grid used to
+    fetch the full original file (same route as the Download button) for
+    every card just to show it in a small square, which was especially
+    slow for the platform's larger sources (KITTI/SUN RGB-D). Generated
+    once on first request and cached to disk (see _thumbnail_path_for) —
+    every request after that is a plain file read, no repeated resize
+    cost."""
+    asset = AssetRepository(db).get(asset_id)
+    if asset is None or not asset.nas_path:
+        raise HTTPException(404, f"Asset {asset_id} not found or has no stored file")
+
+    nas_path = Path(asset.nas_path)
+    thumb_path = _thumbnail_path_for(nas_path)
+    if not thumb_path.exists():
+        _generate_thumbnail(nas_path, thumb_path)
+
+    serve_path = thumb_path if thumb_path.exists() else nas_path
+    return FileResponse(serve_path, media_type="image/jpeg")
 
 
 @router.delete("/assets/{asset_id}", status_code=204)

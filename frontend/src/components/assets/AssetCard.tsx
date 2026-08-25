@@ -5,13 +5,15 @@ import { toast } from 'sonner'
 import type { AssetResponse } from '@/api/types'
 import { downloadAsset } from '@/api/assets'
 import { useAssetImageUrl } from '@/hooks/useAssetImageUrl'
+import { useInView } from '@/hooks/useInView'
 import { Badge } from '@/components/ui/badge'
 import { assetStatusVariant } from '@/lib/statusMaps'
 import { assetStatusLabels, sourceTypeLabels } from '@/lib/enumLabels'
 import { Skeleton } from '@/components/ui/skeleton'
 
 export function AssetCard({ asset, onClick }: { asset: AssetResponse; onClick: () => void }) {
-  const { url, error } = useAssetImageUrl(asset.id)
+  const [imgContainerRef, inView] = useInView<HTMLDivElement>()
+  const { url, error } = useAssetImageUrl(asset.id, { variant: 'thumbnail', enabled: inView })
   const [downloading, setDownloading] = useState(false)
 
   async function handleDownload(e: React.MouseEvent) {
@@ -29,7 +31,7 @@ export function AssetCard({ asset, onClick }: { asset: AssetResponse; onClick: (
   return (
     <div className="group relative flex flex-col overflow-hidden rounded-lg border text-left transition-shadow hover:shadow-md">
       <button type="button" onClick={onClick} className="contents">
-        <div className="relative aspect-square w-full overflow-hidden bg-muted">
+        <div ref={imgContainerRef} className="relative aspect-square w-full overflow-hidden bg-muted">
           {!url && !error && <Skeleton className="h-full w-full rounded-none" />}
           {error && (
             <div className="flex h-full w-full items-center justify-center text-muted-foreground">

@@ -17,8 +17,8 @@ export function getAsset(assetId: string): Promise<AssetResponse> {
   return apiFetch<AssetResponse>(`/assets/${assetId}`)
 }
 
-export function fetchAssetImageUrl(assetId: string): Promise<string> {
-  return fetchBlobUrl(`/assets/${assetId}/file`)
+export function fetchAssetImageUrl(assetId: string, variant: 'full' | 'thumbnail' = 'full'): Promise<string> {
+  return fetchBlobUrl(`/assets/${assetId}/${variant === 'thumbnail' ? 'thumbnail' : 'file'}`)
 }
 
 export function downloadAsset(asset: AssetResponse): Promise<void> {
