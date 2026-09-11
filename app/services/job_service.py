@@ -175,9 +175,12 @@ class JobService:
 
         self.publisher.publish(str(job_id), {"type": "job_status", "status": job.status.value})
 
-        from app.tasks.orchestration_tasks import evaluate_job_completion
-
-        evaluate_job_completion.delay(str(job_id))
+        # evaluate_job_completion is deliberately NOT enqueued here: this
+        # transaction has only been flush()ed, not committed, and a Celery
+        # worker picking the task up in its own session could read the
+        # pre-cancel status before this commits (the API layer commits
+        # after action() returns — see _apply_control in app/api/v1/jobs.py,
+        # which enqueues it once CANCELLING is durably persisted).
         return job
 
     @staticmethod

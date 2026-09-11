@@ -7,6 +7,7 @@ import { buildJobWsUrl, reconnectDelayMs } from '@/lib/websocket'
 import { JOB_TERMINAL_STATUSES, type JobDetailResponse, type JobProgressResponse, type WsEvent } from '@/api/types'
 import type { ConnectionStatus } from '@/components/layout/ConnectionStatusBadge'
 import { jobCompletionReasonLabels, jobStatusLabels } from '@/lib/enumLabels'
+import { randomId } from '@/lib/utils'
 
 export interface JobLogEvent {
   id: string
@@ -39,7 +40,7 @@ export function useJobProgressSocket(jobId: string | undefined): JobProgressSock
   const [events, setEvents] = useState<JobLogEvent[]>([])
 
   function logEvent(message: string) {
-    setEvents((prev) => [{ id: crypto.randomUUID(), at: new Date().toISOString(), message }, ...prev].slice(0, MAX_LOG_EVENTS))
+    setEvents((prev) => [{ id: randomId(), at: new Date().toISOString(), message }, ...prev].slice(0, MAX_LOG_EVENTS))
   }
 
   const wsRef = useRef<WebSocket | null>(null)

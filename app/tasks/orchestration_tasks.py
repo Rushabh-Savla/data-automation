@@ -183,6 +183,16 @@ def evaluate_job_completion(self, job_id: str):
 
         cancellation = CancellationService(get_redis())
         if cancellation.is_cancelled(job_id):
+            if job.status != JobStatus.CANCELLING:
+                # Redis's cancel flag is set synchronously, but the DB
+                # transaction that moved job.status to CANCELLING may not
+                # have committed yet by the time this task's own session
+                # reads it (see JobService.cancel()/jobs.py::_apply_control).
+                # finish_cancel only accepts CANCELLING as its source state —
+                # retry briefly instead of crashing on IllegalTransitionError,
+                # which would otherwise strand the job in CANCELLING forever.
+                clear_job_context()
+                raise self.retry(countdown=2, max_retries=5)
             job_repo.set_status(
                 job_uuid,
                 JobStateMachine.transition(job.status, "finish_cancel"),
@@ -246,9 +256,18 @@ def watchdog_scan():
 
             JobService(db).start(job.id)
 
-        # -- Deadline sweep for running/discovering jobs -----------------------------
+        # -- Deadline sweep for running/discovering jobs, and re-drive jobs stuck
+        # in CANCELLING (safety net for the commit-ordering race in
+        # JobService.cancel()/evaluate_job_completion's retry guard) --------------
+        _cancelling_stall_threshold_s = 120
         for job in job_repo.list_active():
             if job.deadline_at is not None and now >= job.deadline_at:
+                evaluate_job_completion.delay(str(job.id))
+            elif (
+                job.status == JobStatus.CANCELLING
+                and (now - job.updated_at).total_seconds() > _cancelling_stall_threshold_s
+            ):
+                logger.warning(f"Watchdog: job {job.id} stuck in CANCELLING, re-driving completion")
                 evaluate_job_completion.delay(str(job.id))
 
 

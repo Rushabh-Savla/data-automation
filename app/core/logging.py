@@ -15,6 +15,21 @@ class ContextFilter(logging.Filter):
         return True
 
 
+# Request paths that don't exist anywhere in this app but get hit
+# persistently by LAN device-discovery tools / network scanners on
+# deployers' networks (observed: a router/IoT companion app probing every
+# host on the subnet for a common "device info" API) — legitimately 404,
+# not a bug here, just log noise. Suppressed from uvicorn's access log
+# rather than the app's own logger, since these never reach a route handler.
+_JUNK_ACCESS_LOG_PATHS = ("/api/v1/device/info/unprotected",)
+
+
+class SuppressJunkAccessLogs(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        return not any(path in message for path in _JUNK_ACCESS_LOG_PATHS)
+
+
 def configure_logging(level: int = logging.INFO) -> None:
     handler = logging.StreamHandler(sys.stdout)
     handler.setFormatter(
@@ -29,6 +44,11 @@ def configure_logging(level: int = logging.INFO) -> None:
     root = logging.getLogger()
     root.setLevel(level)
     root.handlers = [handler]
+
+    # uvicorn.access logs via its own handler (set up by uvicorn itself,
+    # not via the root logger above), so it needs its own filter — a no-op
+    # in the worker process, which never runs uvicorn.
+    logging.getLogger("uvicorn.access").addFilter(SuppressJunkAccessLogs())
 
 
 def bind_job_context(job_id: str | None = None, job_source_task_id: str | None = None) -> None:

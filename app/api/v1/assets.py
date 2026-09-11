@@ -76,6 +76,14 @@ def get_asset_file(asset_id: uuid.UUID, db: Session = Depends(get_db)):
     asset = AssetRepository(db).get(asset_id)
     if asset is None or not asset.nas_path:
         raise HTTPException(404, f"Asset {asset_id} not found or has no stored file")
+    if not Path(asset.nas_path).exists():
+        # The asset row can outlive its NAS file — relevance rejection,
+        # dedup, and trim_excess_assets all delete the file but leave the
+        # row (see delete_asset_files' docstring). FileResponse checks
+        # existence lazily inside its ASGI __call__, not here, so without
+        # this it raises an unhandled RuntimeError deep in Starlette
+        # instead of a clean 404.
+        raise HTTPException(404, f"Asset {asset_id}'s file no longer exists on disk")
     return FileResponse(asset.nas_path)
 
 
@@ -97,8 +105,17 @@ def get_asset_thumbnail(asset_id: uuid.UUID, db: Session = Depends(get_db)):
     if not thumb_path.exists():
         _generate_thumbnail(nas_path, thumb_path)
 
-    serve_path = thumb_path if thumb_path.exists() else nas_path
-    return FileResponse(serve_path, media_type="image/jpeg")
+    if thumb_path.exists():
+        return FileResponse(thumb_path, media_type="image/jpeg")
+    if nas_path.exists():
+        return FileResponse(nas_path, media_type="image/jpeg")
+    # Neither the thumbnail nor the original exists — the asset row outlived
+    # its NAS file (relevance rejection/dedup/trim all delete the file but
+    # leave the row; see delete_asset_files' docstring). FileResponse checks
+    # existence lazily inside its ASGI __call__, not here, so blindly
+    # falling back to nas_path raised an unhandled RuntimeError deep in
+    # Starlette instead of a clean 404.
+    raise HTTPException(404, f"Asset {asset_id}'s file no longer exists on disk")
 
 
 @router.delete("/assets/{asset_id}", status_code=204)

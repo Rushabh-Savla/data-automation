@@ -8,6 +8,15 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app.domain.enums import JobCompletionReason, JobSourceTaskStatus, JobStatus, SourceType
 
+# Discovery/download stops as soon as target_count is hit, but the overfetch
+# buffer (see target_overfetch_buffer in app/core/config.py) means
+# accepted_count can legitimately sit above target_count while a job is
+# still DISCOVERING/RUNNING — relevance filtering and dedup (which only run
+# afterward) are what trim it back down to target_count. This flag tells API
+# consumers when that trimming hasn't happened yet, so a temporarily-high
+# accepted_count doesn't read as a bug.
+_FILTERING_IN_PROGRESS_STATUSES = (JobStatus.DISCOVERING, JobStatus.RUNNING)
+
 
 class JobCreateRequest(BaseModel):
     query: str = Field(..., min_length=1, description='Free-text query, e.g. "people with red bag"')
@@ -57,8 +66,19 @@ class JobSourceTaskResponse(BaseModel):
     error_count: int
     error_message: str | None
     last_heartbeat_at: datetime | None
+    discovered_unit: str = "images"
 
     model_config = {"from_attributes": True}
+
+    @model_validator(mode="after")
+    def _set_discovered_unit(self):
+        # Kaggle's discovered_count counts datasets, not individual images —
+        # downloaded/accepted_count still count images extracted from those
+        # datasets, so "discovered: 5, downloaded: 750" is correct, not a
+        # mismatch. This tells API consumers what unit discovered_count is in.
+        if self.source_type == SourceType.KAGGLE:
+            self.discovered_unit = "datasets"
+        return self
 
 
 class JobResponse(BaseModel):
@@ -81,8 +101,14 @@ class JobResponse(BaseModel):
     updated_at: datetime
     started_at: datetime | None
     completed_at: datetime | None
+    filtering_in_progress: bool = False
 
     model_config = {"from_attributes": True}
+
+    @model_validator(mode="after")
+    def _set_filtering_in_progress(self):
+        self.filtering_in_progress = self.status in _FILTERING_IN_PROGRESS_STATUSES
+        return self
 
 
 class JobDetailResponse(JobResponse):
@@ -98,4 +124,10 @@ class JobProgressResponse(BaseModel):
     duplicate_count: int
     discovered_count: int
     downloaded_count: int
+    filtering_in_progress: bool = False
     source_tasks: list[JobSourceTaskResponse] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _set_filtering_in_progress(self):
+        self.filtering_in_progress = self.status in _FILTERING_IN_PROGRESS_STATUSES
+        return self

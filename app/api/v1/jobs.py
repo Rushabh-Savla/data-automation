@@ -136,6 +136,15 @@ def _apply_control(db: Session, job_id: uuid.UUID, action) -> Job:
         raise HTTPException(409, str(e)) from e
     db.commit()
     db.refresh(job)
+    if job.status == JobStatus.CANCELLING:
+        # Only enqueued now that CANCELLING is durably committed — enqueuing
+        # inside JobService.cancel() let a Celery worker's own session race
+        # ahead of this commit and read the pre-cancel status, which crashed
+        # the state-machine transition and stranded the job in CANCELLING
+        # forever (still counted as "active"). See JobService.cancel().
+        from app.tasks.orchestration_tasks import evaluate_job_completion
+
+        evaluate_job_completion.delay(str(job.id))
     return job
 
 
