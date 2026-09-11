@@ -39,7 +39,7 @@ from app.db.session import session_scope
 from app.domain.enums import JobSourceTaskStatus, SourceType
 from app.services.credential_service import CredentialService
 from app.services.standardization_service import AssetRejected
-from app.tasks._helpers import bind_context, build_on_progress, build_should_stop, unbind_context
+from app.tasks._helpers import bind_context, build_on_progress, build_should_stop, heartbeat_during, unbind_context
 from app.tasks.celery_app import celery_app
 from app.tasks.cleanup_tasks import cleanup_kaggle_cache
 from app.tasks.standardize_tasks import standardize_and_promote_sync
@@ -56,12 +56,41 @@ def _run_item_download(
     checkpoint_key: str,
     fetch: Callable[[dict, Callable, Callable], Iterator[RawAssetDraft]],
     on_done: Callable[[], None] | None = None,
+    bound_task=None,
 ) -> dict:
     """Shared driver: resolve the task's namespaced checkpoint, wire up
     should_stop/on_progress, run the connector's fetch() generator through
-    standardization, and translate JobStopped/FatalConnectorError into the
-    right task-level outcome. `fetch(checkpoint, should_stop, on_progress)`
-    is a closure the caller builds around its specific connector + item.
+    standardization, and translate JobStopped/FatalConnectorError/exhausted-
+    retry TransientConnectorError into the right task-level outcome.
+    `fetch(checkpoint, should_stop, on_progress)` is a closure the caller
+    builds around its specific connector + item. `bound_task` is the
+    calling Celery task's `self` (all 12 callers are `bind=True`) — needed
+    to tell an exhausted retry apart from one with attempts left, below.
+
+    FatalConnectorError handling (Kaggle fix):
+    A FatalConnectorError on one dataset (e.g. a restricted/firearm-class
+    dataset returning 403) increments the error counter and returns a clean
+    result dict — it does NOT set the whole source task to FAILED. Setting
+    FAILED here would mark the entire Kaggle source as failed even when 4
+    out of 5 datasets downloaded successfully, which is wrong. The chord
+    callback (on_source_finished) decides the final task status based on
+    the aggregate of all per-item results. Per-item fatal errors are errors,
+    not source-level failures.
+
+    Exhausted-retry TransientConnectorError handling (YouTube fix):
+    autoretry_for=(TransientConnectorError, ...) on each download task
+    retries automatically, but once every retry is exhausted Celery
+    re-raises the original exception unhandled — which, for a task that's
+    part of a chord (every source here dispatches one), raises ChordError
+    into on_source_finished instead of running it. That leaves the
+    JobSourceTask stuck in DOWNLOADING forever, since nothing else ever
+    calls check_and_advance_job for it again. This isn't a rare edge case:
+    a systemic block (e.g. YouTube's CDN 403ing every video for a given
+    host — see youtube_connector.py's _classify_error) makes every item's
+    retries exhaust the same way, guaranteeing the source gets stuck. So
+    once bound_task confirms this was the last permitted attempt, degrade
+    exactly like FatalConnectorError above (record it, keep the chord
+    intact) instead of letting it propagate.
     """
     job_uuid = uuid.UUID(job_id)
     task_uuid = uuid.UUID(job_source_task_id)
@@ -114,11 +143,38 @@ def _run_item_download(
             unbind_context()
             return {"item": checkpoint_key, "accepted": accepted, "rejected": rejected, "stopped": True}
         except FatalConnectorError as e:
-            task_repo.increment_counts(task_uuid, errors=1)
-            task_repo.set_status(task_uuid, JobSourceTaskStatus.FAILED, error_message=str(e))
+            # Increment the error counter on the source task but do NOT set
+            # the task status to FAILED — one inaccessible dataset (e.g. a
+            # restricted firearm/NSFW dataset returning 403) must not mark
+            # the entire Kaggle source as failed when other datasets in the
+            # same chord succeeded. The chord callback (on_source_finished)
+            # will set COMPLETED_PARTIAL if any errors were recorded.
+            with session_scope() as err_db:
+                err_repo = JobSourceTaskRepository(err_db)
+                err_repo.increment_counts(task_uuid, errors=1)
+                # Surfaces the specific reason (e.g. Kaggle's 403/401 dataset
+                # gating) via the existing error_message field instead of it
+                # only ever reaching the worker log — status is left
+                # unchanged (still DOWNLOADING), this is not a task failure.
+                err_repo.set_status(task_uuid, JobSourceTaskStatus.DOWNLOADING, error_message=str(e))
+                err_db.commit()
             unbind_context()
-            logger.error(f"Fatal error downloading {checkpoint_key}: {e}")
-            return {"item": checkpoint_key, "error": str(e)}
+            logger.error(f"Fatal error downloading {checkpoint_key} (recorded as error, not task failure): {e}")
+            return {"item": checkpoint_key, "accepted": accepted, "rejected": rejected, "error": str(e)}
+        except (TransientConnectorError, ConnectionError, TimeoutError) as e:
+            retries = getattr(getattr(bound_task, "request", None), "retries", None)
+            max_retries = getattr(bound_task, "max_retries", None)
+            if bound_task is not None and retries is not None and max_retries is not None and retries < max_retries:
+                unbind_context()
+                raise  # attempts remain — let autoretry_for retry this task again
+            with session_scope() as err_db:
+                err_repo = JobSourceTaskRepository(err_db)
+                err_repo.increment_counts(task_uuid, errors=1)
+                err_repo.set_status(task_uuid, JobSourceTaskStatus.DOWNLOADING, error_message=str(e))
+                err_db.commit()
+            unbind_context()
+            logger.error(f"Exhausted retries downloading {checkpoint_key} (recorded as error, not task failure): {e}")
+            return {"item": checkpoint_key, "accepted": accepted, "rejected": rejected, "error": str(e)}
 
         if on_done is not None:
             on_done()
@@ -156,12 +212,20 @@ def download_kaggle_dataset(self, job_id: str, job_source_task_id: str, item_dic
     connector = KaggleConnector(min_resolution=min_res)
 
     def fetch(checkpoint, should_stop, on_progress):
-        with credential_service.scoped_env(SourceType.KAGGLE):
+        # kagglehub.dataset_download() is one blocking call with no progress
+        # callback of its own — for a large dataset on a slow connection it
+        # can run well past the watchdog's stall threshold before the walk
+        # loop below ever yields its first item and starts its own
+        # per-image heartbeats. Without this, the watchdog kills and
+        # restarts the task from scratch, which for a persistently slow/huge
+        # dataset means it never actually finishes (killed → re-download
+        # from zero → killed again).
+        with credential_service.scoped_env(SourceType.KAGGLE), heartbeat_during(uuid.UUID(job_source_task_id)):
             yield from connector.fetch(item, workdir, checkpoint, should_stop, on_progress)
 
     return _run_item_download(
         job_id, job_source_task_id, SourceType.KAGGLE, slug, fetch,
-        on_done=lambda: cleanup_kaggle_cache(slug),
+        on_done=lambda: cleanup_kaggle_cache(slug), bound_task=self,
     )
 
 
@@ -199,7 +263,7 @@ def download_roboflow_item(self, job_id: str, job_source_task_id: str, item_dict
     def fetch(checkpoint, should_stop, on_progress):
         yield from connector.fetch(item, workdir, checkpoint, should_stop, on_progress)
 
-    return _run_item_download(job_id, job_source_task_id, SourceType.ROBOFLOW, checkpoint_key, fetch)
+    return _run_item_download(job_id, job_source_task_id, SourceType.ROBOFLOW, checkpoint_key, fetch, bound_task=self)
 
 
 @celery_app.task(
@@ -229,16 +293,25 @@ def download_youtube_video(self, job_id: str, job_source_task_id: str, item_dict
         min_res = tuple(task.job.config.get("min_resolution", (320, 240))) if task and task.job else (320, 240)
 
     connector = YouTubeConnector(
-        frame_mode=yt_config.get("frame_mode", "scene"),
-        frames_per_video=yt_config.get("frames_per_video", 100),
+        # "fps" extracts exactly one frame per second — deterministic and
+        # matches the documented behaviour. "scene" was the old default but
+        # produced unpredictable frame counts and often zero results.
+        frame_mode=yt_config.get("frame_mode", "fps"),
+        # None = no hard cap; fps=1.0 naturally limits output by video
+        # duration. The old default of 100 silently capped a 10-min video
+        # at 100 frames even when fps=1 should produce 600.
+        frames_per_video=yt_config.get("frames_per_video", None),
         min_resolution=min_res,
-        cc_only=yt_config.get("cc_only", True),
+        # False = do not filter by CC license at download time. yt-dlp's
+        # flat search metadata omits the license field so cc_only=True
+        # silently drops every video. Operators can override via job config.
+        cc_only=yt_config.get("cc_only", False),
     )
 
     def fetch(checkpoint, should_stop, on_progress):
         yield from connector.fetch(item, workdir, checkpoint, should_stop, on_progress)
 
-    return _run_item_download(job_id, job_source_task_id, SourceType.YOUTUBE, checkpoint_key, fetch)
+    return _run_item_download(job_id, job_source_task_id, SourceType.YOUTUBE, checkpoint_key, fetch, bound_task=self)
 
 
 @celery_app.task(
@@ -271,7 +344,7 @@ def download_web_batch(self, job_id: str, job_source_task_id: str, item_dict: di
     def fetch(checkpoint, should_stop, on_progress):
         yield from connector.fetch(item, workdir, checkpoint, should_stop, on_progress)
 
-    return _run_item_download(job_id, job_source_task_id, SourceType.WEB, shard_id, fetch)
+    return _run_item_download(job_id, job_source_task_id, SourceType.WEB, shard_id, fetch, bound_task=self)
 
 
 @celery_app.task(
@@ -304,7 +377,7 @@ def download_coco_shard(self, job_id: str, job_source_task_id: str, item_dict: d
     def fetch(checkpoint, should_stop, on_progress):
         yield from connector.fetch(item, workdir, checkpoint, should_stop, on_progress)
 
-    return _run_item_download(job_id, job_source_task_id, SourceType.COCO, shard_id, fetch)
+    return _run_item_download(job_id, job_source_task_id, SourceType.COCO, shard_id, fetch, bound_task=self)
 
 
 @celery_app.task(
@@ -337,7 +410,7 @@ def download_open_images_shard(self, job_id: str, job_source_task_id: str, item_
     def fetch(checkpoint, should_stop, on_progress):
         yield from connector.fetch(item, workdir, checkpoint, should_stop, on_progress)
 
-    return _run_item_download(job_id, job_source_task_id, SourceType.OPEN_IMAGES, shard_id, fetch)
+    return _run_item_download(job_id, job_source_task_id, SourceType.OPEN_IMAGES, shard_id, fetch, bound_task=self)
 
 
 @celery_app.task(
@@ -370,7 +443,7 @@ def download_pascal_voc_shard(self, job_id: str, job_source_task_id: str, item_d
     def fetch(checkpoint, should_stop, on_progress):
         yield from connector.fetch(item, workdir, checkpoint, should_stop, on_progress)
 
-    return _run_item_download(job_id, job_source_task_id, SourceType.PASCAL_VOC, shard_id, fetch)
+    return _run_item_download(job_id, job_source_task_id, SourceType.PASCAL_VOC, shard_id, fetch, bound_task=self)
 
 
 @celery_app.task(
@@ -403,7 +476,7 @@ def download_visual_genome_shard(self, job_id: str, job_source_task_id: str, ite
     def fetch(checkpoint, should_stop, on_progress):
         yield from connector.fetch(item, workdir, checkpoint, should_stop, on_progress)
 
-    return _run_item_download(job_id, job_source_task_id, SourceType.VISUAL_GENOME, shard_id, fetch)
+    return _run_item_download(job_id, job_source_task_id, SourceType.VISUAL_GENOME, shard_id, fetch, bound_task=self)
 
 
 @celery_app.task(
@@ -436,7 +509,7 @@ def download_davis_shard(self, job_id: str, job_source_task_id: str, item_dict: 
     def fetch(checkpoint, should_stop, on_progress):
         yield from connector.fetch(item, workdir, checkpoint, should_stop, on_progress)
 
-    return _run_item_download(job_id, job_source_task_id, SourceType.DAVIS, shard_id, fetch)
+    return _run_item_download(job_id, job_source_task_id, SourceType.DAVIS, shard_id, fetch, bound_task=self)
 
 
 @celery_app.task(
@@ -469,7 +542,7 @@ def download_sun_rgbd_shard(self, job_id: str, job_source_task_id: str, item_dic
     def fetch(checkpoint, should_stop, on_progress):
         yield from connector.fetch(item, workdir, checkpoint, should_stop, on_progress)
 
-    return _run_item_download(job_id, job_source_task_id, SourceType.SUN_RGBD, shard_id, fetch)
+    return _run_item_download(job_id, job_source_task_id, SourceType.SUN_RGBD, shard_id, fetch, bound_task=self)
 
 
 @celery_app.task(
@@ -502,7 +575,7 @@ def download_nuscenes_shard(self, job_id: str, job_source_task_id: str, item_dic
     def fetch(checkpoint, should_stop, on_progress):
         yield from connector.fetch(item, workdir, checkpoint, should_stop, on_progress)
 
-    return _run_item_download(job_id, job_source_task_id, SourceType.NUSCENES, shard_id, fetch)
+    return _run_item_download(job_id, job_source_task_id, SourceType.NUSCENES, shard_id, fetch, bound_task=self)
 
 
 @celery_app.task(
@@ -535,4 +608,4 @@ def download_kitti_shard(self, job_id: str, job_source_task_id: str, item_dict: 
     def fetch(checkpoint, should_stop, on_progress):
         yield from connector.fetch(item, workdir, checkpoint, should_stop, on_progress)
 
-    return _run_item_download(job_id, job_source_task_id, SourceType.KITTI, shard_id, fetch)
+    return _run_item_download(job_id, job_source_task_id, SourceType.KITTI, shard_id, fetch, bound_task=self)

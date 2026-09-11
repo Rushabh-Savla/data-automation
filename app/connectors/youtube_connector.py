@@ -20,6 +20,19 @@ Refactored:
 - No argparse/input(); credentials come from CredentialService.
 - should_stop()/on_progress() wired into the frame-extraction loop so
   pause/cancel/resume work mid-video.
+
+Changes (2024-09):
+- frame_mode now defaults to "fps" (was "scene") so the connector reliably
+  produces exactly one frame per second, matching the documented behaviour.
+  "scene" is still available but must be requested explicitly — its frame
+  count is variable and its fps=1 fallback was already identical to this
+  default, so switching the default costs nothing for the common case.
+- extraction_fps constructor param (default 1.0) is forwarded into
+  _extract_fps() so callers can adjust density (e.g. 2.0) without a mode
+  switch. The scene-fallback path always uses 1.0 regardless.
+- frames_per_video defaults to None (no hard cap). At fps=1.0 the video's
+  own duration limits output naturally. An explicit integer is still
+  honoured as a hard ceiling when set.
 """
 
 import logging
@@ -37,6 +50,7 @@ from app.connectors.base import (
     SourceItem,
     register_connector,
 )
+from app.core.config import get_settings
 from app.core.exceptions import FatalConnectorError, JobStopped, TransientConnectorError
 from app.domain.enums import SourceType
 
@@ -52,6 +66,12 @@ def search_videos(
     max_results: int = 20,
     license_filter: str | None = "creativeCommon",
 ) -> list[SourceItem]:
+    """YouTube Data API v3 search — requires a valid api_key.
+
+    Returns an empty list (not an exception) on any API failure so the
+    caller can fall back to search_videos_ytdlp() without special-casing
+    the two error modes (missing key vs. API call failed).
+    """
     if not api_key:
         return []
 
@@ -74,14 +94,22 @@ def search_videos(
         logger.error(f"YouTube API search failed: {e}")
         return []
 
-    video_ids = [item["id"]["videoId"] for item in data.get("items", []) if item.get("id", {}).get("videoId")]
+    video_ids = [
+        item["id"]["videoId"]
+        for item in data.get("items", [])
+        if item.get("id", {}).get("videoId")
+    ]
     if not video_ids:
         return []
 
     try:
         det_resp = requests.get(
             f"{YT_API_BASE}/videos",
-            params={"key": api_key, "id": ",".join(video_ids), "part": "snippet,contentDetails,status"},
+            params={
+                "key": api_key,
+                "id": ",".join(video_ids),
+                "part": "snippet,contentDetails,status",
+            },
             timeout=15,
         )
         det_resp.raise_for_status()
@@ -105,6 +133,94 @@ def search_videos(
                 dataset_identifier=vid_id,
             )
         )
+    return items
+
+
+def search_videos_ytdlp(
+    query: str,
+    max_results: int = 20,
+    cc_only: bool = False,
+) -> list[SourceItem]:
+    """yt-dlp based search — no API key required.
+
+    Uses yt-dlp's built-in ytsearch extractor which hits the same internal
+    YouTube endpoint the web UI uses, bypassing the Data API v3 quota
+    entirely. This is the automatic fallback when no YOUTUBE_API_KEY
+    credential is configured.
+
+    License handling: yt-dlp populates info_dict["license"] from the video's
+    metadata the same way it does during download (the field is extracted
+    from the watch page, not the Data API). We apply the same
+    _cc_only_match_filter substring check used in fetch() so CC filtering
+    is consistent regardless of which search path produced the SourceItem.
+
+    extract_flat="in_playlist" tells yt-dlp to collect video metadata
+    without downloading anything — it returns info dicts with id, title,
+    and (crucially) license. quiet=True + ignoreerrors=True suppress
+    per-video warnings for age-gated/geo-blocked entries so one bad result
+    doesn't abort the whole search.
+    """
+    import yt_dlp
+
+    search_url = f"ytsearch{max_results}:{query}"
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "ignoreerrors": True,
+        "extract_flat": "in_playlist",
+        # Explicitly request the iOS/android clients so yt-dlp can resolve
+        # metadata for videos that block the web client — same
+        # extractor_args used in build_ytdlp_options() for actual downloads.
+        # Key is "player_client", NOT "client" — the latter is silently
+        # ignored by yt-dlp's youtube extractor (not a recognized
+        # configuration arg), which is why this was never actually taking
+        # effect until this fix.
+        "extractor_args": {"youtube": {"player_client": ["ios", "android"]}},
+    }
+
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(search_url, download=False)
+    except Exception as e:
+        logger.error(f"yt-dlp search failed for query {query!r}: {e}")
+        return []
+
+    if info is None:
+        return []
+
+    entries = info.get("entries") or []
+    items: list[SourceItem] = []
+    for entry in entries:
+        if entry is None:
+            continue
+        vid_id = entry.get("id")
+        if not vid_id:
+            continue
+
+        # yt-dlp's flat extraction may omit "license" for some entries —
+        # treat missing as non-CC so we don't accidentally include a
+        # standard-license video when cc_only=True.
+        license_name: str = entry.get("license") or ""
+        if cc_only and "creative commons" not in license_name.lower():
+            continue
+
+        license_hint = license_name if license_name else "unknown"
+        items.append(
+            SourceItem(
+                source_type=SourceType.YOUTUBE,
+                external_ref={
+                    "url": f"https://www.youtube.com/watch?v={vid_id}",
+                    "video_id": vid_id,
+                },
+                license_hint=license_hint,
+                dataset_identifier=vid_id,
+            )
+        )
+
+    logger.info(
+        f"yt-dlp search for {query!r}: {len(entries)} candidates, "
+        f"{len(items)} passed CC filter (cc_only={cc_only})"
+    )
     return items
 
 
@@ -160,8 +276,27 @@ def build_ytdlp_options(
         "retries": 5,
         "fragment_retries": 10,
         "file_access_retries": 3,
+        # Bounds each socket op so a connection that stalls after the
+        # handshake (accepted, no data) fails and retries instead of
+        # hanging extract_info() indefinitely.
+        "socket_timeout": get_settings().youtube_socket_timeout_s,
         "postprocessors": [{"key": "FFmpegVideoConvertor", "preferedformat": "mp4"}],
-        "extractor_args": {"youtube": {"client": ["ios", "android"]}},
+        # Key is "player_client", NOT "client" (see discover_videos_ytdlp's
+        # extractor_args for the same fix) — "client" is silently ignored by
+        # yt-dlp's youtube extractor, so this client restriction was never
+        # actually being applied; yt-dlp fell back to its own default client
+        # selection instead, which picks clients (e.g. "ios", "android_vr")
+        # whose video-CDN formats require a GVS PO Token yt-dlp doesn't have,
+        # causing a hard "HTTP Error 403: Forbidden" on every video's actual
+        # data download regardless of video_id — looking exactly like this
+        # host's whole network being IP-blocked, but it wasn't. Now that the
+        # key actually works, "android" alone gets formats that need no PO
+        # token and download cleanly (verified directly against every
+        # video_id that was previously 403ing) — capped at itag 18 (360p)
+        # since YouTube's SABR-only streaming experiment currently withholds
+        # the android client's higher formats without a token, but a working
+        # 360p frame source beats a 100%-failing 1080p one.
+        "extractor_args": {"youtube": {"player_client": ["android"]}},
     }
     if cc_only:
         opts["match_filter"] = _cc_only_match_filter
@@ -191,19 +326,95 @@ def _cc_only_match_filter(info_dict: dict, *, incomplete: bool = False) -> str |
 class YouTubeConnector:
     def __init__(
         self,
-        frame_mode: str = "scene",
-        frames_per_video: int = 100,
+        # ------------------------------------------------------------------ #
+        # frame_mode="fps": extract one frame per second via ffmpeg (default).#
+        # This is deterministic, evenly spaced, and matches the documented    #
+        # "1 image per second" spec. "scene" (PySceneDetect) and "every_n"   #
+        # (raw OpenCV) are still supported but must be requested explicitly.  #
+        # ------------------------------------------------------------------ #
+        frame_mode: str = "fps",
+        # ------------------------------------------------------------------ #
+        # extraction_fps: frames per second to extract when frame_mode="fps". #
+        # 1.0 = one frame per second (the default). Only affects fps mode;   #
+        # scene and every_n modes are not rate-controlled by this param.     #
+        # ------------------------------------------------------------------ #
+        extraction_fps: float = 1.0,
+        # ------------------------------------------------------------------ #
+        # frames_per_video: hard upper cap on frames yielded per video.      #
+        # None (the default) means no cap — at fps=1.0 the video's own      #
+        # duration naturally limits output. Set an integer when you need a   #
+        # strict per-video ceiling (e.g. to stop one long video from         #
+        # monopolising the job's target_count quota).                        #
+        # ------------------------------------------------------------------ #
+        frames_per_video: int | None = None,
         min_resolution: tuple[int, int] = (320, 240),
-        cc_only: bool = True,
+        # cc_only=False: do not restrict to Creative Commons license by default.
+        # yt-dlp's flat search metadata often omits the license field entirely,
+        # so cc_only=True silently drops every candidate video when no API key
+        # is configured (observed: 5 candidates → 0 passed for 'red car').
+        # Operators who need strict CC-only ingestion can set
+        # config={"youtube": {"cc_only": true}} on the job.
+        cc_only: bool = False,
     ):
         self.frame_mode = frame_mode
+        self.extraction_fps = extraction_fps
         self.frames_per_video = frames_per_video
         self.min_w, self.min_h = min_resolution
         self.cc_only = cc_only
 
     def discover(self, query: str, cursor: str | None, limit: int, api_key: str = "") -> DiscoveryPage:
-        items = search_videos(query, api_key, max_results=limit, license_filter="creativeCommon" if self.cc_only else None)
-        return DiscoveryPage(items=items, next_cursor=None, exhausted=True)
+        """Discover YouTube videos for the given query.
+
+        Strategy (API-first, yt-dlp fallback):
+        1. If api_key is provided, try the YouTube Data API v3. This is the
+           preferred path: it returns richer metadata and can filter by
+           license server-side (videoLicense=creativeCommon), reducing the
+           number of entries we have to filter ourselves.
+        2. If the API key is absent OR the API call returns nothing (quota
+           exhausted, key invalid, transient error — search_videos() swallows
+           all of these and returns []), fall back to yt-dlp's ytsearch
+           extractor. This requires no credentials and is not subject to
+           the Data API v3 quota.
+
+        The fallback is transparent to the caller: discover_youtube in
+        discovery_tasks.py passes whatever api_key CredentialService resolved
+        (may be an empty string) and receives a normal DiscoveryPage either
+        way. No task-level changes are needed.
+        """
+        license_filter = "creativeCommon" if self.cc_only else None
+        error_reason: str | None = None
+
+        # --- Path 1: YouTube Data API v3 ---
+        items = search_videos(query, api_key, max_results=limit, license_filter=license_filter)
+
+        # --- Path 2: yt-dlp (no API key needed) ---
+        if not items:
+            if api_key:
+                # API key was present but returned nothing — log so operators
+                # can distinguish "key works but no results" from "no key at
+                # all"; don't surface this as an error_reason since yt-dlp
+                # may still succeed.
+                logger.warning(
+                    f"YouTube Data API returned no results for {query!r} "
+                    f"(quota exhausted or key invalid?) — falling back to yt-dlp search"
+                )
+            else:
+                logger.info(
+                    f"No YOUTUBE_API_KEY configured — using yt-dlp search for {query!r}"
+                )
+
+            items = search_videos_ytdlp(query, max_results=limit, cc_only=self.cc_only)
+
+            if not items:
+                # Both paths came up empty. Surface a reason so discover_youtube
+                # can write a meaningful error_message on the source task rather
+                # than the generic "No YouTube videos found for query".
+                error_reason = (
+                    "No YouTube videos found via Data API or yt-dlp search "
+                    f"for query {query!r} (cc_only={self.cc_only})"
+                )
+
+        return DiscoveryPage(items=items, next_cursor=None, exhausted=True, error_reason=error_reason)
 
     def fetch(
         self,
@@ -262,11 +473,16 @@ class YouTubeConnector:
                 reason = error_logger.last_error or "unknown reason (no file produced, no error captured)"
                 raise self._classify_error(RuntimeError(reason), url, video_id=video_id)
             video_path = candidates[0]
-            license_name = info.get("license", "unknown") if info is not None else (item.license_hint or "unknown")
+            license_name = (
+                info.get("license", "unknown") if info is not None else (item.license_hint or "unknown")
+            )
             on_progress({"checkpoint": {"stage": "extracting", "frame_index": 0}, "downloaded": 1})
         else:
             video_id = item.external_ref.get("video_id", "")
-            candidates = [p for p in video_dir.glob(f"{video_id}.*") if p.suffix.lower() in _MEDIA_EXTENSIONS]
+            candidates = [
+                p for p in video_dir.glob(f"{video_id}.*")
+                if p.suffix.lower() in _MEDIA_EXTENSIONS
+            ]
             video_path = candidates[0] if candidates else None
             license_name = item.license_hint or "unknown"
 
@@ -281,7 +497,15 @@ class YouTubeConnector:
         self._cleanup_video_files(video_dir, video_id)
 
     def _extract_frames(
-        self, video_id, video_path, video_url, license_name, frames_dir, start_index, should_stop, on_progress
+        self,
+        video_id,
+        video_path,
+        video_url,
+        license_name,
+        frames_dir,
+        start_index,
+        should_stop,
+        on_progress,
     ) -> Iterator[RawAssetDraft]:
         out_dir = frames_dir / video_id
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -289,14 +513,17 @@ class YouTubeConnector:
         if self.frame_mode == "scene":
             frames = self._extract_scene(video_path, out_dir)
         elif self.frame_mode == "fps":
-            frames = self._extract_fps(video_path, out_dir)
+            # Forward the configured rate so callers who set extraction_fps
+            # != 1.0 get the density they asked for without a mode switch.
+            frames = self._extract_fps(video_path, out_dir, fps=self.extraction_fps)
         else:
             frames = self._extract_every_n(video_path, out_dir)
 
         for i, (frame_path, frame_number, timestamp_sec, scene_number, w, h) in enumerate(frames):
             if i < start_index:
                 continue
-            if i >= self.frames_per_video:
+            # None means no cap — honour an explicit integer ceiling.
+            if self.frames_per_video is not None and i >= self.frames_per_video:
                 break
             if should_stop():
                 on_progress({"checkpoint": {"stage": "extracting", "frame_index": i}})
@@ -360,10 +587,26 @@ class YouTubeConnector:
         cap.release()
 
     def _extract_fps(self, vpath: Path, out_dir: Path, fps: float = 1.0):
+        """Extract frames at a fixed rate using ffmpeg.
+
+        fps=1.0 produces exactly one frame per second — the default for the
+        connector. The fps parameter is explicit (not hard-coded) so both the
+        constructor path (self.extraction_fps) and the scene-detection
+        fallback path (always 1.0 regardless of self.extraction_fps) can
+        share this method without a magic constant buried inside it.
+        """
         import cv2
 
         out_pattern = str(out_dir / "fps_%07d.jpg")
-        cmd = ["ffmpeg", "-i", str(vpath), "-vf", f"fps={fps}", "-q:v", "2", out_pattern, "-loglevel", "quiet", "-y"]
+        cmd = [
+            "ffmpeg",
+            "-i", str(vpath),
+            "-vf", f"fps={fps}",
+            "-q:v", "2",
+            out_pattern,
+            "-loglevel", "quiet",
+            "-y",
+        ]
         try:
             subprocess.run(cmd, check=True, timeout=3600)
         except FileNotFoundError:

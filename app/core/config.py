@@ -52,6 +52,12 @@ class Settings(BaseSettings):
     celery_task_time_limit_s: int = 3900
     watchdog_stall_threshold_s: int = 900
 
+    # yt-dlp's extract_info() is a single blocking call with no timeout of
+    # its own — a connection that stalls after the handshake (accepted but
+    # no data) can hang indefinitely without this. Bounds each socket
+    # operation so yt-dlp's existing retries/backoff can actually kick in.
+    youtube_socket_timeout_s: int = 30
+
     # -- Fast-path source selection --------------------------------------------------
     # For small target counts, fanning out to every connector at once wastes time —
     # Kaggle/Roboflow download whole datasets and YouTube downloads+extracts video
