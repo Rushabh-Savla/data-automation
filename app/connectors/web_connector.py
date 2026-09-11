@@ -28,8 +28,10 @@ import json
 import logging
 import subprocess
 import sys
+import time
 import urllib.robotparser
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -53,6 +55,35 @@ _MIN_BYTES = 2_000  # rejects near-empty/placeholder responses
 _MAX_BYTES = 25_000_000
 _ROBOTS_CACHE: dict[str, urllib.robotparser.RobotFileParser] = {}
 _IMG2DATASET_TIMEOUT_S = 600
+_VALIDATE_TIMEOUT_S = 3.0  # HEAD requests should be fast; 8s serial was the main bottleneck
+_VALIDATE_MAX_WORKERS = 16
+_DISCOVER_PAGE_SIZE = 100  # ddgs image engines cap out well under this per call regardless
+_DISCOVER_PAGES_PER_VARIANT = 6  # pages to walk for one query phrasing before moving to the next
+_DISCOVER_PAGE_RETRIES = 3  # per-page retries before treating that page as exhausted
+_DISCOVER_RETRY_DELAY_S = 2.0
+_DISCOVER_MIN_ATTEMPTS = 20
+_DISCOVER_MAX_ATTEMPTS_CAP = 200  # hard ceiling on (variant, page) fetches regardless of target size
+_DISCOVER_ATTEMPTS_PER_TARGET = 10  # scales attempt budget with how many validated URLs are wanted
+
+# Generic photography-style qualifiers, not object-specific — appended to the
+# job's own query to get DuckDuckGo's differently-indexed results for a
+# slightly different phrasing of the same subject. A single literal query
+# genuinely has a finite pool of unique image results (~35-350 for a typical
+# two-word phrase, even after full page pagination) — nowhere near enough for
+# a job asking for hundreds or thousands of images. Downstream relevance
+# filtering (YOLO-World + SmolVLM, see filtering_tasks.py) is what keeps this
+# safe: broadening recall here can only add candidates for filtering to
+# reject, it can't let anything irrelevant through on its own.
+_QUERY_VARIANT_SUFFIXES = (
+    "",
+    " photo",
+    " picture",
+    " image",
+    " stock photo",
+    " close up",
+    " isolated on white background",
+    " product photo",
+)
 
 
 def _robots_allowed(url: str) -> bool:
@@ -63,10 +94,25 @@ def _robots_allowed(url: str) -> bool:
         rp = urllib.robotparser.RobotFileParser()
         rp.set_url(origin + "/robots.txt")
         try:
-            rp.read()
+            # NOT rp.read() — that calls urllib.request.urlopen() with no
+            # timeout, which blocks on Python's global socket default
+            # (unset = block forever) if the host accepts the connection
+            # but never responds. One such host anywhere in a discovery
+            # batch hangs the whole ThreadPoolExecutor batch (it waits for
+            # every submitted future), which hangs the whole discover()
+            # call — this is what silently stuck jobs at 0/target for
+            # 20+ minutes rather than failing fast. requests.get() with an
+            # explicit timeout can't hang like this.
+            resp = requests.get(
+                origin + "/robots.txt", timeout=_VALIDATE_TIMEOUT_S, headers={"User-Agent": "Mozilla/5.0"}
+            )
+            if resp.status_code >= 400:
+                rp = None  # no robots.txt (404 etc.) — fail open, same as before
+            else:
+                rp.parse(resp.text.splitlines())
         except Exception:
-            # If robots.txt can't be fetched, fail open (most sites have none) —
-            # this matches standard crawler behavior.
+            # Robots.txt fetch failed/timed out — fail open (most sites have
+            # none) — this matches standard crawler behavior.
             rp = None
         _ROBOTS_CACHE[origin] = rp
     if rp is None:
@@ -77,7 +123,7 @@ def _robots_allowed(url: str) -> bool:
         return True
 
 
-def _validate_candidate(url: str, timeout: float = 8.0) -> bool:
+def _validate_candidate(url: str, timeout: float = _VALIDATE_TIMEOUT_S) -> bool:
     """robots.txt + AI opt-out + Content-Type/size pre-check via HEAD, so
     invalid URLs never reach the img2dataset download step."""
     if not _robots_allowed(url):
@@ -116,30 +162,97 @@ class WebScrapeConnector:
     # -- Discovery: gather + validate candidate URLs into shards -----------------
 
     def discover(self, query: str, cursor: str | None, limit: int = 200) -> DiscoveryPage:
+        """`limit` is the number of *validated* URLs wanted, not a raw
+        ddgs page size — a single ddgs call at `limit` routinely validates
+        down to a small fraction of that (dead links, hotlink-blocked CDNs,
+        non-image redirects), so a job asking for e.g. 500 images used to
+        get stuck around ~16. Note ddgs's `max_results` is capped per call
+        by the underlying engines (~35 results for images regardless of how
+        high it's set) — raising it alone just re-fetches the same first
+        page, so real pagination requires ddgs's `page` kwarg instead.
+
+        Even with full page pagination, one literal query phrase has a
+        finite pool of unique results (often only a few hundred), which
+        can't satisfy a job asking for e.g. 2000 images. So this also walks
+        _QUERY_VARIANT_SUFFIXES — generic rephrasings of the same query —
+        each with its own page walk, until enough candidates validate, the
+        (query, page) budget (scaled by `limit`, capped at
+        _DISCOVER_MAX_ATTEMPTS_CAP) is exhausted, or every variant runs dry.
+        A query with genuinely few real results still terminates promptly
+        (each variant/page stops as soon as it stops returning anything
+        new) rather than spinning through the whole budget.
+        """
         from ddgs import DDGS
 
-        try:
-            with DDGS() as ddgs:
-                results = list(ddgs.images(query, safesearch=self.safesearch, max_results=limit))
-        except Exception as e:
-            logger.error(f"DuckDuckGo image search failed: {e}")
-            return DiscoveryPage(items=[], next_cursor=None, exhausted=True)
-
+        seen_urls: set[str] = set()
         validated: list[SourceItem] = []
-        for r in results:
-            url = r.get("image")
-            if not url:
-                continue
-            if not _validate_candidate(url):
-                continue
-            validated.append(
-                SourceItem(
-                    source_type=SourceType.WEB,
-                    external_ref={"url": url, "title": r.get("title", "")},
-                    license_hint=None,
-                    dataset_identifier=query,
-                )
-            )
+        max_attempts = min(
+            _DISCOVER_MAX_ATTEMPTS_CAP, max(_DISCOVER_MIN_ATTEMPTS, limit // _DISCOVER_ATTEMPTS_PER_TARGET)
+        )
+        attempts = 0
+
+        for suffix in _QUERY_VARIANT_SUFFIXES:
+            if len(validated) >= limit or attempts >= max_attempts:
+                break
+            variant_query = f"{query}{suffix}".strip()
+
+            for page in range(1, _DISCOVER_PAGES_PER_VARIANT + 1):
+                if len(validated) >= limit or attempts >= max_attempts:
+                    break
+                attempts += 1
+
+                results = None
+                # A single page fetch failing (e.g. a transient 403 from
+                # DuckDuckGo's anti-bot throttling — more likely now that a
+                # large job walks many pages/variants in one discover()
+                # call) shouldn't truncate an otherwise-healthy discovery;
+                # only give up on this variant after every retry fails.
+                for retry in range(_DISCOVER_PAGE_RETRIES):
+                    try:
+                        with DDGS() as ddgs:
+                            results = list(
+                                ddgs.images(
+                                    variant_query,
+                                    safesearch=self.safesearch,
+                                    max_results=_DISCOVER_PAGE_SIZE,
+                                    page=page,
+                                )
+                            )
+                        break
+                    except Exception as e:
+                        logger.warning(
+                            f"DuckDuckGo image search failed ({variant_query!r}, page {page}, retry {retry}): {e}"
+                        )
+                        time.sleep(_DISCOVER_RETRY_DELAY_S)
+                if results is None:
+                    logger.error(f"DuckDuckGo image search gave up on {variant_query!r} page {page}")
+                    break  # try the next variant instead of the whole query
+
+                new_candidates = []
+                for r in results:
+                    url = r.get("image")
+                    if not url or url in seen_urls:
+                        continue
+                    seen_urls.add(url)
+                    new_candidates.append(r)
+
+                if not new_candidates:
+                    break  # this variant is exhausted; move on to the next one
+
+                with ThreadPoolExecutor(max_workers=_VALIDATE_MAX_WORKERS) as pool:
+                    future_to_r = {pool.submit(_validate_candidate, r["image"]): r for r in new_candidates}
+                    for future in as_completed(future_to_r):
+                        if not future.result():
+                            continue
+                        r = future_to_r[future]
+                        validated.append(
+                            SourceItem(
+                                source_type=SourceType.WEB,
+                                external_ref={"url": r["image"], "title": r.get("title", "")},
+                                license_hint=None,
+                                dataset_identifier=query,
+                            )
+                        )
 
         # Batch validated URLs into shards of ~25 — a shard is one Celery
         # download task's unit of work, and img2dataset's own thread pool

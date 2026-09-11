@@ -329,8 +329,14 @@ def discover_web(self, job_id: str, job_source_task_id: str):
 
         web_config = job.config.get("web", {})
         connector = WebScrapeConnector(safesearch=web_config.get("safesearch", "moderate"))
+        # Default max_results (200) only applies when the job has no
+        # target_count (e.g. deadline-only jobs) — otherwise a job asking
+        # for e.g. 500 images used to silently cap at 200 raw search
+        # results (and far fewer once validated) regardless of what was
+        # actually requested.
+        desired = job.target_count or web_config.get("max_results", 200)
         with heartbeat_during(task_uuid):
-            page = connector.discover(job.query, cursor=None, limit=web_config.get("max_results", 200))
+            page = connector.discover(job.query, cursor=None, limit=desired)
         shards = page.items
 
         if not shards:
