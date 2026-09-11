@@ -7,6 +7,17 @@ K-means dominant-color matching) with a single shared, open-vocabulary
 filter that isn't limited to a fixed class list — "red bag", "pedestrian",
 or any other free-text query can be used directly as a detection prompt,
 which a closed-vocabulary detector cannot do.
+
+Changes (2024-09):
+- conf_threshold default raised from 0.15 → 0.25. At 0.15 YOLO-World
+  passes too many weakly-matched detections through to SmolVLM, adding
+  unnecessary inference cost without improving recall (SmolVLM is the
+  sole accept/reject gatekeeper; YOLO-World's role is region proposal,
+  not final scoring). 0.25 sits in the empirically validated 0.2–0.3
+  sweet-spot: enough signal to localise a real candidate region, tight
+  enough to suppress background false-positives. The default is also
+  the fallback value in filtering_tasks.py's job.config lookup —
+  both must agree; see that module.
 """
 
 import logging
@@ -62,7 +73,11 @@ def _load_model(weights: str = "yolov8s-world.pt"):
 
 
 class RelevanceFilter:
-    def __init__(self, weights: str = "yolov8s-world.pt", conf_threshold: float = 0.15):
+    # Sentinel used in filtering_tasks.py's job.config fallback — keep in
+    # sync. Defined here so there is exactly one source of truth.
+    DEFAULT_CONF_THRESHOLD: float = 0.25
+
+    def __init__(self, weights: str = "yolov8s-world.pt", conf_threshold: float = DEFAULT_CONF_THRESHOLD):
         self.conf_threshold = conf_threshold
         self._model = _load_model(weights)
         self._current_classes: list[str] | None = None

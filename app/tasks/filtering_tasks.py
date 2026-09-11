@@ -110,7 +110,12 @@ def relevance_filter_batch(self, job_id: str, asset_ids: list[str]) -> dict:
             return {"passed": 0, "rejected": 0}
 
         prompt_classes = derive_prompt_classes(job.query)
-        conf_threshold = job.config.get("yolo_world_conf_threshold", 0.15)
+        # Use the class-level constant as the fallback so both the filter
+        # object's own default and this config lookup always agree — there
+        # is exactly one source of truth (RelevanceFilter.DEFAULT_CONF_THRESHOLD).
+        conf_threshold = job.config.get(
+            "yolo_world_conf_threshold", RelevanceFilter.DEFAULT_CONF_THRESHOLD
+        )
         query = job.query
         relevance_filter = RelevanceFilter(conf_threshold=conf_threshold)
         visual_verifier = VisualVerifier()
