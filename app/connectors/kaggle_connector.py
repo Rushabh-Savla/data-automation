@@ -37,6 +37,11 @@ logger = logging.getLogger(__name__)
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff", ".tif"}
 
+# Kaggle's own dataset tags for image/vision content — used to prioritize
+# search results (see discover()'s docstring for why this matters for
+# generic object-word queries like "hammer" or "axe").
+_IMAGE_RELATED_TAGS = {"image", "computer vision", "object detection"}
+
 
 def make_source_item_id(slug: str, rel_path: str) -> str:
     """Deterministic ID — ported verbatim from kaggle_downloader.py::_make_id()."""
@@ -54,6 +59,19 @@ class KaggleConnector:
         """Search Kaggle for datasets matching the job's query. Falls back to
         an empty page (not fatal) if the `kaggle` package/credentials aren't
         available — a direct-slug job doesn't need discovery at all.
+
+        Kaggle's dataset search matches literal text anywhere in a dataset's
+        title/description, not just image datasets — a generic single-word
+        query like "hammer" or "axe" ranks tabular/unrelated datasets (an
+        IPL auction dataset, a virus-infection prediction dataset, etc.)
+        right alongside the handful of real image datasets. With the
+        platform's default of only 5 datasets per job (job.config["kaggle"]
+        ["max_datasets"]), those unrelated hits can crowd out every actual
+        image dataset, so the query appears to "not work." Results are
+        stable-sorted so datasets Kaggle itself tags image/computer-vision/
+        object-detection are tried first — untagged datasets are still kept
+        (just after), since Kaggle's tagging is user-submitted and
+        inconsistent (a real image dataset can lack the "image" tag).
 
         Note: `kaggle.api.authenticate()` calls the bare builtin `exit(1)`
         (i.e. raises SystemExit) when no credentials are configured, instead
@@ -78,6 +96,7 @@ class KaggleConnector:
             return DiscoveryPage(items=[], next_cursor=None, exhausted=True)
 
         raw = self._search_with_singular_fallback(kaggle_pkg, query)
+        raw = sorted(raw, key=lambda ds: not self._is_image_related(ds))
 
         items = []
         for ds in raw[:limit]:
@@ -92,6 +111,10 @@ class KaggleConnector:
                 )
             )
         return DiscoveryPage(items=items, next_cursor=None, exhausted=True)
+
+    @staticmethod
+    def _is_image_related(ds) -> bool:
+        return any(getattr(t, "ref", None) in _IMAGE_RELATED_TAGS for t in (getattr(ds, "tags", None) or []))
 
     @staticmethod
     def _search_with_singular_fallback(kaggle_pkg, query: str) -> list:
@@ -278,6 +301,11 @@ class KaggleConnector:
     @staticmethod
     def _classify_error(e: Exception, slug: str) -> Exception:
         msg = str(e).lower()
-        if "404" in msg or "not found" in msg or "403" in msg or "401" in msg:
-            return FatalConnectorError(f"Kaggle dataset '{slug}' not accessible: {e}")
+        if "403" in msg or "401" in msg:
+            return FatalConnectorError(
+                f"Kaggle dataset '{slug}' requires accepting dataset rules on kaggle.com "
+                f"before API access is allowed (403/401 from Kaggle API): {e}"
+            )
+        if "404" in msg or "not found" in msg:
+            return FatalConnectorError(f"Kaggle dataset '{slug}' not found (404): {e}")
         return TransientConnectorError(f"Kaggle download failed for '{slug}': {e}")
