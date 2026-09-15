@@ -21,6 +21,8 @@ via app/services/format_conversion.py::parse_coco_boxes_for_image().
 import hashlib
 import json
 import logging
+import os
+import uuid
 import zipfile
 from collections.abc import Iterator
 from pathlib import Path
@@ -55,32 +57,48 @@ def _ensure_annotations_cached(split: str) -> Path:
     only the requested split's instances_*.json member. Two jobs racing to
     populate this cache concurrently is possible but low-probability/low-
     impact — the final on-disk state is correct either way, just possibly
-    redundant work; not worth a lock for this."""
+    redundant work — PROVIDED each writer uses its own tmp file. A shared,
+    fixed tmp filename doesn't hold that: whichever writer finishes first
+    calls Path.replace(), which removes the tmp file, so a second writer
+    still mid-download raises FileNotFoundError on its own later replace()
+    (observed in production: "annotations_trainval2017.zip.tmp -> ...zip").
+    Suffixing the tmp filename with a per-call unique token avoids that
+    while keeping the same fast-path/redundant-work tradeoff."""
     cache_dir = _cache_dir()
     cache_dir.mkdir(parents=True, exist_ok=True)
     json_path = cache_dir / f"instances_{split}.json"
     if json_path.exists():
         return json_path
 
+    unique = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
+
     zip_path = cache_dir / "annotations_trainval2017.zip"
     if not zip_path.exists():
         logger.info(f"Downloading COCO annotations ({_ANNOTATIONS_ZIP_URL})")
-        tmp_path = zip_path.with_suffix(".zip.tmp")
-        with requests.get(_ANNOTATIONS_ZIP_URL, stream=True, timeout=120, headers=HTTP_HEADERS) as r:
-            r.raise_for_status()
-            with open(tmp_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=1 << 20):
-                    f.write(chunk)
-        tmp_path.replace(zip_path)
+        tmp_path = cache_dir / f"annotations_trainval2017.zip.{unique}.tmp"
+        try:
+            with requests.get(_ANNOTATIONS_ZIP_URL, stream=True, timeout=120, headers=HTTP_HEADERS) as r:
+                r.raise_for_status()
+                with open(tmp_path, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=1 << 20):
+                        f.write(chunk)
+            if not zip_path.exists():
+                tmp_path.replace(zip_path)
+        finally:
+            tmp_path.unlink(missing_ok=True)
 
     with zipfile.ZipFile(zip_path) as zf:
         member = f"annotations/instances_{split}.json"
         if member not in zf.namelist():
             raise FatalConnectorError(f"COCO split '{split}' not found in annotations archive")
-        tmp_json = json_path.with_suffix(".json.tmp")
-        with zf.open(member) as src, open(tmp_json, "wb") as dst:
-            dst.write(src.read())
-        tmp_json.replace(json_path)
+        tmp_json = cache_dir / f"instances_{split}.json.{unique}.tmp"
+        try:
+            with zf.open(member) as src, open(tmp_json, "wb") as dst:
+                dst.write(src.read())
+            if not json_path.exists():
+                tmp_json.replace(json_path)
+        finally:
+            tmp_json.unlink(missing_ok=True)
 
     return json_path
 
