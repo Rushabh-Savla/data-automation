@@ -48,7 +48,8 @@ _TRANSITIONS: dict[str, dict[JobStatus, JobStatus]] = {
 
 class IllegalTransitionError(Exception):
     def __init__(self, event: str, current_status: JobStatus):
-        super().__init__(f"Cannot apply event '{event}' to job in status '{current_status.value}'")
+        status_label = current_status.value if isinstance(current_status, JobStatus) else current_status
+        super().__init__(f"Cannot apply event '{event}' to job in status '{status_label}'")
         self.event = event
         self.current_status = current_status
 

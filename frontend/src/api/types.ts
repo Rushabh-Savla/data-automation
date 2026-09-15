@@ -86,6 +86,13 @@ export const JOB_TERMINAL_STATUSES: JobStatus[] = [
   'failed',
 ]
 
+export const JOB_SOURCE_TASK_TERMINAL_STATUSES: JobSourceTaskStatus[] = [
+  'completed',
+  'completed_partial',
+  'failed',
+  'cancelled',
+]
+
 // -- Job config (freeform `dict` backend-side; this is the shape the
 // frontend actually reads/writes — see app/tasks/discovery_tasks.py and
 // app/tasks/ingest_tasks.py for the exact keys consumed).

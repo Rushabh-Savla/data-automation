@@ -65,7 +65,7 @@ export function JobDetailPage() {
                 <CardTitle>Per-source breakdown</CardTitle>
               </CardHeader>
               <CardContent className="px-0">
-                <JobSourceTaskTable sourceTasks={job.source_tasks} />
+                <JobSourceTaskTable sourceTasks={job.source_tasks} jobStatus={job.status} />
               </CardContent>
             </Card>
 

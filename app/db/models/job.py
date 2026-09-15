@@ -4,7 +4,7 @@ and how it should stop (target image count, a deadline, or both)."""
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, Index, Integer, String, Text, text
+from sqlalchemy import DateTime, Enum, ForeignKey, Index, Integer, String, Text, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -25,10 +25,21 @@ class Job(Base):
     deadline_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     scheduled_start_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
+    # native_enum=False keeps this a plain VARCHAR(32) at the DB level (matches
+    # the existing column from the initial migration, no schema change needed)
+    # while making SQLAlchemy hydrate reads as JobStatus members instead of
+    # bare strings — a bare str loaded fresh from the DB has no `.value`,
+    # which crashed JobStateMachine's IllegalTransitionError message
+    # (app/domain/state_machine.py) for any job loaded in a new session.
     status: Mapped[JobStatus] = mapped_column(
-        String(32), nullable=False, default=JobStatus.DRAFT
+        Enum(JobStatus, native_enum=False, length=32, values_callable=lambda e: [m.value for m in e]),
+        nullable=False,
+        default=JobStatus.DRAFT,
     )
-    completion_reason: Mapped[JobCompletionReason | None] = mapped_column(String(32), nullable=True)
+    completion_reason: Mapped[JobCompletionReason | None] = mapped_column(
+        Enum(JobCompletionReason, native_enum=False, length=32, values_callable=lambda e: [m.value for m in e]),
+        nullable=True,
+    )
 
     # Per-source overrides: min_resolution, license allow-list, yolo_world_conf_threshold,
     # dedup_hamming_threshold, img2dataset concurrency, etc.
@@ -36,6 +47,10 @@ class Job(Base):
 
     discovered_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     downloaded_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Can temporarily exceed target_count while status is DISCOVERING/RUNNING
+    # due to the overfetch buffer (app/tasks/_helpers.py::build_on_progress) —
+    # relevance filtering and dedup (app/tasks/filtering_tasks.py) trim it
+    # back down to target_count afterward. See JobResponse.filtering_in_progress.
     accepted_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     rejected_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     duplicate_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)

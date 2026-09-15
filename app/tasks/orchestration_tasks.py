@@ -182,7 +182,16 @@ def evaluate_job_completion(self, job_id: str):
             return
 
         cancellation = CancellationService(get_redis())
-        if cancellation.is_cancelled(job_id):
+        # job.status == CANCELLING (Postgres, durable) is treated as
+        # sufficient on its own, not just cancellation.is_cancelled() (Redis,
+        # ephemeral): a Redis restart/eviction between JobService.cancel()
+        # setting the flag and this task running loses the flag while the DB
+        # still faithfully remembers CANCELLING, and relying on the flag
+        # alone stranded such jobs forever — every re-drive fell through to
+        # the normal complete/fail/complete_partial path below and hit
+        # IllegalTransitionError, since none of those events are legal from
+        # CANCELLING.
+        if cancellation.is_cancelled(job_id) or job.status == JobStatus.CANCELLING:
             if job.status != JobStatus.CANCELLING:
                 # Redis's cancel flag is set synchronously, but the DB
                 # transaction that moved job.status to CANCELLING may not

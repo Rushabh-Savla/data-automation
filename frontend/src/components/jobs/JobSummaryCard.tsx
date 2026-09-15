@@ -14,7 +14,7 @@ export function JobSummaryCard({ job }: { job: JobDetailResponse }) {
             <h2 className="text-lg font-semibold">{job.name || job.query}</h2>
             {job.name && <p className="text-sm text-muted-foreground">{job.query}</p>}
           </div>
-          <JobStatusBadge status={job.status} />
+          <JobStatusBadge status={job.status} sourceTasks={job.source_tasks} />
         </div>
 
         <JobProgressBar job={job} />
