@@ -59,6 +59,25 @@ logger = logging.getLogger(__name__)
 YT_API_BASE = "https://www.googleapis.com/youtube/v3"
 _MEDIA_EXTENSIONS = {".mp4", ".mkv", ".webm", ".avi", ".m4a", ".mov", ".flv"}
 
+# A single literal query has a finite pool of matching videos, and cc_only
+# filtering (default on) shrinks that further — mirrors web_connector.py's
+# _QUERY_VARIANT_SUFFIXES fix for the same "job stops way short of target"
+# problem (there: ~16 images instead of the requested 500). Generic
+# rephrasings pull differently-ranked search results for the same subject;
+# downstream relevance filtering (YOLO-World + SmolVLM) is what keeps this
+# safe — broadening recall here only adds candidates for filtering to
+# reject, it can't let anything irrelevant through on its own.
+_QUERY_VARIANT_SUFFIXES = (
+    "",
+    " video",
+    " footage",
+    " scene",
+    " clip",
+    " compilation",
+)
+_DISCOVER_MAX_RESULTS_PER_CALL = 50  # YouTube Data API's own per-call ceiling
+_DISCOVER_MAX_VARIANT_ATTEMPTS = len(_QUERY_VARIANT_SUFFIXES)
+
 
 def search_videos(
     query: str,
@@ -380,40 +399,62 @@ class YouTubeConnector:
         discovery_tasks.py passes whatever api_key CredentialService resolved
         (may be an empty string) and receives a normal DiscoveryPage either
         way. No task-level changes are needed.
+
+        Loops _QUERY_VARIANT_SUFFIXES (generic rephrasings of the same
+        query, e.g. "weapon" -> "weapon footage") accumulating unique
+        (by video_id) candidates until `limit` is reached or every variant
+        has been tried — a single literal query previously capped discovery
+        at whatever one search call returned (as few as 5-20 videos), so a
+        job asking for hundreds of accepted frames from a query with heavy
+        downstream relevance-filter rejection had no way to make up the
+        shortfall; discover() just declared itself exhausted immediately.
         """
         license_filter = "creativeCommon" if self.cc_only else None
-        error_reason: str | None = None
+        seen_video_ids: set[str] = set()
+        items: list[SourceItem] = []
+        api_returned_anything = False
 
-        # --- Path 1: YouTube Data API v3 ---
-        items = search_videos(query, api_key, max_results=limit, license_filter=license_filter)
+        for suffix in _QUERY_VARIANT_SUFFIXES:
+            if len(items) >= limit:
+                break
+            variant_query = f"{query}{suffix}".strip()
 
-        # --- Path 2: yt-dlp (no API key needed) ---
-        if not items:
-            if api_key:
-                # API key was present but returned nothing — log so operators
-                # can distinguish "key works but no results" from "no key at
-                # all"; don't surface this as an error_reason since yt-dlp
-                # may still succeed.
-                logger.warning(
-                    f"YouTube Data API returned no results for {query!r} "
-                    f"(quota exhausted or key invalid?) — falling back to yt-dlp search"
-                )
+            # --- Path 1: YouTube Data API v3 ---
+            variant_items = search_videos(
+                variant_query, api_key, max_results=_DISCOVER_MAX_RESULTS_PER_CALL, license_filter=license_filter
+            )
+            if variant_items:
+                api_returned_anything = True
             else:
-                logger.info(
-                    f"No YOUTUBE_API_KEY configured — using yt-dlp search for {query!r}"
+                # --- Path 2: yt-dlp (no API key needed, or API path came up empty) ---
+                variant_items = search_videos_ytdlp(
+                    variant_query, max_results=_DISCOVER_MAX_RESULTS_PER_CALL, cc_only=self.cc_only
                 )
 
-            items = search_videos_ytdlp(query, max_results=limit, cc_only=self.cc_only)
+            for si in variant_items:
+                vid_id = si.external_ref["video_id"]
+                if vid_id in seen_video_ids:
+                    continue
+                seen_video_ids.add(vid_id)
+                items.append(si)
+                if len(items) >= limit:
+                    break
 
-            if not items:
-                # Both paths came up empty. Surface a reason so discover_youtube
-                # can write a meaningful error_message on the source task rather
-                # than the generic "No YouTube videos found for query".
-                error_reason = (
-                    "No YouTube videos found via Data API or yt-dlp search "
-                    f"for query {query!r} (cc_only={self.cc_only})"
+        error_reason: str | None = None
+        if not items:
+            if api_key and not api_returned_anything:
+                logger.warning(
+                    f"YouTube Data API returned no results for {query!r} across all query variants "
+                    f"(quota exhausted or key invalid?) — yt-dlp fallback also came up empty"
                 )
+            error_reason = (
+                "No YouTube videos found via Data API or yt-dlp search "
+                f"for query {query!r} (cc_only={self.cc_only}, tried {_DISCOVER_MAX_VARIANT_ATTEMPTS} query variants)"
+            )
 
+        # exhausted=True whenever every variant has been walked (always, in
+        # this implementation) — there's no cursor to resume from since each
+        # variant is a one-shot search, not a paginated feed.
         return DiscoveryPage(items=items, next_cursor=None, exhausted=True, error_reason=error_reason)
 
     def fetch(
@@ -661,6 +702,14 @@ class YouTubeConnector:
         ref = f"video_id={video_id}" if video_id else url
         if "private" in msg or "unavailable" in msg or "removed" in msg or "copyright" in msg:
             return FatalConnectorError(f"Video unavailable ({ref}): {e}")
+        if "sign in to confirm" in msg:
+            # yt-dlp has no cookies configured in this deployment, so an
+            # age/bot-check gate can never succeed no matter how many times
+            # it's retried — classifying it as transient just burns 5 retries
+            # x up to 600s of backoff before landing in the same place a
+            # fatal error would reach immediately (recorded as a per-item
+            # error, chord continues with the rest of the job).
+            return FatalConnectorError(f"Video requires sign-in/age verification ({ref}): {e}")
         if "403" in msg or "forbidden" in msg:
             return TransientConnectorError(
                 f"YouTube CDN refused the video download for {ref} (HTTP 403 — this host's network is "
