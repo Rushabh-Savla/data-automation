@@ -216,6 +216,9 @@ export interface JobCreateRequest {
   target_count?: number | null
   deadline_at?: string | null
   scheduled_start_at?: string | null
+  /** Cron expression; makes this job a recurring template. */
+  schedule_cron?: string | null
+  schedule_timezone?: string
   config?: JobConfig
 }
 
@@ -264,6 +267,13 @@ export interface JobResponse {
   filtering_in_progress: boolean
   /** Which top-up round is running; 1 or null is the original pass. */
   topup_round: number | null
+  /** Set when this job is a recurring template rather than a single run. */
+  schedule_cron: string | null
+  schedule_timezone: string
+  next_run_at: string | null
+  last_run_at: string | null
+  /** Set on a run that a template spawned; points at the template. */
+  parent_job_id: string | null
 }
 
 export interface JobDetailResponse extends JobResponse {

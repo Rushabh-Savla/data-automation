@@ -49,6 +49,12 @@ export const jobCreateSchema = z
     scheduleEnabled: z.boolean(),
     scheduledStart: z.string().optional(),
 
+    // Recurring schedule. A job with a cron becomes a template that spawns one
+    // run per firing, rather than running itself — so this is deliberately
+    // separate from scheduledStart, which is a single deferred start.
+    recurringEnabled: z.boolean(),
+    scheduleCron: z.string().optional(),
+
     // -- Advanced / config (all optional; unset fields are simply omitted on submit) --
     // Field-array items are objects, not raw tuples/strings: react-hook-form's
     // useFieldArray only officially supports arrays of objects (it injects a
@@ -120,6 +126,28 @@ export const jobCreateSchema = z
     if (data.scheduleEnabled && !data.scheduledStart) {
       ctx.addIssue({ code: 'custom', message: 'Pick a start time', path: ['scheduledStart'] })
     }
+    if (data.recurringEnabled && !data.scheduleCron?.trim()) {
+      ctx.addIssue({ code: 'custom', message: 'Enter a cron expression', path: ['scheduleCron'] })
+    }
+    if (data.recurringEnabled && data.scheduleCron?.trim()) {
+      // Shape only — the backend owns the real rules (parseability, and a
+      // minimum interval so runs cannot overlap) and returns a precise error.
+      const fields = data.scheduleCron.trim().split(/\s+/).length
+      if (fields < 5 || fields > 6) {
+        ctx.addIssue({
+          code: 'custom',
+          message: 'A cron expression has 5 fields, e.g. "0 2 * * *" for 02:00 daily',
+          path: ['scheduleCron'],
+        })
+      }
+    }
+    if (data.recurringEnabled && data.scheduleEnabled) {
+      ctx.addIssue({
+        code: 'custom',
+        message: 'Use either a one-off start time or a repeating schedule, not both',
+        path: ['recurringEnabled'],
+      })
+    }
     if (!data.useAutoSources && data.sources.length === 0) {
       ctx.addIssue({ code: 'custom', message: 'Pick at least one source, or use Auto', path: ['sources'] })
     }
@@ -138,6 +166,8 @@ export const jobCreateDefaultValues: JobCreateFormValues = {
   deadline: undefined,
   scheduleEnabled: false,
   scheduledStart: undefined,
+  recurringEnabled: false,
+  scheduleCron: undefined,
   roboflowMaxProjects: undefined,
   roboflowExportFormat: undefined,
   roboflowProjects: [],
@@ -314,6 +344,8 @@ export function buildJobCreatePayload(values: JobCreateFormValues): JobCreateReq
     deadline_at: values.deadlineEnabled && values.deadline ? new Date(values.deadline).toISOString() : undefined,
     scheduled_start_at:
       values.scheduleEnabled && values.scheduledStart ? new Date(values.scheduledStart).toISOString() : undefined,
+    schedule_cron:
+      values.recurringEnabled && values.scheduleCron?.trim() ? values.scheduleCron.trim() : undefined,
     config: buildConfigPayload(values),
   }
   return payload

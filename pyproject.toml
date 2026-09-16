@@ -71,6 +71,8 @@ dependencies = [
     # detected, matmul OK). Pinning here rather than upgrading the host
     # driver, because this machine also runs unrelated production workloads
     # that a driver change would disrupt.
+    # Cron parsing for recurring job schedules (app/services/schedule_service.py).
+    "croniter>=3.0.0",
     "torch==2.6.0",
     "torchvision==0.21.0",
 ]

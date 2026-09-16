@@ -53,6 +53,8 @@ class JobService:
         target_count: int | None = None,
         deadline_at: datetime | None = None,
         scheduled_start_at: datetime | None = None,
+        schedule_cron: str | None = None,
+        schedule_timezone: str = "UTC",
         config: dict | None = None,
     ) -> Job:
         # No sources picked -> fan out across every connector the platform
@@ -90,7 +92,18 @@ class JobService:
         else:
             dispatch_sources = sources
 
-        status = JobStatus.SCHEDULED if scheduled_start_at else JobStatus.DRAFT
+        # A recurring template also sits in SCHEDULED, and stays there: it is
+        # never started itself, only swept by scan_schedules, which creates a
+        # child run per firing.
+        status = (
+            JobStatus.SCHEDULED if (scheduled_start_at or schedule_cron) else JobStatus.DRAFT
+        )
+        next_run_at = None
+        if schedule_cron:
+            from app.services.schedule_service import next_fire_time
+
+            next_run_at = next_fire_time(schedule_cron, schedule_timezone)
+
         job = Job(
             id=uuid.uuid4(),
             name=name,
@@ -99,6 +112,9 @@ class JobService:
             target_count=target_count,
             deadline_at=deadline_at,
             scheduled_start_at=scheduled_start_at,
+            schedule_cron=schedule_cron,
+            schedule_timezone=schedule_timezone,
+            next_run_at=next_run_at,
             status=status,
             config=job_config,
         )

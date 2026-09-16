@@ -37,6 +37,8 @@ def create_job(payload: JobCreateRequest, db: Session = Depends(get_db)):
         target_count=payload.target_count,
         deadline_at=payload.deadline_at,
         scheduled_start_at=payload.scheduled_start_at,
+        schedule_cron=payload.schedule_cron,
+        schedule_timezone=payload.schedule_timezone,
         config=payload.config,
     )
     db.commit()

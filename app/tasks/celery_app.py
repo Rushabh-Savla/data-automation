@@ -57,6 +57,12 @@ celery_app.conf.update(
         # that path missed, including everything stranded while cleanup_local
         # had no call site at all. Six-hourly because the directories it
         # targets are already hours old by definition.
+        # Recurring job templates. Separate from watchdog-scan so a slow or
+        # failing sweep of one cannot delay the other.
+        "scan-schedules": {
+            "task": "app.tasks.orchestration_tasks.scan_schedules",
+            "schedule": 60.0,
+        },
         "purge-orphan-work-dirs": {
             "task": "app.tasks.cleanup_tasks.purge_orphan_work_dirs",
             "schedule": 6 * 3600.0,

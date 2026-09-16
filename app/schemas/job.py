@@ -33,6 +33,15 @@ class JobCreateRequest(BaseModel):
     target_count: int | None = Field(default=None, gt=0)
     deadline_at: datetime | None = None
     scheduled_start_at: datetime | None = None
+    schedule_cron: str | None = Field(
+        default=None,
+        description=(
+            "Cron expression for a recurring job, e.g. '0 2 * * *' for nightly "
+            "at 02:00. A job with this set becomes a template: it never runs "
+            "itself, and each firing creates a separate run."
+        ),
+    )
+    schedule_timezone: str = "UTC"
     config: dict = Field(default_factory=dict)
 
     @model_validator(mode="after")
@@ -46,13 +55,45 @@ class JobCreateRequest(BaseModel):
             )
         return self
 
+    @model_validator(mode="after")
+    def _validate_cron(self):
+        """Rejects a bad cron at creation time.
+
+        Validating here rather than in the Beat sweep matters: an unparseable
+        expression that only fails inside a background task fails silently,
+        and the user simply never sees their job run.
+        """
+        if self.schedule_cron is None:
+            return self
+        from app.services.schedule_service import InvalidCronError, validate_cron
+
+        try:
+            validate_cron(self.schedule_cron, self.schedule_timezone)
+        except InvalidCronError as e:
+            raise ValueError(str(e)) from e
+        return self
+
 
 class JobUpdateRequest(BaseModel):
     name: str | None = None
     target_count: int | None = Field(default=None, gt=0)
     deadline_at: datetime | None = None
     scheduled_start_at: datetime | None = None
+    schedule_cron: str | None = None
+    schedule_timezone: str | None = None
     config: dict | None = None
+
+    @model_validator(mode="after")
+    def _validate_cron(self):
+        if self.schedule_cron is None:
+            return self
+        from app.services.schedule_service import InvalidCronError, validate_cron
+
+        try:
+            validate_cron(self.schedule_cron, self.schedule_timezone or "UTC")
+        except InvalidCronError as e:
+            raise ValueError(str(e)) from e
+        return self
 
 
 class JobSourceTaskResponse(BaseModel):
@@ -108,6 +149,11 @@ class JobResponse(BaseModel):
     # whole `config` blob, which is internal orchestration state the client has
     # no business depending on. 1 (or absent) means the original pass.
     topup_round: int | None = None
+    schedule_cron: str | None = None
+    schedule_timezone: str = "UTC"
+    next_run_at: datetime | None = None
+    last_run_at: datetime | None = None
+    parent_job_id: uuid.UUID | None = None
 
     model_config = {"from_attributes": True}
 

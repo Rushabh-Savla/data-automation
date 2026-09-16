@@ -90,6 +90,32 @@ class JobRepository:
         )
         return list(self.db.execute(stmt).scalars().all())
 
+    def list_due_schedules(self, now: datetime | None = None) -> list[Job]:
+        """Recurring templates whose next_run_at has arrived.
+
+        Distinct from list_due_scheduled above: that one handles the one-shot
+        scheduled_start_at and starts the job itself, whereas a template never
+        runs -- it spawns a child run each time it fires. A template with a
+        NULL next_run_at is included so a newly created one fires on its first
+        sweep rather than waiting for a value nothing has written yet.
+        """
+        now = now or datetime.now(timezone.utc)
+        stmt = select(Job).where(
+            Job.schedule_cron.is_not(None),
+            Job.status == JobStatus.SCHEDULED,
+            or_(Job.next_run_at.is_(None), Job.next_run_at <= now),
+        )
+        return list(self.db.execute(stmt).scalars().all())
+
+    def list_runs_for_template(self, template_id: uuid.UUID, limit: int = 50) -> list[Job]:
+        stmt = (
+            select(Job)
+            .where(Job.parent_job_id == template_id)
+            .order_by(Job.created_at.desc())
+            .limit(limit)
+        )
+        return list(self.db.execute(stmt).scalars().all())
+
     def list_active(self) -> list[Job]:
         from app.domain.enums import JOB_ACTIVE_STATUSES
 

@@ -397,6 +397,75 @@ def evaluate_job_completion(self, job_id: str):
     clear_job_context()
 
 
+@celery_app.task(name="app.tasks.orchestration_tasks.scan_schedules")
+def scan_schedules():
+    """Beat-scheduled: fires recurring job templates whose cron is due.
+
+    A template spawns a child Job per firing and starts it; see
+    app/services/schedule_service.py for why it is modelled that way rather
+    than re-running the template row itself.
+
+    next_run_at is advanced BEFORE the child is started, so a failure while
+    starting cannot leave the template permanently due and spawning a child on
+    every 60s sweep.
+    """
+    from app.services.schedule_service import build_child_job, next_fire_time
+
+    now = datetime.now(timezone.utc)
+    to_start: list[str] = []
+
+    with session_scope() as db:
+        job_repo = JobRepository(db)
+        for template in job_repo.list_due_schedules(now):
+            try:
+                upcoming = next_fire_time(
+                    template.schedule_cron, template.schedule_timezone or "UTC", after=now
+                )
+            except Exception:
+                logger.exception(
+                    f"Schedule for template {template.id} is unusable; disabling it"
+                )
+                # Clearing the cron stops an unparseable expression from being
+                # retried every 60 seconds forever.
+                template.schedule_cron = None
+                continue
+
+            first_fire = template.next_run_at is None
+            template.next_run_at = upcoming
+            template.last_run_at = now
+
+            if first_fire:
+                # A template created moments ago has no next_run_at yet. Arm it
+                # rather than treating "never scheduled" as "overdue", which
+                # would run it immediately regardless of what the cron says.
+                logger.info(f"Schedule for template {template.id} armed; first run at {upcoming}")
+                continue
+
+            child = build_child_job(template, now)
+            db.add(child)
+            db.flush()
+            for source in child.sources or []:
+                db.add(
+                    JobSourceTask(
+                        id=uuid.uuid4(), job_id=child.id, source_type=source
+                    )
+                )
+            db.flush()
+            to_start.append(str(child.id))
+            logger.info(
+                f"Schedule fired for template {template.id}: created run {child.id}, "
+                f"next at {upcoming}"
+            )
+
+    # Started after the transaction commits so the discovery tasks cannot race
+    # the child's own INSERT.
+    for child_id in to_start:
+        with session_scope() as db:
+            from app.services.job_service import JobService
+
+            JobService(db).start(uuid.UUID(child_id))
+
+
 @celery_app.task(name="app.tasks.orchestration_tasks.watchdog_scan")
 def watchdog_scan():
     """Beat-scheduled (every 60s) safety net: resumes stalled JobSourceTasks,

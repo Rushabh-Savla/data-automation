@@ -42,6 +42,7 @@ export function JobCreateForm() {
   const targetCountEnabled = watch('targetCountEnabled')
   const deadlineEnabled = watch('deadlineEnabled')
   const scheduleEnabled = watch('scheduleEnabled')
+  const recurringEnabled = watch('recurringEnabled')
 
   // Driven by the API rather than a literal. The hardcoded list here named
   // four sources while twelve connectors are implemented and the backend's
@@ -136,6 +137,39 @@ export function JobCreateForm() {
             {...register('scheduledStart')}
           />
           {errors.scheduledStart && <p className="text-xs text-destructive">{errors.scheduledStart.message}</p>}
+        </Card>
+
+        <Card className="gap-2 p-4">
+          <Label className="flex items-center gap-2">
+            <Controller
+              control={control}
+              name="recurringEnabled"
+              render={({ field }) => (
+                <Checkbox checked={field.value} onCheckedChange={(c) => field.onChange(c === true)} />
+              )}
+            />
+            Repeat on a schedule
+          </Label>
+          <p className="text-xs text-muted-foreground">
+            Each run collects a fresh set toward the target and is kept as its own job, so you can see what
+            every run brought in.
+          </p>
+          <Input
+            placeholder="0 2 * * *"
+            disabled={!recurringEnabled}
+            className="max-w-xs font-mono"
+            {...register('scheduleCron')}
+          />
+          {errors.recurringEnabled && (
+            <p className="text-xs text-destructive">{errors.recurringEnabled.message}</p>
+          )}
+          {errors.scheduleCron ? (
+            <p className="text-xs text-destructive">{errors.scheduleCron.message}</p>
+          ) : (
+            <p className="text-xs text-muted-foreground">
+              Cron format. <code>0 2 * * *</code> is 02:00 daily; <code>0 * * * *</code> is hourly.
+            </p>
+          )}
         </Card>
       </section>
 
