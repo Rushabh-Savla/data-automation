@@ -3,7 +3,7 @@
 ddg_downloader.py's YOLOv8-COCO-80-class + K-means dominant-color
 verification block (including the confirmed `target_xclasses` NameError bug
 at its line 185) is NOT ported here. It's superseded by the shared
-YOLO-World relevance-filter stage (app/filtering/yolo_world_filter.py),
+relevance-filter stage (app/filtering/vlm_filter.py),
 which is open-vocabulary (not limited to 80 COCO classes) and runs once,
 shared across every noisy source, rather than being reimplemented per
 connector. This also finally gives the web source real provenance tracking —
@@ -71,7 +71,7 @@ _DISCOVER_ATTEMPTS_PER_TARGET = 10  # scales attempt budget with how many valida
 # genuinely has a finite pool of unique image results (~35-350 for a typical
 # two-word phrase, even after full page pagination) — nowhere near enough for
 # a job asking for hundreds or thousands of images. Downstream relevance
-# filtering (YOLO-World + SmolVLM, see filtering_tasks.py) is what keeps this
+# filtering (app/filtering/vlm_filter.py, see filtering_tasks.py) is what keeps this
 # safe: broadening recall here can only add candidates for filtering to
 # reject, it can't let anything irrelevant through on its own.
 _QUERY_VARIANT_SUFFIXES = (

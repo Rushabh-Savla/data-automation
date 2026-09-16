@@ -51,10 +51,14 @@ def delete_asset_files(asset: Asset) -> None:
 
 @lru_cache(maxsize=1)
 def _load_clip_model(name: str = "ViT-B/32"):
-    """Lazily-loaded, process-wide CLIP model for standalone image-embedding
-    extraction — decoupled from YOLO-World's own internal CLIP text-encoder
-    (app/filtering/yolo_world_filter.py), which never exposes its embeddings
-    for application-level use."""
+    """Lazily-loaded, process-wide CLIP model for image-embedding extraction.
+
+    Used only for deduplication (app/filtering/dedup.py). It is deliberately
+    NOT used for relevance any more: a CLIP embedding encodes scene gist, and
+    measured on real job frames it separated actual weapons from briefcase and
+    wagon-wheel frames by +0.007 -- see app/filtering/vlm_filter.py for the
+    measurements and what replaced it. Near-duplicate detection is a different
+    question, and one these vectors genuinely do answer well."""
     import clip
     import torch
 

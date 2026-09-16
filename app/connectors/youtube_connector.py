@@ -64,7 +64,7 @@ _MEDIA_EXTENSIONS = {".mp4", ".mkv", ".webm", ".avi", ".m4a", ".mov", ".flv"}
 # _QUERY_VARIANT_SUFFIXES fix for the same "job stops way short of target"
 # problem (there: ~16 images instead of the requested 500). Generic
 # rephrasings pull differently-ranked search results for the same subject;
-# downstream relevance filtering (YOLO-World + SmolVLM) is what keeps this
+# downstream relevance filtering (app/filtering/vlm_filter.py) is what keeps this
 # safe — broadening recall here only adds candidates for filtering to
 # reject, it can't let anything irrelevant through on its own.
 _QUERY_VARIANT_SUFFIXES = (

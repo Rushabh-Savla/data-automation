@@ -9,45 +9,45 @@ though the connector itself never raised an error (e.g. a Kaggle dataset
 titled "Dog vs Cat Classification" matching a "dog" query, then yielding
 its cat images too).
 
-Filtering is a cheap-first cascade, not a single model.
+Relevance is decided by one model looking at the whole frame:
+app/filtering/vlm_filter.py, a VLM asked whether the query is clearly
+visible.
 
-Stage 1 is CLIP (app/filtering/clip_relevance.py), scored against the
-normalised image embedding that StandardizationService already stored on
-every asset at promotion time for deduplication. That makes it effectively
-free -- one text-encoder pass per batch plus a matrix multiply, with no
-image decode and no per-image inference -- and it yields a continuous
-score rather than a bit, which is what `Asset.relevance_score` now holds.
-Prompts come from app/filtering/query_expansion.py, which expands
-superordinate categories into concrete nouns and scores the query's prompt
-ensemble against a fixed background/contrast set.
+It is deliberately NOT a cheap-first cascade any more. The previous design
+scored a stored CLIP embedding and escalated only an uncertain middle band
+to a VLM, which is the textbook arrangement and was wrong here: measured on
+a real job's frames, CLIP's separation between actual weapons and briefcase
+or wagon-wheel frames was +0.007. The band therefore never fired, every one
+of that job's 500 accepted assets scored 90-100%, and the filter was passing
+essentially everything while displaying a confident-looking percentage next
+to images containing nothing of the sort. SigLIP, YOLO-World and a 256M VLM
+were measured too; app/filtering/vlm_filter.py records the numbers. The
+cause is structural -- a global image-text embedding encodes scene gist, in
+which a briefcase and a pistol in a dark room are near-identical -- so no
+prompt tuning recovers it.
 
-Stage 2 is SmolVLM (app/filtering/smolvlm_filter.py), and it runs ONLY on
-the uncertain middle band between the accept and reject thresholds. It is
-asked a normalised question rather than the raw query: the original code
-passed the job's text through verbatim, so a real job asked "Does this
-image show weapon on movies scence?" -- typo and all -- and that answer was
-the sole accept/reject decision for all 754 assets. YOLO-World is consulted
-only to crop toward a candidate region for those escalated few; its score
-never gates anything, because it structurally cannot represent compound
-queries ("red cane", "people wearing helmet" would pass on a bare
-"cane"/"people" match). On the job that motivated this rewrite it returned
-0.0 for every asset even at a 0.05 threshold, so it was contributing a full
-inference pass per image for no signal at all -- hence it now runs on a
-small minority of assets and can be disabled per job.
+The replacement model is both more accurate and faster than the 256M one it
+replaces (0.18s vs 0.39s per image on an RTX A4000), so it runs on every
+asset. That removes the accept/reject thresholds entirely: there is nothing
+left to calibrate, and no band whose miscalibration can silently disable
+filtering.
+
+app/filtering/query_expansion.py still normalises the query into the
+question ("weapon on movies scence" -> "a weapon"); the old gate passed the
+raw typo'd string to the model verbatim.
 
 Crucially there are THREE outcomes per asset, not two: accept, reject, and
 error. An exception must never be recorded as a rejection, because a
-rejection deletes the file from NAS. The previous code set vlm_pass=False
-on any exception, so a model OOM or a transient read failure destroyed the
-image as if the model had confidently judged it irrelevant. An undecided
-asset is instead left PROMOTED, keeps its file, and is reconsidered by a
-later pass.
+rejection deletes the file from NAS. The previous code set the verdict to
+False on any exception, so a model OOM or a transient read failure destroyed
+the image as if the model had confidently judged it irrelevant. An undecided
+asset is instead left PROMOTED, keeps its file, and is reconsidered later.
 
 Deduplication runs across every source's assets for the job.
 
 Relevance filtering is dispatched as a fan-out of small batches
 (relevance_filter_batch), not one big loop in run_relevance_filter itself.
-Each asset costs one YOLO-World + one SmolVLM inference call (~5-25s
+Each asset costs one VLM inference call (~0.2s on GPU
 combined); at 50k+ assets, one task looping over all of them would take
 days and would hit celery_task_time_limit_s (app/core/config.py) long
 before finishing.
@@ -90,8 +90,6 @@ from app.db.repositories.job_repository import JobRepository
 from app.db.session import session_scope
 from app.domain.enums import AssetStatus
 from app.filtering.dedup import HybridDeduplicator
-from app.filtering.smolvlm_filter import VisualVerifier
-from app.filtering.yolo_world_filter import RelevanceFilter
 from app.services.fan_in import FanIn
 from app.services.job_counters import reconcile
 from app.services.progress_service import ProgressPublisher
@@ -185,107 +183,126 @@ _REJECT = "reject"
 _ERROR = "error"
 
 
+# Outcome of the relevance decision for one asset. "error" is a distinct
+# third state on purpose: it must never be conflated with a genuine "no",
+# because a rejection deletes the file. Previously any exception -- a model
+# OOM, a transient read failure -- was recorded as a rejection and the image
+# was destroyed as if the model had confidently judged it irrelevant.
+_ACCEPT = "accept"
+_REJECT = "reject"
+_ERROR = "error"
+
+
 def _classify_batch(
     job_query: str,
-    conf_threshold: float,
-    items: list[tuple[str, str, list[float] | None]],
-    accept_at: float,
-    reject_at: float,
-    use_detector: bool = True,
+    items: list[tuple[str, str]],
 ) -> list[tuple[str, str, float | None]]:
-    """Decides relevance for (asset_id, nas_path, embedding) triples.
+    """Decides relevance for (asset_id, nas_path) pairs.
 
     Returns (asset_id, outcome, score) where outcome is _ACCEPT / _REJECT /
-    _ERROR and score is the CLIP relevance in [0, 1] (None only when it could
-    not be computed at all).
+    _ERROR. `score` is 1.0 / 0.0 / None -- the VLM gives a verdict, not a
+    calibrated probability, and recording a fabricated confidence is what
+    made the previous implementation so misleading: it showed "95.2%" next to
+    images containing no weapon at all.
 
-    Two stages, cheap first:
-
-    1. CLIP scores every asset from the embedding already stored on the row
-       at promotion time. No image is decoded and no per-image model runs, so
-       this costs one text-encoder pass for the whole batch. Assets that land
-       above accept_at or below reject_at are decided here and never reach
-       the VLM.
-    2. Only the uncertain middle band goes to the VLM, which is the expensive
-       part (measured at ~66s/image on CPU). YOLO-World is consulted solely
-       to crop toward a candidate region for those few, not to gate anything.
+    A single model decides, on the whole frame. The previous cascade scored a
+    CLIP embedding first and escalated only an uncertain middle band, which
+    sounds cheaper but measured a separation of +0.007 between real weapons
+    and briefcases -- so the band never fired and everything was accepted.
+    See app/filtering/vlm_filter.py for the full measurement.
 
     Kept out of the task body so the expensive work cannot hold a database
     transaction: an hour of idle-in-transaction is what let the
     inherited-socket fork bug surface as a mid-batch OperationalError."""
-    from app.filtering import clip_relevance, query_expansion
+    from app.filtering import query_expansion
+    from app.filtering.vlm_filter import VisualVerifier
 
     if not items:
         return []
 
-    relevance_config_positive = query_expansion.positive_prompts(job_query)
-    relevance_config_negative = query_expansion.negative_prompts()
-    scores = clip_relevance.score_embeddings(
-        [embedding for _, _, embedding in items],
-        relevance_config_positive,
-        relevance_config_negative,
-    )
-
-    decisions: list[tuple[str, str, float | None]] = []
-    uncertain: list[tuple[int, str, str]] = []
-
-    for index, ((asset_id_str, nas_path, _embedding), score) in enumerate(zip(items, scores)):
-        band = clip_relevance.classify(score, accept_at, reject_at)
-        if band == "accept":
-            decisions.append((asset_id_str, _ACCEPT, score))
-        elif band == "reject":
-            decisions.append((asset_id_str, _REJECT, score))
-        else:
-            # Placeholder; replaced below once the VLM has adjudicated.
-            decisions.append((asset_id_str, _ERROR, score))
-            uncertain.append((index, asset_id_str, nas_path))
-
-    if not uncertain:
-        return decisions
-
-    logger.info(
-        f"Relevance: {len(items) - len(uncertain)} decided by CLIP, "
-        f"{len(uncertain)} escalated to the VLM"
-    )
-
-    question = query_expansion.normalize_query(job_query)
-    prompt_classes = query_expansion.derive_classes(job_query)
-
-    relevance_filter = None
-    if use_detector and prompt_classes:
-        try:
-            relevance_filter = RelevanceFilter(conf_threshold=conf_threshold)
-        except Exception as e:
-            logger.warning(f"YOLO-World unavailable, verifying uncropped: {e}")
+    question_subject = query_expansion.normalize_query(job_query)
 
     try:
-        visual_verifier = VisualVerifier()
-    except Exception as e:
-        # The whole escalation path is unusable. Leave every uncertain asset
-        # as _ERROR so it stays PROMOTED and is retried, rather than deleting
-        # images because a model failed to load.
-        logger.exception(f"SmolVLM unavailable, deferring {len(uncertain)} uncertain assets: {e}")
-        return decisions
+        verifier = VisualVerifier()
+    except Exception:
+        # The gate itself is unusable. Every asset becomes _ERROR so it stays
+        # PROMOTED for a later pass, rather than being deleted because a model
+        # failed to load.
+        logger.exception(f"Relevance model unavailable; deferring {len(items)} asset(s)")
+        return [(asset_id, _ERROR, None) for asset_id, _ in items]
 
-    for index, asset_id_str, nas_path in uncertain:
-        box = None
-        if relevance_filter is not None:
-            try:
-                box = relevance_filter.detect(nas_path, prompt_classes).box
-            except Exception as e:
-                logger.warning(f"Relevance detection failed for asset {asset_id_str}: {e}")
+    verdicts = verifier.verify_batch([path for _, path in items], question_subject)
 
-        try:
-            vlm_pass = visual_verifier.verify(nas_path, question, box=box)
-        except Exception as e:
-            # Explicitly NOT a rejection. An exception means we do not know,
-            # and "we do not know" must not destroy the file.
-            logger.warning(f"SmolVLM verification failed for asset {asset_id_str}: {e}")
-            continue
+    decisions: list[tuple[str, str, float | None]] = []
+    for (asset_id, _path), verdict in zip(items, verdicts):
+        if verdict is None:
+            decisions.append((asset_id, _ERROR, None))
+        elif verdict:
+            decisions.append((asset_id, _ACCEPT, 1.0))
+        else:
+            decisions.append((asset_id, _REJECT, 0.0))
 
-        decisions[index] = (asset_id_str, _ACCEPT if vlm_pass else _REJECT, decisions[index][2])
-
+    accepted = sum(1 for _, o, _ in decisions if o == _ACCEPT)
+    logger.info(
+        f"Relevance ({question_subject!r}): {accepted}/{len(decisions)} accepted"
+    )
     return decisions
+
+
+@celery_app.task(name="app.tasks.filtering_tasks.rerun_relevance_filter", bind=True)
+def rerun_relevance_filter(self, job_id: str, include_rejected: bool = False):
+    """Re-judges a job's assets with the current relevance gate.
+
+    The escape hatch that did not exist when the gate was wrong. A job filtered
+    by a miscalibrated model has an accepted set that cannot be trusted, and
+    without this the only remedy was to re-collect everything from scratch.
+
+    Resets RELEVANCE_PASSED assets back to PROMOTED and re-dispatches the normal
+    filtering pass, so there is exactly one code path that decides relevance.
+
+    `include_rejected` additionally reconsiders rejected assets, but only those
+    whose file still exists: a rejection deletes the file from NAS, so most
+    rejected rows have nothing left to look at. Those are skipped rather than
+    being re-judged on a missing file (which would score them as errors and
+    leave them stuck PROMOTED forever).
+    """
+    import os
+
+    job_uuid = uuid.UUID(job_id)
+
+    with session_scope() as db:
+        asset_repo = AssetRepository(db)
+        restored = 0
+
+        for asset in asset_repo.list_for_job(job_uuid, status=AssetStatus.RELEVANCE_PASSED, limit=100_000):
+            asset_repo.set_status(asset.id, AssetStatus.PROMOTED, relevance_score=None)
+            restored += 1
+
+        skipped_missing = 0
+        if include_rejected:
+            for asset in asset_repo.list_for_job(
+                job_uuid, status=AssetStatus.RELEVANCE_REJECTED, limit=100_000
+            ):
+                if not asset.nas_path or not os.path.exists(str(asset.nas_path)):
+                    skipped_missing += 1
+                    continue
+                asset_repo.set_status(asset.id, AssetStatus.PROMOTED, relevance_score=None)
+                restored += 1
+
+        db.flush()
+
+    logger.info(
+        f"Re-filtering job {job_id}: {restored} asset(s) reset to PROMOTED"
+        + (f", {skipped_missing} rejected asset(s) skipped (file already deleted)" if include_rejected else "")
+    )
+
+    # Clear the guards so the pass actually dispatches rather than being
+    # suppressed as a duplicate of the run that produced the bad result.
+    redis_client = get_redis()
+    redis_client.delete(_FINALIZE_GUARD_KEY.format(job_id=job_id))
+    redis_client.delete(f"job:{job_id}:filtering_dispatched")
+
+    run_relevance_filter.delay(job_id)
 
 
 @celery_app.task(name="app.tasks.filtering_tasks.relevance_filter_batch", bind=True)
@@ -314,23 +331,7 @@ def relevance_filter_batch(self, job_id: str, asset_ids: list[str]) -> dict:
                 return {"passed": 0, "rejected": 0}
 
             query = job.query
-            # Use the class-level constant as the fallback so both the filter
-            # object's own default and this config lookup always agree — there
-            # is exactly one source of truth (RelevanceFilter.DEFAULT_CONF_THRESHOLD).
-            conf_threshold = job.config.get(
-                "yolo_world_conf_threshold", RelevanceFilter.DEFAULT_CONF_THRESHOLD
-            )
-            settings = get_settings()
-            relevance_config = job.config.get("relevance") or {}
-            accept_at = relevance_config.get("accept_threshold", settings.relevance_accept_threshold)
-            reject_at = relevance_config.get("reject_threshold", settings.relevance_reject_threshold)
-            use_detector = relevance_config.get("yolo_world_enabled", True)
-
-            # The embedding is read here, with the row, rather than recomputed:
-            # StandardizationService already stored a normalised CLIP vector
-            # for every asset at promotion time for dedup's benefit, and
-            # relevance scoring against it is a dot product.
-            items: list[tuple[str, str, list[float] | None]] = []
+            items: list[tuple[str, str]] = []
             for asset_id_str in asset_ids:
                 asset = asset_repo.get(uuid.UUID(asset_id_str))
                 if asset is None or not asset.nas_path:
@@ -347,12 +348,10 @@ def relevance_filter_batch(self, job_id: str, asset_ids: list[str]) -> dict:
                 # redelivery.
                 if asset.status != AssetStatus.PROMOTED:
                     continue
-                items.append((asset_id_str, str(asset.nas_path), asset.embedding))
+                items.append((asset_id_str, str(asset.nas_path)))
 
         # -- Inference phase: NO session held. -----------------------------
-        decisions = _classify_batch(
-            query, conf_threshold, items, accept_at, reject_at, use_detector=use_detector
-        )
+        decisions = _classify_batch(query, items)
 
         # -- Write-back phase: short transactions, chunked so a kill keeps
         #    whatever was already decided. ---------------------------------

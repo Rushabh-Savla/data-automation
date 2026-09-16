@@ -89,21 +89,6 @@ class Settings(BaseSettings):
     # still land on target_count in the common case (see build_on_progress in
     # app/tasks/_helpers.py); trim_excess_assets (app/tasks/filtering_tasks.py)
     # trims any overshoot back down to exactly target_count afterward.
-    # -- Relevance filtering bands -------------------------------------------
-    # A CLIP score (app/filtering/clip_relevance.py) above accept_at is taken
-    # as relevant, below reject_at as irrelevant, and anything between is
-    # escalated to the VLM. Defaults were chosen from the score distribution
-    # measured on a real job's frames (n=107: min 0.21, p25 0.50, median 0.76,
-    # p75 0.93), which puts roughly a quarter of assets in the uncertain band
-    # -- enough to catch genuinely ambiguous images without paying for VLM
-    # inference on the clear majority.
-    #
-    # These are a prefilter, not an oracle: CLIP is confidently wrong on some
-    # low-information images, so raise reject_at only with evidence. Both are
-    # overridable per job via config["relevance"].
-    relevance_accept_threshold: float = 0.75
-    relevance_reject_threshold: float = 0.45
-
     # Hard ceiling on discover -> filter -> re-discover rounds per job
     # (app/domain/topup.py). A top-up loop that can run forever is worse than
     # no loop at all: it burns GPU and API quota on a query with no real

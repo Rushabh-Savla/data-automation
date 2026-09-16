@@ -1,6 +1,6 @@
 """Turning a free-text job query into something a vision model can actually score.
 
-The previous approach (derive_prompt_classes in yolo_world_filter.py) split
+The previous approach (derive_prompt_classes, since removed) split
 the query on connectives and handed the fragments to the detector as class
 prompts. On a real job -- query "weapon on movies scence", target 500 -- that
 produced:

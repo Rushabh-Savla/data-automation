@@ -64,7 +64,7 @@ class Job(Base):
         nullable=True,
     )
 
-    # Per-source overrides: min_resolution, license allow-list, yolo_world_conf_threshold,
+    # Per-source overrides: min_resolution, license allow-list,
     # dedup_hamming_threshold, img2dataset concurrency, etc.
     config: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
 
