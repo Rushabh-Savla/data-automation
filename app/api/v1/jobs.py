@@ -82,8 +82,16 @@ def update_job(job_id: uuid.UUID, payload: JobUpdateRequest, db: Session = Depen
 @router.delete("/{job_id}", status_code=204)
 def delete_job(job_id: uuid.UUID, db: Session = Depends(get_db)):
     job = _get_job_or_404(db, job_id)
-    if job.status not in JOB_TERMINAL_STATUSES and job.status != JobStatus.DRAFT:
-        raise HTTPException(409, "Only terminal or draft jobs can be deleted; cancel it first")
+    # SCHEDULED is deletable as well as terminal/draft. A recurring template
+    # stays SCHEDULED for its entire life by design -- it never runs itself --
+    # so restricting deletion to terminal states would make a template
+    # impossible to ever remove, and it would keep spawning runs forever.
+    # Deleting it does not touch the runs it already produced: parent_job_id
+    # is ON DELETE SET NULL, so those become ordinary standalone jobs and the
+    # data they collected is preserved.
+    deletable = set(JOB_TERMINAL_STATUSES) | {JobStatus.DRAFT, JobStatus.SCHEDULED}
+    if job.status not in deletable:
+        raise HTTPException(409, "Only scheduled, terminal or draft jobs can be deleted; cancel it first")
     db.delete(job)
     db.commit()
 
