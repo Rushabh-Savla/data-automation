@@ -102,11 +102,49 @@ class JobResponse(BaseModel):
     started_at: datetime | None
     completed_at: datetime | None
     filtering_in_progress: bool = False
+    # Which top-up round the job is on, surfaced so the UI can say "collecting
+    # more data" instead of leaving the user staring at a static count while a
+    # second round runs. Exposed as its own field rather than by returning the
+    # whole `config` blob, which is internal orchestration state the client has
+    # no business depending on. 1 (or absent) means the original pass.
+    topup_round: int | None = None
 
     model_config = {"from_attributes": True}
 
+    @model_validator(mode="before")
+    @classmethod
+    def _extract_topup_round(cls, data):
+        """Lifts the round number out of the job's internal `_topup` config.
+
+        Done here rather than in the route so every endpoint returning a
+        JobResponse gets it consistently, and so `config` itself stays out of
+        the API surface. Handles both the ORM object (from_attributes) and a
+        plain dict, since both paths construct this model.
+        """
+        config = data.get("config") if isinstance(data, dict) else getattr(data, "config", None)
+        round_number = ((config or {}).get("_topup") or {}).get("round")
+        if round_number is None:
+            return data
+        if isinstance(data, dict):
+            data = {**data, "topup_round": round_number}
+        else:
+            # ORM instance: model_validate reads attributes, so hand Pydantic a
+            # dict carrying the extra field alongside the object's own. Only
+            # fields the ORM object actually has are copied -- the derived
+            # ones (filtering_in_progress, topup_round) have no attribute
+            # behind them, and copying them as None would override their
+            # defaults and fail validation.
+            _sentinel = object()
+            data = {
+                field: value
+                for field in cls.model_fields
+                if (value := getattr(data, field, _sentinel)) is not _sentinel
+            }
+            data["topup_round"] = round_number
+        return data
+
     @model_validator(mode="after")
-    def _set_filtering_in_progress(self):
+    def _set_derived_fields(self):
         self.filtering_in_progress = self.status in _FILTERING_IN_PROGRESS_STATUSES
         return self
 

@@ -1,31 +1,24 @@
-import { JOB_TERMINAL_STATUSES, type JobSourceTaskStatus, type JobStatus } from '@/api/types'
+import { type JobSourceTaskStatus } from '@/api/types'
 import { Badge } from '@/components/ui/badge'
 import { jobSourceTaskStatusLabels } from '@/lib/enumLabels'
 import { jobSourceTaskStatusVariant } from '@/lib/statusMaps'
 
-// Only a *successful* source finish gets held back — a failed or cancelled
-// source is a real, final outcome for that source regardless of what the
-// rest of the job's pipeline is doing, so those keep showing immediately.
-const HOLDABLE_STATUSES: JobSourceTaskStatus[] = ['completed', 'completed_partial']
-
-export function JobSourceTaskStatusBadge({
-  status,
-  jobStatus,
-}: {
-  status: JobSourceTaskStatus
-  // A source finishing its download doesn't mean the job is done —
-  // relevance filtering and dedup still run afterward, keyed off the job
-  // as a whole rather than per source. Showing this source as green
-  // "Completed" while that's still in flight reads as more final than it
-  // is, so it stays "Running" until the job itself reaches a terminal
-  // status.
-  jobStatus?: JobStatus
-}) {
-  const holdAsRunning =
-    jobStatus !== undefined && !JOB_TERMINAL_STATUSES.includes(jobStatus) && HOLDABLE_STATUSES.includes(status)
-
-  if (holdAsRunning) {
-    return <Badge variant="default">Running</Badge>
-  }
+/**
+ * Shows a source's own status, truthfully.
+ *
+ * This used to hold `completed`/`completed_partial` sources at "Running"
+ * until the whole job went terminal. The concern behind that was real — a
+ * source finishing its download doesn't mean the job is done, since relevance
+ * filtering and dedup still run afterwards — but the fix misreported the
+ * source to say something about the job. In practice it made a genuine
+ * failure indistinguishable from work in progress: a job stranded for 17
+ * hours, whose YouTube source had actually completed after 8 minutes,
+ * displayed "Running" the entire time with no indication anything was wrong.
+ *
+ * Job-level phase belongs at job level. JobPhaseBanner says what the job is
+ * doing now ("Filtering 340 / 754", "Top-up round 2 of 5"); this badge says
+ * what this source did.
+ */
+export function JobSourceTaskStatusBadge({ status }: { status: JobSourceTaskStatus }) {
   return <Badge variant={jobSourceTaskStatusVariant[status]}>{jobSourceTaskStatusLabels[status]}</Badge>
 }

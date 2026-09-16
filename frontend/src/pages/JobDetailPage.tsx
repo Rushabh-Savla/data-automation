@@ -7,6 +7,7 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { ConnectionStatusBadge } from '@/components/layout/ConnectionStatusBadge'
 import { JobSummaryCard } from '@/components/jobs/JobSummaryCard'
 import { JobSourceTaskTable } from '@/components/jobs/JobSourceTaskTable'
+import { JobPhaseBanner } from '@/components/jobs/JobPhaseBanner'
 import { JobControlBar } from '@/components/jobs/JobControlBar'
 import { JobEventLog } from '@/components/jobs/JobEventLog'
 import { DeleteJobDialog } from '@/components/jobs/DeleteJobDialog'
@@ -20,7 +21,7 @@ import { JOB_TERMINAL_STATUSES } from '@/api/types'
 export function JobDetailPage() {
   const { jobId } = useParams<{ jobId: string }>()
   const { data: job, isLoading, error } = useJob(jobId)
-  const { status: connectionStatus, events } = useJobProgressSocket(jobId)
+  const { status: connectionStatus, events, filtering } = useJobProgressSocket(jobId)
   // Progress polling is a fallback: disabled while the socket is genuinely
   // connected, re-enabled at a 3s interval whenever it isn't (connecting,
   // reconnecting, or given up in favor of pure polling).
@@ -60,12 +61,14 @@ export function JobDetailPage() {
           <>
             <JobSummaryCard job={job} />
 
+            <JobPhaseBanner job={job} filtering={filtering} />
+
             <Card>
               <CardHeader>
                 <CardTitle>Per-source breakdown</CardTitle>
               </CardHeader>
               <CardContent className="px-0">
-                <JobSourceTaskTable sourceTasks={job.source_tasks} jobStatus={job.status} />
+                <JobSourceTaskTable sourceTasks={job.source_tasks} />
               </CardContent>
             </Card>
 

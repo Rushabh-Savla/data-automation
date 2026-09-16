@@ -166,7 +166,17 @@ def build_on_progress(
         if delta.get("accepted"):
             job = job_repo.get(job_id)
             if job is not None and job.target_count is not None:
-                target = buffered_target(job.target_count, get_settings().target_overfetch_buffer)
+                # On a top-up round the planner has already measured this
+                # query's real post-filter yield and sized the round from it.
+                # Use that number rather than the static buffer, which is only
+                # a first-round prior -- a query whose survivors are 14% of
+                # what it downloads needs roughly 7x, and no fixed multiplier
+                # expresses that.
+                topup_quota = ((job.config or {}).get("_topup") or {}).get("quota") or {}
+                if topup_quota:
+                    target = job.accepted_count + sum(topup_quota.values())
+                else:
+                    target = buffered_target(job.target_count, get_settings().target_overfetch_buffer)
                 if job.accepted_count >= target:
                     cancellation.mark_target_reached(str(job_id))
                 else:

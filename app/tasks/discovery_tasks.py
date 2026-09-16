@@ -74,6 +74,29 @@ def _default_image_limit(target_count: int | None, *, min_n: int = 200, max_n: i
     return min(max_n, max(min_n, (target_count or 200) * multiplier))
 
 
+def topup_round_number(job) -> int:
+    """Which top-up round this job is on (1 = the first, original pass).
+
+    Discovery limits are scaled by this so a later round reaches further into
+    the result set than the one before it. Without that, re-running discovery
+    returns the same top-N items, every asset is skipped as a duplicate by the
+    Asset unique constraint, and the round delivers nothing -- the loop would
+    spin without converging.
+    """
+    return int(((job.config or {}).get("_topup") or {}).get("round", 1))
+
+
+def scale_for_topup(limit: int, job, *, hard_max: int) -> int:
+    """Widens a discovery limit for later top-up rounds.
+
+    Round 1 is unchanged, so first-pass behaviour is exactly what it was.
+    Each subsequent round multiplies the limit, bounded by hard_max so a
+    runaway round cannot ask a connector for an unbounded result set.
+    """
+    return min(hard_max, limit * max(1, topup_round_number(job)))
+
+
+
 @celery_app.task(name="app.tasks.discovery_tasks.discover_kaggle", bind=True)
 def discover_kaggle(self, job_id: str, job_source_task_id: str):
     job_uuid = uuid.UUID(job_id)
@@ -112,7 +135,7 @@ def discover_kaggle(self, job_id: str, job_source_task_id: str):
             with heartbeat_during(task_uuid):
                 page = connector.discover(
                     job.query, cursor=None,
-                    limit=job.config.get("kaggle", {}).get("max_datasets", _default_container_limit(job.target_count)),
+                    limit=job.config.get("kaggle", {}).get("max_datasets", scale_for_topup(_default_container_limit(job.target_count), job, hard_max=200)),
                 )
             discovery_error_reason = page.error_reason
             items = [
@@ -194,7 +217,7 @@ def discover_roboflow(self, job_id: str, job_source_task_id: str):
             with heartbeat_during(task_uuid):
                 page = connector.discover(
                     job.query, cursor=None,
-                    limit=rf_config.get("max_projects", _default_container_limit(job.target_count)),
+                    limit=rf_config.get("max_projects", scale_for_topup(_default_container_limit(job.target_count), job, hard_max=200)),
                 )
             discovery_error_reason = page.error_reason
             items = [
@@ -278,7 +301,7 @@ def discover_youtube(self, job_id: str, job_source_task_id: str):
             with heartbeat_during(task_uuid):
                 page = connector.discover(
                     job.query, cursor=None,
-                    limit=yt_config.get("max_videos", _default_container_limit(job.target_count)),
+                    limit=yt_config.get("max_videos", scale_for_topup(_default_container_limit(job.target_count), job, hard_max=200)),
                     api_key=credentials.get("YOUTUBE_API_KEY", ""),
                 )
             discovery_error_reason = page.error_reason
@@ -364,7 +387,9 @@ def discover_web(self, job_id: str, job_source_task_id: str):
         # for e.g. 500 images used to silently cap at 200 raw search
         # results (and far fewer once validated) regardless of what was
         # actually requested.
-        desired = job.target_count or web_config.get("max_results", 200)
+        desired = scale_for_topup(
+            job.target_count or web_config.get("max_results", 200), job, hard_max=50_000
+        )
         with heartbeat_during(task_uuid):
             page = connector.discover(job.query, cursor=None, limit=desired)
         shards = page.items
@@ -439,7 +464,7 @@ def discover_coco(self, job_id: str, job_source_task_id: str):
             page = connector.discover(
                 job.query,
                 cursor=None,
-                limit=coco_config.get("max_images", _default_image_limit(job.target_count)),
+                limit=coco_config.get("max_images", scale_for_topup(_default_image_limit(job.target_count), job, hard_max=50_000)),
                 explicit_categories=coco_config.get("categories"),
             )
         shards = page.items
@@ -511,7 +536,7 @@ def discover_open_images(self, job_id: str, job_source_task_id: str):
             page = connector.discover(
                 job.query,
                 cursor=None,
-                limit=oi_config.get("max_samples", _default_image_limit(job.target_count)),
+                limit=oi_config.get("max_samples", scale_for_topup(_default_image_limit(job.target_count), job, hard_max=50_000)),
                 explicit_classes=oi_config.get("classes"),
             )
         shards = page.items
@@ -583,7 +608,7 @@ def discover_pascal_voc(self, job_id: str, job_source_task_id: str):
             page = connector.discover(
                 job.query,
                 cursor=None,
-                limit=voc_config.get("max_images", _default_image_limit(job.target_count)),
+                limit=voc_config.get("max_images", scale_for_topup(_default_image_limit(job.target_count), job, hard_max=50_000)),
                 explicit_categories=voc_config.get("categories"),
             )
         shards = page.items
@@ -655,7 +680,7 @@ def discover_visual_genome(self, job_id: str, job_source_task_id: str):
             page = connector.discover(
                 job.query,
                 cursor=None,
-                limit=vg_config.get("max_images", _default_image_limit(job.target_count)),
+                limit=vg_config.get("max_images", scale_for_topup(_default_image_limit(job.target_count), job, hard_max=50_000)),
                 explicit_categories=vg_config.get("categories"),
             )
         shards = page.items
@@ -727,7 +752,7 @@ def discover_davis(self, job_id: str, job_source_task_id: str):
             page = connector.discover(
                 job.query,
                 cursor=None,
-                limit=davis_config.get("max_images", _default_image_limit(job.target_count)),
+                limit=davis_config.get("max_images", scale_for_topup(_default_image_limit(job.target_count), job, hard_max=50_000)),
                 explicit_categories=davis_config.get("sequences"),
             )
         shards = page.items
@@ -799,7 +824,7 @@ def discover_sun_rgbd(self, job_id: str, job_source_task_id: str):
             page = connector.discover(
                 job.query,
                 cursor=None,
-                limit=sun_config.get("max_images", _default_image_limit(job.target_count)),
+                limit=sun_config.get("max_images", scale_for_topup(_default_image_limit(job.target_count), job, hard_max=50_000)),
                 explicit_categories=sun_config.get("categories"),
             )
         shards = page.items
@@ -871,7 +896,7 @@ def discover_nuscenes(self, job_id: str, job_source_task_id: str):
             page = connector.discover(
                 job.query,
                 cursor=None,
-                limit=nu_config.get("max_samples", _default_image_limit(job.target_count)),
+                limit=nu_config.get("max_samples", scale_for_topup(_default_image_limit(job.target_count), job, hard_max=50_000)),
                 explicit_categories=nu_config.get("categories"),
             )
         shards = page.items
@@ -943,7 +968,7 @@ def discover_kitti(self, job_id: str, job_source_task_id: str):
             page = connector.discover(
                 job.query,
                 cursor=None,
-                limit=kitti_config.get("max_images", _default_image_limit(job.target_count)),
+                limit=kitti_config.get("max_images", scale_for_topup(_default_image_limit(job.target_count), job, hard_max=50_000)),
                 explicit_categories=kitti_config.get("categories"),
             )
         shards = page.items

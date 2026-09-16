@@ -104,6 +104,19 @@ class Settings(BaseSettings):
     relevance_accept_threshold: float = 0.75
     relevance_reject_threshold: float = 0.45
 
+    # Hard ceiling on discover -> filter -> re-discover rounds per job
+    # (app/domain/topup.py). A top-up loop that can run forever is worse than
+    # no loop at all: it burns GPU and API quota on a query with no real
+    # supply. Three softer brakes usually stop it first -- target met, all
+    # sources exhausted, diminishing returns -- and the deadline sweep in
+    # watchdog_scan is a fourth. This is the backstop for when none of those
+    # fire.
+    topup_max_rounds: int = 5
+
+    # First-round prior only. Once a round has completed, the top-up planner
+    # measures the query's actual post-filter yield and sizes the next round
+    # from that instead -- a fixed multiplier cannot absorb an attrition rate
+    # that varies per query (a real job needed ~7x, not 1.5x).
     target_overfetch_buffer: float = 1.5
 
     # -- Source credentials (fallback if not set via the Credential API) -----------

@@ -14,6 +14,7 @@ doesn't mean re-implementing that machinery (DRY).
 
 import hashlib
 import logging
+import math
 import uuid
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -266,6 +267,20 @@ def download_roboflow_item(self, job_id: str, job_source_task_id: str, item_dict
     return _run_item_download(job_id, job_source_task_id, SourceType.ROBOFLOW, checkpoint_key, fetch, bound_task=self)
 
 
+
+def _default_frames_per_video(target_count: int | None) -> int:
+    """Per-video frame ceiling, scaled to the job's target.
+
+    Floored so a small job still gets usable coverage from each video, and
+    capped so a large job does not let one video dominate. The divisor
+    expresses "no single video should supply more than roughly a fifth of
+    what we need", which leaves room for breadth across the rest.
+    """
+    if not target_count:
+        return 60
+    return max(30, min(300, math.ceil(target_count / 5)))
+
+
 @celery_app.task(
     name="app.tasks.ingest_tasks.download_youtube_video",
     bind=True,
@@ -291,16 +306,31 @@ def download_youtube_video(self, job_id: str, job_source_task_id: str, item_dict
         task = JobSourceTaskRepository(db).get(uuid.UUID(job_source_task_id))
         yt_config = task.job.config.get("youtube", {}) if task and task.job else {}
         min_res = tuple(task.job.config.get("min_resolution", (320, 240))) if task and task.job else (320, 240)
+        # Read inside the session: `task` is detached once this block exits,
+        # so touching task.job afterwards raises DetachedInstanceError.
+        target_count = task.job.target_count if task and task.job else None
 
     connector = YouTubeConnector(
+        # A per-video ceiling, defaulted rather than left unbounded.
+        #
+        # At fps=1.0 with no cap, a single video contributes one frame per
+        # second of its runtime: one video in a real job produced 178 frames,
+        # and seven videos consumed the job's entire download budget while
+        # nine more were never touched. Those 178 frames are consecutive
+        # seconds of the same footage, so they are near-identical -- they
+        # inflate the count without adding the visual variety a training set
+        # needs, and they crowd out the breadth that would have come from the
+        # untouched videos.
+        #
+        # Capping per video spends the same budget across more sources. The
+        # cap is not a fixed constant because that would starve a small job
+        # and over-restrict a large one; it scales with the target while
+        # keeping any one video to a minority share of it.
+        frames_per_video=yt_config.get("frames_per_video", _default_frames_per_video(target_count)),
         # "fps" extracts exactly one frame per second — deterministic and
         # matches the documented behaviour. "scene" was the old default but
         # produced unpredictable frame counts and often zero results.
         frame_mode=yt_config.get("frame_mode", "fps"),
-        # None = no hard cap; fps=1.0 naturally limits output by video
-        # duration. The old default of 100 silently capped a 10-min video
-        # at 100 frames even when fps=1 should produce 600.
-        frames_per_video=yt_config.get("frames_per_video", None),
         min_resolution=min_res,
         # False = do not filter by CC license at download time. yt-dlp's
         # flat search metadata omits the license field so cc_only=True

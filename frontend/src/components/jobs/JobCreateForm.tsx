@@ -1,3 +1,4 @@
+import { useMemo } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { Controller, useForm } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
@@ -9,6 +10,7 @@ import {
   type JobCreateFormValues,
 } from '@/components/jobs/jobCreateSchema'
 import { useCreateJob } from '@/hooks/useCreateJob'
+import { useSources } from '@/hooks/useSources'
 import { Textarea } from '@/components/ui/textarea'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -41,7 +43,18 @@ export function JobCreateForm() {
   const deadlineEnabled = watch('deadlineEnabled')
   const scheduleEnabled = watch('scheduleEnabled')
 
-  const activeSources = useAutoSources ? (['roboflow', 'kaggle', 'youtube', 'web'] as const) : sources
+  // Driven by the API rather than a literal. The hardcoded list here named
+  // four sources while twelve connectors are implemented and the backend's
+  // auto mode fans out to all of them (JobService.create), so the advanced
+  // config panels for the other eight never appeared even though those
+  // sources were actively being used. Reading the same registry the backend
+  // does means the two cannot drift apart again.
+  const { data: availableSources } = useSources()
+  const autoSources = useMemo(
+    () => (availableSources ?? []).filter((s) => s.connector_implemented).map((s) => s.source_type),
+    [availableSources],
+  )
+  const activeSources = useAutoSources ? autoSources : sources
 
   async function onSubmit(values: JobCreateFormValues) {
     const payload = buildJobCreatePayload(values)

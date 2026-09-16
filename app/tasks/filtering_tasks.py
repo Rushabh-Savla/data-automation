@@ -503,11 +503,14 @@ def run_deduplication(self, job_id: str):
 
     ProgressPublisher(get_redis()).publish(job_id, {"type": "dedup_complete", "duplicate_count": duplicate_count})
 
-    trim_excess_assets(job_id)
+    # trim_excess_assets is deliberately NOT called here any more. Trimming
+    # the surplus back down to target between rounds destroys the very margin
+    # the next round is trying to build, and would make a job oscillate around
+    # its target instead of converging on it. The planner runs the trim on the
+    # final round, once no further rounds are coming.
+    from app.tasks.orchestration_tasks import plan_topup_round
 
-    from app.tasks.orchestration_tasks import evaluate_job_completion
-
-    evaluate_job_completion.delay(job_id)
+    plan_topup_round.delay(job_id)
 
 
 def _select_trim_candidates(assets: list[tuple[str, float | None]], excess: int) -> list[str]:

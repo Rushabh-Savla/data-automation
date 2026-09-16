@@ -181,6 +181,30 @@ export interface JobConfig {
   yolo_world_conf_threshold?: number
   dedup_hamming_threshold?: number
   dedup_cosine_threshold?: number
+  relevance?: RelevanceConfig
+  /**
+   * Written by the backend's top-up planner, not by the UI. Underscore-
+   * prefixed to mark it internal state rather than a user setting; the job
+   * detail page reads it only to show which round is running.
+   */
+  _topup?: {
+    round?: number
+    quota?: Record<string, number>
+    accepted_after_last_round?: number
+  }
+}
+
+/** Per-job overrides for the relevance filter's decision bands. */
+export interface RelevanceConfig {
+  /** CLIP score at or above which an asset is kept without asking the VLM. */
+  accept_threshold?: number
+  /** CLIP score at or below which an asset is rejected without asking the VLM. */
+  reject_threshold?: number
+  /** Concrete detector classes, replacing the derived ones entirely. */
+  classes?: string[]
+  /** Prompt ensemble representing "relevant", replacing the derived one. */
+  positive_prompts?: string[]
+  yolo_world_enabled?: boolean
 }
 
 // -- Jobs
@@ -236,6 +260,10 @@ export interface JobResponse {
   updated_at: string
   started_at: string | null
   completed_at: string | null
+  /** True while the job is past downloading but not yet terminal. */
+  filtering_in_progress: boolean
+  /** Which top-up round is running; 1 or null is the original pass. */
+  topup_round: number | null
 }
 
 export interface JobDetailResponse extends JobResponse {
@@ -389,8 +417,45 @@ export interface WsExportFailed {
   error: string
 }
 
+/**
+ * Published once per relevance-filter pass, before any batch runs, so the UI
+ * has the denominator for a progress readout. Without it the page could only
+ * show a running tally with nothing to measure it against.
+ */
+export interface WsRelevanceFilterStarted {
+  type: 'relevance_filter_started'
+  total: number
+  batches: number
+}
+
+/**
+ * Published per filtering batch. The backend has always emitted this; the
+ * client had no case for it, so the entire (potentially multi-hour) filtering
+ * stage looked frozen — nothing moved until relevance_filter_complete landed
+ * at the very end.
+ */
+export interface WsRelevanceFilterProgress {
+  type: 'relevance_filter_progress'
+  passed: number
+  rejected: number
+}
+
+/**
+ * Emitted when a job goes back for more data because it is short of target.
+ */
+export interface WsTopupRound {
+  type: 'topup_round'
+  round: number
+  max_rounds: number
+  shortfall: number
+  observed_yield: number
+}
+
 export type WsEvent =
   | WsProgressDelta
+  | WsRelevanceFilterStarted
+  | WsRelevanceFilterProgress
+  | WsTopupRound
   | WsJobStatus
   | WsConnectorFinished
   | WsRelevanceFilterComplete

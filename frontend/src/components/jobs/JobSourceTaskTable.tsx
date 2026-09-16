@@ -1,16 +1,10 @@
-import type { JobSourceTaskResponse, JobStatus } from '@/api/types'
+import type { JobSourceTaskResponse } from '@/api/types'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { JobSourceTaskStatusBadge } from '@/components/jobs/JobSourceTaskStatusBadge'
 import { sourceTypeLabels } from '@/lib/enumLabels'
 import { formatRelative } from '@/lib/dateFormat'
 
-export function JobSourceTaskTable({
-  sourceTasks,
-  jobStatus,
-}: {
-  sourceTasks: JobSourceTaskResponse[]
-  jobStatus?: JobStatus
-}) {
+export function JobSourceTaskTable({ sourceTasks }: { sourceTasks: JobSourceTaskResponse[] }) {
   if (sourceTasks.length === 0) {
     return <p className="p-4 text-sm text-muted-foreground">No source tasks yet.</p>
   }
@@ -35,7 +29,7 @@ export function JobSourceTaskTable({
           <TableRow key={task.id}>
             <TableCell className="font-medium">{sourceTypeLabels[task.source_type]}</TableCell>
             <TableCell>
-              <JobSourceTaskStatusBadge status={task.status} jobStatus={jobStatus} />
+              <JobSourceTaskStatusBadge status={task.status} />
             </TableCell>
             <TableCell className="text-right">{task.discovered_count}</TableCell>
             <TableCell className="text-right">{task.downloaded_count}</TableCell>

@@ -13,12 +13,14 @@ from app.core.config import get_settings
 from app.core.logging import bind_job_context, clear_job_context
 from app.core.redis_client import get_redis
 from app.db.models.job_source_task import JobSourceTask
+from app.db.repositories.asset_repository import AssetRepository
 from app.db.repositories.job_repository import JobRepository
 from app.db.repositories.job_source_task_repository import JobSourceTaskRepository
 from app.db.session import session_scope
 from app.domain.completion import JobCompletionEvaluator, JobSnapshot
-from app.domain.enums import JobSourceTaskStatus, JobStatus, SourceType
+from app.domain.enums import AssetStatus, JobSourceTaskStatus, JobStatus, SourceType
 from app.domain.state_machine import JobStateMachine
+from app.domain.topup import SourceState, TopupPlanner, TopupSnapshot
 from app.services.cancellation_service import CancellationService
 from app.services.progress_service import ProgressPublisher
 from app.tasks.celery_app import celery_app
@@ -64,6 +66,17 @@ def on_source_finished(self, results, job_id: str, job_source_task_id: str):
         if task.status != JobSourceTaskStatus.CANCELLED:
             task_repo.set_status(task_uuid, final_status)
         db.flush()
+
+    # This source's raw intermediates (downloaded videos, extracted archives)
+    # have served their purpose: anything worth keeping was promoted to NAS and
+    # recorded in the DB during download. Releasing the scratch space here is
+    # what cleanup_local was written for -- it simply had no caller anywhere,
+    # which is why 3.3 GB of dead workdirs accumulated against 307 MB of
+    # delivered assets. Dispatched rather than inlined so a slow rmtree over
+    # tens of thousands of files does not hold up the job's progression.
+    from app.tasks.cleanup_tasks import cleanup_local
+
+    cleanup_local.delay(job_source_task_id)
 
     check_and_advance_job(job_id)
     clear_job_context()
@@ -166,6 +179,151 @@ def check_and_advance_job(job_id: str) -> None:
     from app.tasks.filtering_tasks import run_relevance_filter
 
     run_relevance_filter.delay(job_id)
+
+
+@celery_app.task(name="app.tasks.orchestration_tasks.plan_topup_round", bind=True)
+def plan_topup_round(self, job_id: str):
+    """Decides whether to fetch more data, or to finish the job.
+
+    Sits between deduplication and completion evaluation. Before this existed
+    the chain went straight from dedup to evaluate_job_completion, which can
+    only move a job to a terminal state -- so a job whose filtering removed
+    more than the fixed 1.5x over-fetch buffer anticipated simply ended short
+    and was reported `completed_partial`. On the job that motivated this work,
+    754 downloaded assets became 107 survivors against a target of 500, and
+    nothing ever went back for more.
+
+    The sizing decision itself is in app/domain/topup.py (pure, unit tested);
+    this task is only the orchestration around it.
+    """
+    job_uuid = uuid.UUID(job_id)
+    bind_job_context(job_id)
+    settings = get_settings()
+
+    # Resolved inside the transaction, acted on after it commits: dispatching
+    # Celery tasks from inside an open transaction races them against the
+    # commit, and they can read state that has not landed yet.
+    plan = None
+    redispatch: list[tuple[str, str]] = []
+
+    try:
+        with session_scope() as db:
+            job_repo = JobRepository(db)
+            task_repo = JobSourceTaskRepository(db)
+            asset_repo = AssetRepository(db)
+            job = job_repo.get(job_uuid)
+            if job is None or job.status not in (JobStatus.DISCOVERING, JobStatus.RUNNING):
+                return
+
+            cancellation = CancellationService(get_redis())
+            if cancellation.is_cancelled(job_id) or cancellation.is_paused(job_id):
+                return
+
+            topup_state = (job.config or {}).get("_topup") or {}
+            round_number = int(topup_state.get("round", 1))
+            previous_accepted = topup_state.get("accepted_after_last_round")
+
+            # Post-filter survivors, deliberately not job.accepted_count: that
+            # column is incremented optimistically at promotion time and only
+            # corrected once filtering has run. Sizing a round off it would
+            # repeat the original mistake of reacting to a pre-filter number.
+            accepted = asset_repo.count_for_job(job_uuid, status=AssetStatus.RELEVANCE_PASSED)
+            promoted_total = asset_repo.count_for_job(job_uuid)
+
+            tasks = task_repo.list_for_job(job_uuid)
+            sources = [
+                SourceState(
+                    source_type=str(getattr(t.source_type, "value", t.source_type)),
+                    accepted=t.accepted_count,
+                    exhausted=bool((t.checkpoint or {}).get("discovery_exhausted")),
+                )
+                for t in tasks
+            ]
+
+            plan = TopupPlanner.plan(
+                TopupSnapshot(
+                    target_count=job.target_count,
+                    accepted_post_filter=accepted,
+                    promoted_total=promoted_total,
+                    round_number=round_number,
+                    max_rounds=settings.topup_max_rounds,
+                    sources=sources,
+                    gained_last_round=(
+                        accepted - previous_accepted if previous_accepted is not None else None
+                    ),
+                )
+            )
+
+            if plan is None:
+                logger.info(
+                    f"Top-up for job {job_id}: stopping at {accepted}/{job.target_count} "
+                    f"after round {round_number}"
+                )
+            else:
+                logger.info(
+                    f"Top-up for job {job_id}: round {plan.round_number}, short by "
+                    f"{plan.shortfall}, observed yield {plan.observed_yield:.2f}, "
+                    f"fetching ~{plan.total_quota} more"
+                )
+
+                config = dict(job.config or {})
+                config["_topup"] = {
+                    "round": plan.round_number,
+                    "quota": plan.quota,
+                    "accepted_after_last_round": accepted,
+                }
+                job_repo.set_config(job_uuid, config)
+
+                # Clearing these is not optional. should_stop() consults the
+                # job-wide target flag and each source's cap flag, both set when
+                # the previous round hit its ceiling. Leaving them set means
+                # every connector in the new round stops on its first iteration
+                # and the round fetches precisely nothing.
+                cancellation.clear_target_reached(job_id)
+                for task in tasks:
+                    cancellation.clear_source_cap_reached(job_id, str(task.id))
+
+                # Filtering is dispatched once per round; the previous round's
+                # guard would otherwise suppress this round's pass.
+                get_redis().delete(f"job:{job_id}:filtering_dispatched")
+
+                exhausted = {s.source_type for s in sources if s.exhausted}
+                for task in tasks:
+                    source_value = str(getattr(task.source_type, "value", task.source_type))
+                    if source_value in exhausted:
+                        continue
+                    task_repo.set_status(task.id, JobSourceTaskStatus.PENDING)
+                    task_repo.heartbeat(task.id)
+                    redispatch.append((source_value, str(task.id)))
+
+        # -- After the transaction has committed. --------------------------
+        if plan is None:
+            # No further rounds, so any overshoot is final: trim back to
+            # exactly target_count and evaluate completion. Trimming is
+            # deliberately deferred to here rather than run after every round,
+            # because cutting the surplus between rounds would destroy the
+            # margin the next round is trying to build.
+            from app.tasks.filtering_tasks import trim_excess_assets
+
+            trim_excess_assets(job_id)
+            evaluate_job_completion.delay(job_id)
+            return
+
+        ProgressPublisher(get_redis()).publish(
+            job_id,
+            {
+                "type": "topup_round",
+                "round": plan.round_number,
+                "max_rounds": settings.topup_max_rounds,
+                "shortfall": plan.shortfall,
+                "observed_yield": round(plan.observed_yield, 3),
+            },
+        )
+
+        for source_value, task_id in redispatch:
+            _resume_task(job_id, task_id, source_value, {})
+    finally:
+        clear_job_context()
 
 
 @celery_app.task(name="app.tasks.orchestration_tasks.evaluate_job_completion", bind=True)

@@ -29,15 +29,23 @@ const MAX_LOG_EVENTS = 50
  * see nothing until the next delta. useJob/useJobProgress firing on mount
  * (before this hook's effect runs) is what actually bootstraps state.
  */
+/** Live progress through the relevance-filter stage, or null when not filtering. */
+export interface FilteringProgress {
+  done: number
+  total: number
+}
+
 export interface JobProgressSocketState {
   status: ConnectionStatus
   events: JobLogEvent[]
+  filtering: FilteringProgress | null
 }
 
 export function useJobProgressSocket(jobId: string | undefined): JobProgressSocketState {
   const queryClient = useQueryClient()
   const [status, setStatus] = useState<ConnectionStatus>('connecting')
   const [events, setEvents] = useState<JobLogEvent[]>([])
+  const [filtering, setFiltering] = useState<FilteringProgress | null>(null)
 
   function logEvent(message: string) {
     setEvents((prev) => [{ id: randomId(), at: new Date().toISOString(), message }, ...prev].slice(0, MAX_LOG_EVENTS))
@@ -172,6 +180,32 @@ export function useJobProgressSocket(jobId: string | undefined): JobProgressSock
           break
         }
 
+        case 'relevance_filter_started': {
+          setFiltering({ done: 0, total: msg.total })
+          logEvent(`Relevance filtering started: ${msg.total} asset(s) in ${msg.batches} batch(es)`)
+          break
+        }
+
+        case 'relevance_filter_progress': {
+          // Accumulated rather than assigned: each event reports one batch's
+          // own counts, not a running total.
+          setFiltering((prev) =>
+            prev ? { ...prev, done: prev.done + msg.passed + msg.rejected } : prev,
+          )
+          break
+        }
+
+        case 'topup_round': {
+          logEvent(
+            `Top-up round ${msg.round}/${msg.max_rounds}: short by ${msg.shortfall}, ` +
+              `observed yield ${(msg.observed_yield * 100).toFixed(0)}%`,
+          )
+          setFiltering(null)
+          queryClient.invalidateQueries({ queryKey: jobKeys.detail(jobId!) })
+          queryClient.invalidateQueries({ queryKey: jobKeys.progress(jobId!) })
+          break
+        }
+
         case 'relevance_filter_complete': {
           // Never hand-merged arithmetically: the backend mutates
           // accepted_count/rejected_count directly here with no
@@ -179,6 +213,7 @@ export function useJobProgressSocket(jobId: string | undefined): JobProgressSock
           // authoritative.
           queryClient.invalidateQueries({ queryKey: jobKeys.progress(jobId!) })
           queryClient.invalidateQueries({ queryKey: jobKeys.detail(jobId!) })
+          setFiltering(null)
           toast.info(`Relevance filter: ${msg.passed} passed, ${msg.rejected} rejected`)
           logEvent(`Relevance filter complete: ${msg.passed} passed, ${msg.rejected} rejected`)
           break
@@ -255,5 +290,5 @@ export function useJobProgressSocket(jobId: string | undefined): JobProgressSock
     }
   }, [jobId, queryClient])
 
-  return { status, events }
+  return { status, events, filtering }
 }

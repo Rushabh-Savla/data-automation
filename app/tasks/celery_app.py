@@ -51,6 +51,16 @@ celery_app.conf.update(
             "task": "app.tasks.orchestration_tasks.watchdog_scan",
             "schedule": 60.0,
         },
+        # Reclaims scratch directories whose task finished (or whose job was
+        # deleted) and that nothing will come back for. cleanup_local is now
+        # called on the normal path too; this is the safety net for anything
+        # that path missed, including everything stranded while cleanup_local
+        # had no call site at all. Six-hourly because the directories it
+        # targets are already hours old by definition.
+        "purge-orphan-work-dirs": {
+            "task": "app.tasks.cleanup_tasks.purge_orphan_work_dirs",
+            "schedule": 6 * 3600.0,
+        },
     },
 )
 

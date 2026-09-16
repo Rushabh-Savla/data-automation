@@ -76,6 +76,8 @@ function seedDetail(queryClient: QueryClient): JobDetailResponse {
     query: 'test',
     sources: ['kaggle'],
     target_count: 100,
+    filtering_in_progress: false,
+    topup_round: null,
     deadline_at: null,
     scheduled_start_at: null,
     status: 'running',
