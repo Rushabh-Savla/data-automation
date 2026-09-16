@@ -18,7 +18,7 @@ services:
   redis:
     image: redis:7-alpine
     ports:
-      - "6379:6379"
+      - "6378:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -53,16 +53,28 @@ services:
       redis:
         condition: service_healthy
 
+  # IO-bound worker: discovery, downloads, standardization, orchestration.
+  # Deliberately does NOT consume the `filtering` queue — that work is GPU
+  # bound and lives on worker-gpu below. Splitting them stops a burst of
+  # slow inference tasks from starving connector downloads (and vice versa),
+  # and lets each side size its concurrency for its own bottleneck.
   worker:
     build:
       context: .
       dockerfile: docker/Dockerfile.worker
+    command: ["uv", "run", "celery", "-A", "app.tasks.celery_app", "worker", "--loglevel=info", "--concurrency=8",
+              "-Q", "celery,discovery,download,standardize,cleanup,orchestration,export"]
     env_file: .env
     environment:
       DATABASE_URL: postgresql+psycopg://postgres:postgres@postgres:5432/data_automation
       REDIS_URL: redis://redis:6379/0
       NAS_ROOT: /nas
       WORK_ROOT: /work
+      # Without this each of the 8 children defaults its intra-op pool to the
+      # host's core count (64 here), so the box runs ~512 compute threads and
+      # spends its time context switching. See _cap_torch_threads in
+      # app/tasks/celery_app.py.
+      TORCH_NUM_THREADS: "2"
     volumes:
       # Bind mounts (not named volumes): NAS_ROOT/WORK_ROOT stay the same
       # host folder whether the API/worker run natively (uv run uvicorn,
@@ -73,6 +85,61 @@ services:
       # become invisible/404 the other way).
       - ./nas_data:/nas
       - ./work_data:/work
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # GPU worker: relevance filtering only.
+  #
+  # This host has an RTX A4000 that the stack was not using at all — the
+  # container never received NVIDIA_VISIBLE_DEVICES, so torch.cuda.is_available()
+  # was False and SmolVLM/YOLO-World/CLIP all ran on CPU at ~66s per image
+  # (one 50-image batch measured at up to 3320s, which is also how batches
+  # started colliding with celery_task_soft_time_limit_s).
+  #
+  # concurrency is 2, not 8: these processes each hold model weights in VRAM,
+  # so parallelism is bounded by the card, not by cores. The memory cap below
+  # exists because this machine also runs unrelated production containers —
+  # the filtering worker must not be able to exhaust the GPU and take them
+  # down with it.
+  worker-gpu:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker
+    command: ["uv", "run", "celery", "-A", "app.tasks.celery_app", "worker", "--loglevel=info", "--concurrency=2",
+              "-Q", "filtering"]
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://postgres:postgres@postgres:5432/data_automation
+      REDIS_URL: redis://redis:6379/0
+      NAS_ROOT: /nas
+      WORK_ROOT: /work
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      TORCH_NUM_THREADS: "4"
+      # Hard ceiling on the fraction of total VRAM this process may allocate,
+      # enforced by torch itself (see _cap_gpu_memory in app/tasks/celery_app.py).
+      # 2 children x 0.35 leaves ~30% of the card free for everything else on
+      # the host.
+      TORCH_CUDA_MEMORY_FRACTION: "0.35"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    volumes:
+      - ./nas_data:/nas
+      - ./work_data:/work
+      # Model weights (YOLO-World .pt, HuggingFace SmolVLM, CLIP) are large and
+      # downloaded on first use. A shared named volume means the two children
+      # -- and successive container rebuilds -- reuse one copy instead of
+      # re-fetching, which otherwise shows up as a multi-minute stall on the
+      # first filtering task after every deploy.
+      - model_cache:/root/.cache
     depends_on:
       postgres:
         condition: service_healthy
@@ -131,5 +198,6 @@ services:
 
 volumes:
   postgres_data:
+  model_cache:
   # nas_data/work_data are bind mounts (./nas_data, ./work_data), not named
   # volumes — see the api/worker service definitions above.

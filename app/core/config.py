@@ -52,6 +52,17 @@ class Settings(BaseSettings):
     celery_task_time_limit_s: int = 3900
     watchdog_stall_threshold_s: int = 900
 
+    # Separate, longer threshold for the *post-ingestion* stall: a job whose
+    # source tasks are all terminal but which is still RUNNING because the
+    # relevance-filter/dedup chain died part-way. That chain has no
+    # heartbeat of its own (it is not a JobSourceTask), so
+    # watchdog_stall_threshold_s above cannot see it — a job in that state
+    # used to sit in `running` indefinitely with nothing able to re-drive
+    # it. Longer than the task threshold because a single legitimate
+    # filtering batch can run for tens of minutes, and re-driving a pass
+    # that is merely slow would waste inference.
+    filtering_stall_threshold_s: int = 1800
+
     # yt-dlp's extract_info() is a single blocking call with no timeout of
     # its own — a connection that stalls after the handshake (accepted but
     # no data) can hang indefinitely without this. Bounds each socket
@@ -78,6 +89,21 @@ class Settings(BaseSettings):
     # still land on target_count in the common case (see build_on_progress in
     # app/tasks/_helpers.py); trim_excess_assets (app/tasks/filtering_tasks.py)
     # trims any overshoot back down to exactly target_count afterward.
+    # -- Relevance filtering bands -------------------------------------------
+    # A CLIP score (app/filtering/clip_relevance.py) above accept_at is taken
+    # as relevant, below reject_at as irrelevant, and anything between is
+    # escalated to the VLM. Defaults were chosen from the score distribution
+    # measured on a real job's frames (n=107: min 0.21, p25 0.50, median 0.76,
+    # p75 0.93), which puts roughly a quarter of assets in the uncertain band
+    # -- enough to catch genuinely ambiguous images without paying for VLM
+    # inference on the clear majority.
+    #
+    # These are a prefilter, not an oracle: CLIP is confidently wrong on some
+    # low-information images, so raise reject_at only with evidence. Both are
+    # overridable per job via config["relevance"].
+    relevance_accept_threshold: float = 0.75
+    relevance_reject_threshold: float = 0.45
+
     target_overfetch_buffer: float = 1.5
 
     # -- Source credentials (fallback if not set via the Credential API) -----------

@@ -96,6 +96,26 @@ class JobRepository:
         stmt = select(Job).where(Job.status.in_(JOB_ACTIVE_STATUSES))
         return list(self.db.execute(stmt).scalars().all())
 
+    @staticmethod
+    def apply_status_timestamps(job: Job, status: JobStatus) -> None:
+        """Stamps started_at / completed_at for a status the caller is applying
+        directly to an ORM object.
+
+        This exists because there are two ways a job's status changes in this
+        codebase: set_status() below (a Core UPDATE, used by the Celery tasks)
+        and direct assignment on a loaded Job (used by JobService, which needs
+        the in-memory object for the rest of its work). Only the first one
+        stamped the timestamps, so every job started through the API had
+        started_at NULL forever and the UI showed "Started —" even while the
+        job was running. Both paths now call this, so the rule lives once.
+        """
+        from app.domain.enums import JOB_TERMINAL_STATUSES
+
+        if status == JobStatus.RUNNING and job.started_at is None:
+            job.started_at = datetime.now(timezone.utc)
+        if status in JOB_TERMINAL_STATUSES and job.completed_at is None:
+            job.completed_at = datetime.now(timezone.utc)
+
     def set_status(
         self,
         job_id: uuid.UUID,
@@ -126,18 +146,27 @@ class JobRepository:
         duplicate: int = 0,
     ) -> None:
         """Atomic `x = x + delta` update — safe under concurrent writers from
-        many Celery tasks touching the same job row."""
+        many Celery tasks touching the same job row.
+
+        Every column is floored at 0 via GREATEST. These counters take
+        negative deltas as well as positive ones (filtering corrects
+        accepted_count downward as assets are rejected, deduplicated or
+        trimmed), so a stage that runs twice — a retried task, or a
+        watchdog re-drive of a pass that partly completed — could otherwise
+        drive a count below zero and surface as a nonsensical negative in
+        the UI. Clamping here keeps the invariant in the one place every
+        writer already funnels through, rather than at each call site."""
         values = {}
         if discovered:
-            values["discovered_count"] = Job.discovered_count + discovered
+            values["discovered_count"] = func.greatest(0, Job.discovered_count + discovered)
         if downloaded:
-            values["downloaded_count"] = Job.downloaded_count + downloaded
+            values["downloaded_count"] = func.greatest(0, Job.downloaded_count + downloaded)
         if accepted:
-            values["accepted_count"] = Job.accepted_count + accepted
+            values["accepted_count"] = func.greatest(0, Job.accepted_count + accepted)
         if rejected:
-            values["rejected_count"] = Job.rejected_count + rejected
+            values["rejected_count"] = func.greatest(0, Job.rejected_count + rejected)
         if duplicate:
-            values["duplicate_count"] = Job.duplicate_count + duplicate
+            values["duplicate_count"] = func.greatest(0, Job.duplicate_count + duplicate)
         if not values:
             return
         self.db.execute(update(Job).where(Job.id == job_id).values(**values))

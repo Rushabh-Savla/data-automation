@@ -33,5 +33,9 @@ COPY app ./app
 # filtering/export), not the "celery" default — a worker started without an
 # explicit -Q only consumes "celery" and silently never picks up any actual
 # work, which is exactly the bug this comment is here to prevent regressing.
+# docker-compose.yml overrides this `command:` for both the IO worker and the
+# GPU filtering worker, which consume different queue sets at different
+# concurrencies. This default is the all-in-one fallback for running the image
+# directly (no compose) and keeps every queue covered so that case still works.
 CMD ["uv", "run", "celery", "-A", "app.tasks.celery_app", "worker", "--loglevel=info", "--concurrency=4", \
      "-Q", "celery,discovery,download,standardize,cleanup,orchestration,filtering,export"]

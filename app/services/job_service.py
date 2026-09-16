@@ -113,6 +113,7 @@ class JobService:
     def start(self, job_id: uuid.UUID) -> Job:
         job = self.job_repo.get_or_404(job_id)
         job.status = JobStateMachine.transition(job.status, "start")
+        JobRepository.apply_status_timestamps(job, job.status)
         self.db.flush()
 
         dispatched_any = False
@@ -130,9 +131,11 @@ class JobService:
 
         if not dispatched_any:
             job.status = JobStateMachine.transition(job.status, "fail")
+            JobRepository.apply_status_timestamps(job, job.status)
             job.error_message = "No source connectors available for the selected sources"
         else:
             job.status = JobStateMachine.transition(job.status, "begin_running")
+            JobRepository.apply_status_timestamps(job, job.status)
         self.db.flush()
         self.publisher.publish(str(job_id), {"type": "job_status", "status": job.status.value})
         return job
@@ -140,6 +143,7 @@ class JobService:
     def pause(self, job_id: uuid.UUID) -> Job:
         job = self.job_repo.get_or_404(job_id)
         job.status = JobStateMachine.transition(job.status, "pause")
+        JobRepository.apply_status_timestamps(job, job.status)
         self.cancellation.mark_paused(str(job_id))
         self.db.flush()
         self.publisher.publish(str(job_id), {"type": "job_status", "status": job.status.value})
@@ -148,6 +152,7 @@ class JobService:
     def resume(self, job_id: uuid.UUID) -> Job:
         job = self.job_repo.get_or_404(job_id)
         job.status = JobStateMachine.transition(job.status, "resume")
+        JobRepository.apply_status_timestamps(job, job.status)
         self.cancellation.clear_paused(str(job_id))
         self.db.flush()
 
@@ -164,6 +169,7 @@ class JobService:
     def cancel(self, job_id: uuid.UUID) -> Job:
         job = self.job_repo.get_or_404(job_id)
         job.status = JobStateMachine.transition(job.status, "cancel")
+        JobRepository.apply_status_timestamps(job, job.status)
         self.cancellation.mark_cancelled(str(job_id))
         self.db.flush()
 

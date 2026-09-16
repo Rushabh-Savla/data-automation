@@ -1,7 +1,12 @@
 [project]
 name = "data-automation-platform"
 version = "0.1.0"
-requires-python = ">=3.13"
+# Upper-bounded to match docker/Dockerfile.worker's python:3.13-slim base. Without
+# the bound uv resolves the local dev venv to 3.14 while the container runs
+# 3.13, and the two stop agreeing on what is installable -- the CUDA torch
+# build this project pins only ships cp313 wheels, so a 3.14 dev venv cannot
+# install the same dependency set the image does.
+requires-python = ">=3.13,<3.14"
 dependencies = [
     # -- Web / API --------------------------------------------------------
     "fastapi>=0.115.0",
@@ -52,7 +57,35 @@ dependencies = [
     "numpy>=1.26.0",
     # SmolVLM-256M second-opinion visual check (app/filtering/smolvlm_filter.py)
     "transformers>=4.45.0",
+    # torch/torchvision are pinned to a CUDA 12.4 build rather than left to
+    # whatever ultralytics resolves. PyPI's default torch wheel is currently
+    # built against CUDA 13.0, which refuses to initialise on this host:
+    #
+    #   UserWarning: CUDA initialization: The NVIDIA driver on your system is
+    #   too old (found version 12020)
+    #
+    # so torch.cuda.is_available() returned False and every relevance-filter
+    # inference silently ran on CPU at ~66s/image while an idle RTX A4000 sat
+    # next to it. Driver 535.x is CUDA 12.2; CUDA minor-version compatibility
+    # means a cu124 build runs on it fine (verified on this host: A4000
+    # detected, matmul OK). Pinning here rather than upgrading the host
+    # driver, because this machine also runs unrelated production workloads
+    # that a driver change would disrupt.
+    "torch==2.6.0",
+    "torchvision==0.21.0",
 ]
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu124" }]
+torchvision = [{ index = "pytorch-cu124" }]
+
+# explicit = true: only the packages named in [tool.uv.sources] above are
+# pulled from this index. Without it every dependency would be resolved
+# against the PyTorch index first, which does not mirror all of PyPI.
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
 
 [dependency-groups]
 dev = [

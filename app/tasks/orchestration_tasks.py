@@ -278,6 +278,34 @@ def watchdog_scan():
             ):
                 logger.warning(f"Watchdog: job {job.id} stuck in CANCELLING, re-driving completion")
                 evaluate_job_completion.delay(str(job.id))
+            elif (
+                job.status in (JobStatus.RUNNING, JobStatus.DISCOVERING)
+                and (now - job.updated_at).total_seconds() > settings.filtering_stall_threshold_s
+                and task_repo.all_terminal_for_job(job.id)
+            ):
+                # Post-ingestion stall: every source finished, but the
+                # filtering -> dedup -> completion chain died part-way and
+                # nothing else in this watchdog can see it. The stalled-task
+                # sweep above only looks at JobSourceTasks in a non-terminal
+                # state, and the deadline sweep only fires for jobs that set
+                # a deadline — so a job like this had no recovery path at
+                # all and stayed `running` forever.
+                #
+                # Re-driving is safe to repeat: run_relevance_filter only
+                # selects PROMOTED assets, so already-classified assets are
+                # not reconsidered, and finalize_relevance_filter derives its
+                # counts from the DB. A job whose assets are all already
+                # classified therefore passes straight through to dedup and
+                # completion rather than redoing any inference.
+                logger.warning(
+                    f"Watchdog: job {job.id} has all sources terminal but is still "
+                    f"{job.status.value} and idle since {job.updated_at}; re-driving filtering"
+                )
+                redis_client = get_redis()
+                redis_client.delete(f"job:{job.id}:filtering_dispatched")
+                from app.tasks.filtering_tasks import run_relevance_filter
+
+                run_relevance_filter.delay(str(job.id))
 
 
 def _resume_task(job_id: str, job_source_task_id: str, source_type, checkpoint: dict) -> None:
@@ -288,44 +316,28 @@ def _resume_task(job_id: str, job_source_task_id: str, source_type, checkpoint: 
     from-scratch discovery re-run cannot duplicate data — the only cost is a
     cheap re-run of the (already-cached-by-most-SDKs) discovery/search step
     and, as a known minor limitation, a re-increment of the task's
-    discovered_count rollup (a display counter, not a correctness-critical one)."""
-    from app.domain.enums import SourceType
+    discovered_count rollup (a display counter, not a correctness-critical one).
 
-    if source_type == SourceType.KAGGLE:
-        from app.tasks.discovery_tasks import discover_kaggle
+    Dispatch goes through _SOURCE_DISCOVERY_TASKS — the same registry
+    JobService.start uses — rather than a hand-written if/elif chain. That
+    chain was a duplicate of the registry and had silently drifted out of
+    sync: WEB, YOUTUBE and ROBOFLOW were missing from it, so a stalled task
+    on any of those three fell through to a log line and was never resumed.
+    Because `stalled` is not a terminal status, such a task also kept
+    all_terminal_for_job() False forever, pinning the whole job in `running`.
+    Reading the registry makes every registered connector resumable by
+    construction and removes the class of bug entirely."""
+    from app.services.job_service import _SOURCE_DISCOVERY_TASKS
 
-        discover_kaggle.delay(job_id, job_source_task_id)
-    elif source_type == SourceType.COCO:
-        from app.tasks.discovery_tasks import discover_coco
+    try:
+        source = SourceType(source_type)
+    except ValueError:
+        logger.warning(f"Watchdog: unknown source_type={source_type}, cannot resume")
+        return
 
-        discover_coco.delay(job_id, job_source_task_id)
-    elif source_type == SourceType.OPEN_IMAGES:
-        from app.tasks.discovery_tasks import discover_open_images
+    task_path = _SOURCE_DISCOVERY_TASKS.get(source)
+    if task_path is None:
+        logger.warning(f"Watchdog: no connector registered for source_type={source_type}")
+        return
 
-        discover_open_images.delay(job_id, job_source_task_id)
-    elif source_type == SourceType.PASCAL_VOC:
-        from app.tasks.discovery_tasks import discover_pascal_voc
-
-        discover_pascal_voc.delay(job_id, job_source_task_id)
-    elif source_type == SourceType.VISUAL_GENOME:
-        from app.tasks.discovery_tasks import discover_visual_genome
-
-        discover_visual_genome.delay(job_id, job_source_task_id)
-    elif source_type == SourceType.DAVIS:
-        from app.tasks.discovery_tasks import discover_davis
-
-        discover_davis.delay(job_id, job_source_task_id)
-    elif source_type == SourceType.SUN_RGBD:
-        from app.tasks.discovery_tasks import discover_sun_rgbd
-
-        discover_sun_rgbd.delay(job_id, job_source_task_id)
-    elif source_type == SourceType.NUSCENES:
-        from app.tasks.discovery_tasks import discover_nuscenes
-
-        discover_nuscenes.delay(job_id, job_source_task_id)
-    elif source_type == SourceType.KITTI:
-        from app.tasks.discovery_tasks import discover_kitti
-
-        discover_kitti.delay(job_id, job_source_task_id)
-    else:
-        logger.warning(f"Watchdog: no resume handler yet for source_type={source_type}")
+    celery_app.send_task(task_path, args=[job_id, job_source_task_id])

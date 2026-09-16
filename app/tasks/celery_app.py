@@ -3,7 +3,7 @@ for the watchdog (stalled-task resume, scheduled-job kickoff, deadline sweep).
 """
 
 from celery import Celery
-from celery.signals import task_postrun, task_prerun
+from celery.signals import task_postrun, task_prerun, worker_process_init
 
 from app.core.config import get_settings
 from app.core.logging import configure_logging
@@ -53,6 +53,72 @@ celery_app.conf.update(
         },
     },
 )
+
+
+@worker_process_init.connect
+def _reset_db_connections_after_fork(**_):
+    """Give each prefork child its own Postgres connections.
+
+    Without this, every child inherits the parent's pooled sockets and two
+    processes end up multiplexing one connection, producing
+    "another command is already in progress". See
+    app/db/session.dispose_engine_for_fork for the full explanation.
+    """
+    from app.db.session import dispose_engine_for_fork
+
+    dispose_engine_for_fork()
+
+
+@worker_process_init.connect
+def _cap_torch_threads(**_):
+    """Stop each child from grabbing every core.
+
+    torch/OpenMP default their intra-op pool to the machine's CPU count. On
+    this host (64 cores) a worker at --concurrency=12 would spawn ~768
+    compute threads across children, so the box spends its time context
+    switching instead of doing inference -- the measured effect was
+    relevance_filter_batch taking up to 3320s for 50 images. Capping per
+    child keeps the total in line with the core count.
+    """
+    import os
+
+    threads = os.environ.get("TORCH_NUM_THREADS")
+    if not threads:
+        return
+    os.environ.setdefault("OMP_NUM_THREADS", threads)
+    os.environ.setdefault("MKL_NUM_THREADS", threads)
+    try:
+        import torch
+
+        torch.set_num_threads(int(threads))
+    except Exception:  # torch absent (api image) or bad value -- non-fatal
+        pass
+
+
+@worker_process_init.connect
+def _cap_gpu_memory(**_):
+    """Bound this process's share of the GPU.
+
+    This host also runs unrelated production containers. Without a cap, a
+    filtering child can allocate the whole card (PyTorch's caching allocator
+    holds freed blocks rather than returning them to the driver), and the
+    next process to need VRAM -- ours or someone else's -- fails with an
+    out-of-memory error. set_per_process_memory_fraction makes torch itself
+    refuse to grow past the limit, so the failure is contained to this
+    worker instead of taking down a neighbour.
+    """
+    import os
+
+    fraction = os.environ.get("TORCH_CUDA_MEMORY_FRACTION")
+    if not fraction:
+        return
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.set_per_process_memory_fraction(float(fraction), 0)
+    except Exception:  # no GPU in this container, or a bad value -- non-fatal
+        pass
 
 
 @task_prerun.connect

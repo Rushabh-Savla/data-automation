@@ -73,18 +73,45 @@ def _crop_with_margin(
     return image.crop((left, top, right, bottom))
 
 
+def _select_device() -> str:
+    """Prefers CUDA when the container was actually granted a GPU.
+
+    Guarded rather than assumed: the same image runs on the CPU-only IO
+    worker and on the GPU filtering worker, and torch.cuda.is_available()
+    also returns False when the installed wheel's CUDA build is newer than
+    the host driver. Falling back keeps the filter working (slowly) instead
+    of crashing the whole worker on import.
+    """
+    try:
+        import torch
+
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    except Exception:  # pragma: no cover - torch missing entirely
+        return "cpu"
+
+
 @lru_cache(maxsize=1)
 def _load_model(model_id: str = "HuggingFaceTB/SmolVLM-256M-Instruct"):
+    import torch
     from transformers import AutoModelForImageTextToText, AutoProcessor
 
+    device = _select_device()
     processor = AutoProcessor.from_pretrained(model_id)
-    model = AutoModelForImageTextToText.from_pretrained(model_id)
-    return processor, model
+    # fp16 on GPU roughly halves both the weight footprint and the matmul
+    # cost; on CPU it is slower than fp32 (no native half-precision path),
+    # so the dtype follows the device rather than being fixed.
+    model = AutoModelForImageTextToText.from_pretrained(
+        model_id,
+        torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+    )
+    model.to(device)
+    model.eval()
+    return processor, model, device
 
 
 class VisualVerifier:
     def __init__(self, model_id: str = "HuggingFaceTB/SmolVLM-256M-Instruct"):
-        self._processor, self._model = _load_model(model_id)
+        self._processor, self._model, self._device = _load_model(model_id)
 
     def verify(self, image_path: Path, query: str, box: tuple[float, float, float, float] | None = None) -> bool:
         """Yes/no check: does this image (cropped to `box`, if given) show
@@ -106,7 +133,13 @@ class VisualVerifier:
             ]
             prompt = self._processor.apply_chat_template(messages, add_generation_prompt=True)
             inputs = self._processor(text=prompt, images=[image], do_image_splitting=False, return_tensors="pt")
-            generated = self._model.generate(**inputs, max_new_tokens=5)
+            inputs = {k: (v.to(self._device) if hasattr(v, "to") else v) for k, v in inputs.items()}
+            # inference_mode (not just no_grad) also skips autograd's version
+            # counter bookkeeping — this model is never trained here.
+            import torch
+
+            with torch.inference_mode():
+                generated = self._model.generate(**inputs, max_new_tokens=5)
             response = self._processor.batch_decode(
                 generated[:, inputs["input_ids"].shape[1] :], skip_special_tokens=True
             )[0]
