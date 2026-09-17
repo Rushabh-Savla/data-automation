@@ -155,16 +155,26 @@ def discover_kaggle(self, job_id: str, job_source_task_id: str):
             return
 
         task_repo.increment_counts(task_uuid, discovered=len(items))
-        db.flush()
 
-    item_dicts = [
-        {
-            "external_ref": {"slug": it["slug"]},
-            "license_hint": it["license"],
-            "dataset_identifier": it["slug"],
-        }
-        for it in items
-    ]
+        item_dicts = [
+            {
+                "external_ref": {"slug": it["slug"]},
+                "license_hint": it["license"],
+                "dataset_identifier": it["slug"],
+            }
+            for it in items
+        ]
+
+        # Records exactly what this round dispatched, keyed by slug (the
+        # same key download_kaggle_dataset uses as its checkpoint_key). A
+        # paused/resumed job reads this back (JobService.resume) to
+        # redispatch only the datasets that are still outstanding instead of
+        # re-running discovery and rebuilding the whole chord from scratch —
+        # see on_source_finished for where "still outstanding" gets updated.
+        pending = {**(task.checkpoint or {}).get("_pending_items", {})}
+        pending.update({it["slug"]: item for it, item in zip(items, item_dicts)})
+        task_repo.heartbeat(task_uuid, checkpoint={**(task.checkpoint or {}), "_pending_items": pending})
+        db.flush()
 
     download_group = [download_kaggle_dataset.s(job_id, job_source_task_id, item) for item in item_dicts]
     chord(download_group)(on_source_finished.s(job_id, job_source_task_id))
@@ -212,8 +222,8 @@ def discover_roboflow(self, job_id: str, job_source_task_id: str):
                 for ws, proj, ver, lic in explicit_projects
             ]
         else:
-            credentials = CredentialService(CredentialRepository(db)).resolve(SourceType.ROBOFLOW)
-            connector = RoboflowConnector(api_key=credentials.get("ROBOFLOW_API_KEY", ""))
+            api_keys = CredentialService(CredentialRepository(db)).resolve_pool(SourceType.ROBOFLOW, "ROBOFLOW_API_KEY")
+            connector = RoboflowConnector(api_keys=api_keys)
             with heartbeat_during(task_uuid):
                 page = connector.discover(
                     job.query, cursor=None,

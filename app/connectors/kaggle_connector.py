@@ -163,6 +163,15 @@ class KaggleConnector:
         license_name = item.license_hint or "Unknown"
         logger.info(f"Downloading Kaggle dataset: {slug}")
 
+        # kagglehub.dataset_download() below is one uninterruptible blocking
+        # call with no should_stop() hook of its own — once it starts, a
+        # pause can't take effect until it returns. Checking here at least
+        # makes pause instant for any dataset in the chord whose download
+        # hasn't started yet, rather than waiting for it to run to
+        # completion first.
+        if should_stop():
+            raise JobStopped(f"should_stop() signalled before Kaggle download started for {slug}")
+
         try:
             cached_path = Path(kagglehub.dataset_download(slug))
         except Exception as e:

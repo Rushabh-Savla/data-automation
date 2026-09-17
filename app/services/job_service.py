@@ -28,13 +28,68 @@ logger = logging.getLogger(__name__)
 # orchestration code never needs to change, only this mapping (Open/Closed).
 _SOURCE_DISCOVERY_TASKS: dict[SourceType, str] = {}
 
+# Per-item download task registry — a source only needs to register here if
+# it wants pause/resume to redispatch exactly the items still outstanding
+# instead of re-running discovery from scratch (see _resume_pending_items
+# below). Sources that don't register keep today's discovery-redispatch
+# behavior unchanged.
+_SOURCE_DOWNLOAD_TASKS: dict[SourceType, str] = {}
+
 
 def register_source_discovery_task(source_type: SourceType, task_dotted_path: str) -> None:
     _SOURCE_DISCOVERY_TASKS[source_type] = task_dotted_path
 
 
+def register_source_download_task(source_type: SourceType, task_dotted_path: str) -> None:
+    _SOURCE_DOWNLOAD_TASKS[source_type] = task_dotted_path
+
+
 def get_implemented_sources() -> set[SourceType]:
     return set(_SOURCE_DISCOVERY_TASKS.keys())
+
+
+def _resume_pending_items(
+    source_type: SourceType, job_id: str, job_source_task_id: str, checkpoint: dict | None
+) -> bool:
+    """If the task's checkpoint records exactly which items a prior
+    discovery round dispatched ("_pending_items", written by e.g.
+    discover_kaggle) and which of those already reached a terminal outcome
+    ("_completed_items", written by on_source_finished), redispatch just the
+    outstanding items' download tasks directly instead of re-running
+    discovery and rebuilding the whole chord.
+
+    This is what makes resuming a paused Kaggle job cheap: a dataset that
+    already finished downloading (and had its local cache cleaned up) is
+    never redispatched just to re-download the whole thing and skip through
+    it via its checkpoint.
+
+    Returns True if it dispatched a redispatch chord this way (caller
+    should not also redispatch discovery), False if there was nothing
+    usable to resume from (caller should fall back to redispatching
+    discovery — this is also what correctly triggers a genuinely new
+    discovery round, e.g. topup, once every previously-dispatched item is
+    already in `_completed_items`).
+    """
+    pending_items: dict = (checkpoint or {}).get("_pending_items") or {}
+    if not pending_items:
+        return False
+    completed = set((checkpoint or {}).get("_completed_items", []))
+    remaining = {k: v for k, v in pending_items.items() if k not in completed}
+    if not remaining:
+        return False
+
+    task_path = _SOURCE_DOWNLOAD_TASKS.get(source_type)
+    if task_path is None:
+        return False
+
+    from celery import chord
+
+    from app.tasks.celery_app import celery_app
+    from app.tasks.orchestration_tasks import on_source_finished
+
+    group = [celery_app.signature(task_path, args=[job_id, job_source_task_id, item]) for item in remaining.values()]
+    chord(group)(on_source_finished.s(job_id, job_source_task_id))
+    return True
 
 
 class JobService:
@@ -175,7 +230,10 @@ class JobService:
         for task in self.task_repo.list_for_job(job_id):
             if task.status in JOB_SOURCE_TASK_TERMINAL_STATUSES:
                 continue
-            task_path = _SOURCE_DISCOVERY_TASKS.get(SourceType(task.source_type))
+            source_type = SourceType(task.source_type)
+            if _resume_pending_items(source_type, str(job_id), str(task.id), task.checkpoint):
+                continue
+            task_path = _SOURCE_DISCOVERY_TASKS.get(source_type)
             if task_path is not None:
                 self._dispatch(task_path, str(job_id), str(task.id))
 

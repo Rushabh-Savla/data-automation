@@ -46,6 +46,30 @@ def on_source_finished(self, results, job_id: str, job_source_task_id: str):
         had_errors = any(isinstance(r, dict) and r.get("error") for r in (results or []))
         had_stopped = any(isinstance(r, dict) and r.get("stopped") for r in (results or []))
 
+        # Record which dispatched items (keyed the same way download tasks
+        # key their own checkpoint — see _run_item_download) reached a
+        # terminal outcome in this chord round, vs. which were stopped
+        # mid-flight (paused/cancelled). Only sources that write
+        # "_pending_items" (currently Kaggle — see discover_kaggle) ever
+        # consult this; for every other source it's a harmless no-op extra
+        # key in the checkpoint dict. This is what lets a resume redispatch
+        # only the datasets that are actually still outstanding instead of
+        # re-running discovery and rebuilding the whole chord (see
+        # JobService.resume / _resume_task).
+        done_items = {
+            r["item"] for r in (results or []) if isinstance(r, dict) and r.get("item") and not r.get("stopped")
+        }
+        if done_items:
+            existing_completed = set(task.checkpoint.get("_completed_items", []))
+            task_repo.heartbeat(
+                task_uuid,
+                checkpoint={
+                    **(task.checkpoint or {}),
+                    "_completed_items": sorted(existing_completed | done_items),
+                },
+            )
+            db.flush()
+
         if had_stopped and cancellation.is_paused(job_id) and not cancellation.is_cancelled(job_id):
             # Paused mid-flight, not actually done: leave the task in whatever
             # non-terminal status the download task left it in (DOWNLOADING)
@@ -271,6 +295,15 @@ def plan_topup_round(self, job_id: str):
                     "round": plan.round_number,
                     "quota": plan.quota,
                     "accepted_after_last_round": accepted,
+                    # Raw (pre-filter) accepted_count as of right now, before
+                    # this round's downloads start — the fixed baseline
+                    # build_on_progress anchors this round's target to. Not
+                    # the same number as accepted_after_last_round above,
+                    # which is post-filter; the target-reached check in
+                    # build_on_progress compares against job.accepted_count,
+                    # which is the raw/pre-filter counter, so it needs a
+                    # baseline in that same unit.
+                    "raw_accepted_at_round_start": job.accepted_count,
                 }
                 job_repo.set_config(job_uuid, config)
 
@@ -554,12 +587,15 @@ def _resume_task(job_id: str, job_source_task_id: str, source_type, checkpoint: 
     all_terminal_for_job() False forever, pinning the whole job in `running`.
     Reading the registry makes every registered connector resumable by
     construction and removes the class of bug entirely."""
-    from app.services.job_service import _SOURCE_DISCOVERY_TASKS
+    from app.services.job_service import _SOURCE_DISCOVERY_TASKS, _resume_pending_items
 
     try:
         source = SourceType(source_type)
     except ValueError:
         logger.warning(f"Watchdog: unknown source_type={source_type}, cannot resume")
+        return
+
+    if _resume_pending_items(source, job_id, job_source_task_id, checkpoint):
         return
 
     task_path = _SOURCE_DISCOVERY_TASKS.get(source)

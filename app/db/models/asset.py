@@ -28,7 +28,7 @@ class Asset(Base):
     source_type: Mapped[SourceType] = mapped_column(String(32), nullable=False)
     # Deterministic per-source ID — see app/connectors/*.py for the generation scheme
     # of each source (reused from the legacy scripts where one already existed).
-    source_item_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    source_item_id: Mapped[str] = mapped_column(String(512), nullable=False)
     source_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     dataset_identifier: Mapped[str | None] = mapped_column(String(255), nullable=True)
     license: Mapped[str | None] = mapped_column(String(255), nullable=True)

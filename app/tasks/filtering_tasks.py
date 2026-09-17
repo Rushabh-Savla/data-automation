@@ -542,11 +542,25 @@ def trim_excess_assets(job_id: str) -> None:
         if job is None or job.target_count is None:
             return
 
-        excess = job.accepted_count - job.target_count
+        if job.accepted_count <= job.target_count:
+            return
+
+        # excess must be sized off len(kept), not job.accepted_count: that
+        # counter also includes PROMOTED assets awaiting a filtering
+        # decision (reconcile() treats "not yet filtered" as "provisionally
+        # accepted" — see app/services/job_counters.py), which this function
+        # can't trim since it only selects from RELEVANCE_PASSED. Sizing off
+        # job.accepted_count let excess exceed len(kept) whenever a
+        # meaningful number of assets were still undecided, and
+        # ordered[:excess] on a shorter list silently returns the WHOLE
+        # list — trimming every relevance-passed asset instead of just the
+        # surplus, leaving only the undecided leftovers as the job's
+        # "accepted" total once reconcile() ran again.
+        kept = asset_repo.list_for_job(job_uuid, status=AssetStatus.RELEVANCE_PASSED, limit=100_000)
+        excess = len(kept) - job.target_count
         if excess <= 0:
             return
 
-        kept = asset_repo.list_for_job(job_uuid, status=AssetStatus.RELEVANCE_PASSED, limit=100_000)
         trim_ids = _select_trim_candidates([(str(a.id), a.relevance_score) for a in kept], excess)
         if not trim_ids:
             return

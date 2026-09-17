@@ -18,6 +18,8 @@ call (which has no timeout parameter) is wrapped in a thread with an
 explicit timeout to satisfy "detect stalled exports."
 """
 
+import hashlib
+import itertools
 import logging
 import shutil
 import zipfile
@@ -28,7 +30,6 @@ from pathlib import Path
 import requests
 
 from app.connectors.base import (
-    HTTP_HEADERS,
     DiscoveryPage,
     OnProgressFn,
     RawAssetDraft,
@@ -46,68 +47,122 @@ RF_API_BASE = "https://api.roboflow.com"
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff"}
 _FORMAT_FALLBACK = ["yolov8", "yolov5pytorch", "coco", "voc"]
 _SDK_DOWNLOAD_TIMEOUT_S = 600
+# Matches Asset.source_item_id's column width (see the migration widening it
+# from 128 -> 512, prompted by real Roboflow exports overflowing 128 once
+# search actually started returning real projects/filenames). Kept below the
+# column width, not equal to it, so this bound is the thing that trips
+# first and predictably, rather than depending on the DB to reject it.
+_MAX_SOURCE_ITEM_ID_LEN = 500
 
 
 @register_connector(SourceType.ROBOFLOW)
 class RoboflowConnector:
-    def __init__(self, api_key: str = "", export_format: str = "yolov8", min_resolution: tuple[int, int] = (64, 64)):
-        self.api_key = api_key
+    def __init__(
+        self,
+        api_keys: list[str] | None = None,
+        export_format: str = "yolov8",
+        min_resolution: tuple[int, int] = (64, 64),
+    ):
+        self.api_keys = api_keys or []
+        self._key_cycle = itertools.cycle(self.api_keys) if self.api_keys else None
         self.export_format = export_format
         self.min_w, self.min_h = min_resolution
+
+    def _next_key(self) -> str:
+        # Round-robins across every active credential the user has added for
+        # Roboflow, so concurrent/sequential requests spread across keys
+        # instead of hammering a single one into its rate limit.
+        if self._key_cycle is None:
+            return ""
+        return next(self._key_cycle)
 
     # -- Discovery -----------------------------------------------------------
 
     def discover(self, query: str, cursor: str | None, limit: int = 20) -> DiscoveryPage:
-        # Note: api.roboflow.com/search is NOT a real search endpoint — it is
-        # Roboflow's GET /:workspace route, and "search" happens to be a real
-        # workspace slug someone owns. Every request to it returns that one
-        # fixed workspace's own projects regardless of `q`/`type`, completely
-        # ignoring the query — verified by hitting it with several unrelated
-        # queries and getting byte-identical responses. It was previously
-        # kept as a "fallback" but never actually performed a search, so it
-        # only risked silently attaching an unrelated workspace's data to a
-        # job; removed rather than fixed forward since Roboflow does not
-        # appear to expose a public, query-based Universe search API.
-        url = RF_UNIVERSE_BASE + "/search"
-        params = {"q": query, "t": "object-detection", "p": 1}
-        try:
-            resp = requests.get(
-                url, params=params, headers={**HTTP_HEADERS, "Accept": "application/json"}, timeout=15
-            )
-            resp.raise_for_status()
-            ct = resp.headers.get("content-type", "")
-            if "json" not in ct and not resp.text.strip().startswith("{"):
-                logger.warning(
-                    f"Roboflow Universe search returned non-JSON (likely an anti-bot challenge page) "
-                    f"for query {query!r} — this network is probably being blocked, not genuinely "
-                    f"returning zero results. Use explicit project overrides instead of auto-search."
-                )
-                return DiscoveryPage(
-                    items=[],
-                    next_cursor=None,
-                    exhausted=True,
-                    error_reason="Roboflow Universe search is unreachable from this network (blocked/anti-bot "
-                    "challenge) — use explicit project overrides instead of auto-search",
-                )
-            data = resp.json()
-            items = data.get("results", [])
-            return DiscoveryPage(
-                items=[self._parse_universe_item(it) for it in items[:limit]], next_cursor=None, exhausted=True
-            )
-        except Exception as e:
-            logger.warning(f"Roboflow Universe search failed for {query!r}: {e}")
+        # universe.roboflow.com/search (the old endpoint here) is NOT a real
+        # search API — it's the website's own internal Next.js route
+        # (Cloudflare-protected against automated traffic, and even when
+        # reachable it silently returned one fixed workspace's projects
+        # regardless of `q`). The real, documented, authenticated search API
+        # is GET /universe/search on api.roboflow.com — confirmed straight
+        # from the `roboflow` PyPI SDK's own source
+        # (roboflow.adapters.rfapi.search_universe, the function backing
+        # `roboflow universe search` / rfapi.search_universe() in Roboflow's
+        # own docs), which hits exactly this endpoint with an api_key. It
+        # requires an API key (unlike the old endpoint), so this only runs
+        # once api_keys is non-empty.
+        if not self.api_keys:
             return DiscoveryPage(
                 items=[],
                 next_cursor=None,
                 exhausted=True,
-                error_reason=f"Roboflow Universe search request failed ({e}) — use explicit project overrides "
-                "instead of auto-search",
+                error_reason="ROBOFLOW_API_KEY not configured — Universe search requires an API key",
             )
 
+        try:
+            page_number = int(cursor) if cursor else 1
+        except ValueError:
+            page_number = 1
+
+        for _ in range(max(1, len(self.api_keys))):
+            key = self._next_key()
+            params = {"q": query, "limit": limit, "page": page_number, "api_key": key}
+            try:
+                resp = requests.get(f"{RF_API_BASE}/universe/search", params=params, timeout=15)
+            except Exception as e:
+                logger.warning(f"Roboflow Universe search request failed for {query!r}: {e}")
+                return DiscoveryPage(
+                    items=[], next_cursor=None, exhausted=True,
+                    error_reason=f"Roboflow Universe search request failed ({e})",
+                )
+
+            if resp.status_code == 429:
+                retry_after = resp.headers.get("Retry-After")
+                logger.warning(
+                    f"Roboflow Universe search rate-limited (429) for {query!r}"
+                    + (f" (Retry-After={retry_after}s)" if retry_after else "")
+                    + " — rotating to next key"
+                )
+                continue
+
+            try:
+                resp.raise_for_status()
+                data = resp.json()
+            except Exception as e:
+                logger.warning(f"Roboflow Universe search failed for {query!r}: {e}")
+                return DiscoveryPage(
+                    items=[], next_cursor=None, exhausted=True,
+                    error_reason=f"Roboflow Universe search failed ({e})",
+                )
+
+            results = data.get("results", [])
+            items = [parsed for it in results[:limit] if (parsed := self._parse_universe_item(it)) is not None]
+            next_cursor = str(page_number + 1) if len(results) >= limit else None
+            return DiscoveryPage(items=items, next_cursor=next_cursor, exhausted=next_cursor is None)
+
+        return DiscoveryPage(
+            items=[], next_cursor=None, exhausted=True,
+            error_reason="Roboflow Universe search rate-limited (429) on every configured API key",
+        )
+
     @staticmethod
-    def _parse_universe_item(item: dict) -> SourceItem:
-        owner = item.get("owner", "")
-        slug = item.get("slug", "")
+    def _parse_universe_item(item: dict) -> SourceItem | None:
+        # The response doesn't document a stable "workspace"/"project" field
+        # pair, but every result's canonical page is
+        # {RF_UNIVERSE_BASE}/{workspace}/{project} (the same shape this
+        # connector already builds dataset_url from elsewhere) — parsed from
+        # `url`, with explicit fields preferred if the API does provide them.
+        owner = item.get("owner") or item.get("workspace") or ""
+        slug = item.get("slug") or item.get("project") or ""
+        if not owner or not slug:
+            url = item.get("url", "")
+            path = url.removeprefix(RF_UNIVERSE_BASE).strip("/")
+            parts = path.split("/")
+            if len(parts) >= 2 and parts[0] and parts[1]:
+                owner, slug = parts[0], parts[1]
+        if not owner or not slug:
+            logger.debug(f"Roboflow Universe search result missing workspace/project, skipping: {item}")
+            return None
         return SourceItem(
             source_type=SourceType.ROBOFLOW,
             external_ref={"workspace": owner, "project": slug, "version": 1},
@@ -125,8 +180,17 @@ class RoboflowConnector:
         should_stop: ShouldStopFn,
         on_progress: OnProgressFn,
     ) -> Iterator[RawAssetDraft]:
-        if not self.api_key:
+        if not self.api_keys:
             raise FatalConnectorError("ROBOFLOW_API_KEY not configured")
+
+        # A dispatched-but-not-yet-started task (e.g. the job's target was
+        # reached by another project in the same chord while this one sat
+        # queued) shouldn't kick off a large export download just to walk
+        # through it and skip every image — see the chunked should_stop()
+        # check in _api_download below for the same reasoning applied
+        # mid-download, not just here at the start.
+        if should_stop():
+            raise JobStopped("should_stop() signalled before Roboflow download started")
 
         workspace = item.external_ref["workspace"]
         project = item.external_ref["project"]
@@ -154,17 +218,9 @@ class RoboflowConnector:
         formats_to_try = [self.export_format] + [f for f in _FORMAT_FALLBACK if f != self.export_format]
         link = None
         for fmt in formats_to_try:
-            url = f"{RF_API_BASE}/{workspace}/{project}/{version}/{fmt}?api_key={self.api_key}"
-            try:
-                resp = requests.get(url, timeout=30)
-                resp.raise_for_status()
-                data = resp.json()
-                link = data.get("export", {}).get("link")
-                if link:
-                    break
-            except Exception as e:
-                logger.debug(f"  Format '{fmt}' failed: {e}")
-                continue
+            link = self._try_format(workspace, project, version, fmt)
+            if link:
+                break
 
         if not link:
             raise TransientConnectorError(f"No download link for {workspace}/{project} (tried {formats_to_try})")
@@ -173,10 +229,18 @@ class RoboflowConnector:
         extract_dir.mkdir(parents=True, exist_ok=True)
         zip_path = workdir / f"{workspace}__{project}__v{version}.zip"
 
+        # Unlike kagglehub's single opaque blocking call, this download is
+        # already a chunked loop we control — checking should_stop() here
+        # means a large export in progress actually stops mid-download once
+        # the job's target is reached, instead of only reacting to a pause/
+        # target-reached signal once the whole zip has already finished.
         with requests.get(link, stream=True, timeout=600) as r:
             r.raise_for_status()
             with open(zip_path, "wb") as f:
                 for chunk in r.iter_content(chunk_size=65536):
+                    if should_stop():
+                        zip_path.unlink(missing_ok=True)
+                        raise JobStopped(f"should_stop() signalled mid-download for {workspace}/{project}")
                     f.write(chunk)
 
         with zipfile.ZipFile(zip_path, "r") as zf:
@@ -187,13 +251,71 @@ class RoboflowConnector:
             extract_dir, workspace, project, version, license_name, dataset_url, checkpoint, should_stop, on_progress
         )
 
+    def _try_format(self, workspace: str, project: str, version, fmt: str) -> str | None:
+        """Requests one export format, rotating to the next API key on a 429
+        (rate limited) response instead of giving up — a single key hitting
+        its per-account limit shouldn't fail the whole download when other
+        active keys are available. Any other failure (bad format, network
+        error, no link in the response) is not retried across keys, since
+        rotating keys won't fix those."""
+        for _ in range(max(1, len(self.api_keys))):
+            key = self._next_key()
+            url = f"{RF_API_BASE}/{workspace}/{project}/{version}/{fmt}?api_key={key}"
+            try:
+                resp = requests.get(url, timeout=30)
+            except Exception as e:
+                logger.debug(f"  Format '{fmt}' failed: {e}")
+                return None
+            if resp.status_code == 429:
+                retry_after = resp.headers.get("Retry-After")
+                logger.warning(
+                    f"Roboflow API key rate-limited (429) for {workspace}/{project}/{fmt}"
+                    + (f" (Retry-After={retry_after}s)" if retry_after else "")
+                    + " — rotating to next key"
+                )
+                continue
+            try:
+                resp.raise_for_status()
+                link = resp.json().get("export", {}).get("link")
+            except Exception as e:
+                logger.debug(f"  Format '{fmt}' failed: {e}")
+                return None
+            return link or None
+        return None
+
     def _sdk_download(
         self, workspace, project, version, license_name, dataset_url, workdir, checkpoint, should_stop, on_progress
     ) -> Iterator[RawAssetDraft]:
+        # version_obj.download() below is one uninterruptible blocking SDK
+        # call with no should_stop() hook of its own (same limitation as
+        # kagglehub.dataset_download() — see KaggleConnector.fetch()), so
+        # this can only make Pause/target-reached instant when it lands
+        # before the download starts, not interrupt one already running.
+        if should_stop():
+            raise JobStopped(f"should_stop() signalled before Roboflow SDK download started for {workspace}/{project}")
+
         from roboflow import Roboflow
 
-        rf = Roboflow(api_key=self.api_key)
-        version_obj = rf.workspace(workspace).project(project).version(version)
+        rf = Roboflow(api_key=self._next_key())
+        try:
+            version_obj = rf.workspace(workspace).project(project).version(version)
+        except Exception as e:
+            if _looks_inaccessible(e):
+                # Universe search can surface a project the API itself won't
+                # serve (private, deleted, or export-restricted) — that's a
+                # quirk of Roboflow's own search index being broader than
+                # what it actually lets you fetch, not a problem with this
+                # job or anything the user can act on. Treated the same as a
+                # candidate that legitimately has zero matching images:
+                # yield nothing and don't record it as an error, rather than
+                # surfacing raw provider JSON and marking the source
+                # "completed (partial)" over something nobody can fix.
+                logger.warning(
+                    f"Roboflow project '{workspace}/{project}' appeared in search but isn't accessible "
+                    f"via the API — skipping it: {e}"
+                )
+                return
+            raise TransientConnectorError(f"Roboflow SDK failed to load {workspace}/{project}: {e}") from e
 
         export_dir = workdir / "roboflow_cache" / f"{workspace}__{project}__v{version}"
         if export_dir.exists() and not any(export_dir.rglob("*")):
@@ -284,7 +406,9 @@ class RoboflowConnector:
                         annotation_format = "coco_json"
                         break
 
-            source_item_id = f"rf_{safe_ws}__{safe_proj}__v{version}__{split}__{src_img.stem}"
+            source_item_id = _bounded_source_item_id(
+                f"rf_{safe_ws}__{safe_proj}__v{version}__{split}__{src_img.stem}"
+            )
             draft = RawAssetDraft(
                 source_item_id=source_item_id,
                 source_url=dataset_url,
@@ -301,6 +425,30 @@ class RoboflowConnector:
             )
             on_progress({"checkpoint": {split: {"split_index": i + 1}}, "downloaded": 1})
             yield draft
+
+
+def _looks_inaccessible(e: Exception) -> bool:
+    """True for the SDK's raw RoboflowError({"error": {"message": "...does
+    not exist or cannot be loaded due to missing permissions", "type":
+    "GraphMethodException", ...}}) — a project Universe search returned that
+    the API itself refuses to serve."""
+    msg = str(e).lower()
+    return "does not exist" in msg or "missing permission" in msg or "graphmethodexception" in msg
+
+
+def _bounded_source_item_id(source_item_id: str) -> str:
+    """Caps the id at _MAX_SOURCE_ITEM_ID_LEN, deterministically — Roboflow
+    exports append a `.rf.<32-hex-hash>` suffix on top of already-
+    descriptive original filenames, and stock-photo-site names in
+    particular can run long enough to overflow even a generously widened
+    column. Replacing the tail with a hash keeps the id stable across runs
+    (so the (job_id, source_type, source_item_id) uniqueness/dedup logic in
+    AssetRepository.upsert still works) while guaranteeing a hard ceiling
+    regardless of how long a future filename turns out to be."""
+    if len(source_item_id) <= _MAX_SOURCE_ITEM_ID_LEN:
+        return source_item_id
+    digest = hashlib.md5(source_item_id.encode()).hexdigest()[:16]
+    return f"{source_item_id[: _MAX_SOURCE_ITEM_ID_LEN - 17]}_{digest}"
 
 
 def _parse_yolo_classes(label_file: Path) -> list:

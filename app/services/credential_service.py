@@ -71,6 +71,33 @@ class CredentialService:
                     result[env_key] = fallback
         return result
 
+    def resolve_pool(self, source_type: SourceType, key_name: str) -> list[str]:
+        """Returns every active credential's decrypted value for a given
+        (source_type, key_name), least-recently-used first — for connectors
+        that rotate across several user-added credentials (e.g. multiple
+        Roboflow API keys) to spread request load and avoid a single key's
+        rate limit. Falls back to the single Settings/.env value only when
+        no DB-stored credential exists at all."""
+        values: list[str] = []
+        cipher = self._cipher_or_none()
+        if cipher is not None:
+            for cred in self.credential_repo.list_active_for_source(source_type):
+                if cred.key_name != key_name:
+                    continue
+                try:
+                    values.append(cipher.decrypt(cred.encrypted_value))
+                    self.credential_repo.mark_used(cred.id)
+                except RuntimeError:
+                    continue
+
+        if not values:
+            settings_attr = _SOURCE_ENV_KEYS.get(source_type, {}).get(key_name)
+            if settings_attr:
+                fallback = getattr(self.settings, settings_attr, "")
+                if fallback:
+                    values.append(fallback)
+        return values
+
     @contextmanager
     def scoped_env(self, source_type: SourceType) -> Iterator[dict[str, str]]:
         """Context manager: sets resolved credentials into os.environ for the

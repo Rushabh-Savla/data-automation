@@ -172,9 +172,20 @@ def build_on_progress(
                 # a first-round prior -- a query whose survivors are 14% of
                 # what it downloads needs roughly 7x, and no fixed multiplier
                 # expresses that.
-                topup_quota = ((job.config or {}).get("_topup") or {}).get("quota") or {}
+                topup_state = (job.config or {}).get("_topup") or {}
+                topup_quota = topup_state.get("quota") or {}
                 if topup_quota:
-                    target = job.accepted_count + sum(topup_quota.values())
+                    # Anchored to a fixed baseline captured once when the
+                    # round was dispatched (plan_topup_round), NOT the live
+                    # job.accepted_count read here — that field grows with
+                    # every accepted image in this same round, so comparing
+                    # against "current + quota" recomputed on every call is a
+                    # moving target that can never be reached (quota is
+                    # always positive), and the topup round never stops
+                    # itself. Falling back to the live count only covers a
+                    # job.config predating this baseline field.
+                    baseline = topup_state.get("raw_accepted_at_round_start", job.accepted_count)
+                    target = baseline + sum(topup_quota.values())
                 else:
                     target = buffered_target(job.target_count, get_settings().target_overfetch_buffer)
                 if job.accepted_count >= target:

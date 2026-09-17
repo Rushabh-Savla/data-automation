@@ -39,6 +39,7 @@ from app.db.repositories.job_source_task_repository import JobSourceTaskReposito
 from app.db.session import session_scope
 from app.domain.enums import JobSourceTaskStatus, SourceType
 from app.services.credential_service import CredentialService
+from app.services.job_service import register_source_download_task
 from app.services.standardization_service import AssetRejected
 from app.tasks._helpers import bind_context, build_on_progress, build_should_stop, heartbeat_during, unbind_context
 from app.tasks.celery_app import celery_app
@@ -176,6 +177,26 @@ def _run_item_download(
             unbind_context()
             logger.error(f"Exhausted retries downloading {checkpoint_key} (recorded as error, not task failure): {e}")
             return {"item": checkpoint_key, "accepted": accepted, "rejected": rejected, "error": str(e)}
+        except Exception as e:
+            # Anything not covered above (a DB constraint violation, an
+            # unclassified third-party SDK error, ...) must not crash this
+            # task outright: an unhandled exception in one chord member
+            # breaks the WHOLE chord — Celery surfaces it as ChordError to
+            # every other member and on_source_finished never runs, which
+            # permanently strands the JobSourceTask in DOWNLOADING even
+            # though the rest of the chord's items finished fine. That's
+            # exactly what the FatalConnectorError/TransientConnectorError
+            # handling above exists to prevent for known error types; any
+            # other exception gets the same degrade-and-continue treatment
+            # instead of being left to propagate and poison the chord.
+            with session_scope() as err_db:
+                err_repo = JobSourceTaskRepository(err_db)
+                err_repo.increment_counts(task_uuid, errors=1)
+                err_repo.set_status(task_uuid, JobSourceTaskStatus.DOWNLOADING, error_message=str(e))
+                err_db.commit()
+            unbind_context()
+            logger.exception(f"Unexpected error downloading {checkpoint_key} (recorded as error, not task failure)")
+            return {"item": checkpoint_key, "accepted": accepted, "rejected": rejected, "error": str(e)}
 
         if on_done is not None:
             on_done()
@@ -230,6 +251,9 @@ def download_kaggle_dataset(self, job_id: str, job_source_task_id: str, item_dic
     )
 
 
+register_source_download_task(SourceType.KAGGLE, "app.tasks.ingest_tasks.download_kaggle_dataset")
+
+
 @celery_app.task(
     name="app.tasks.ingest_tasks.download_roboflow_item",
     bind=True,
@@ -253,13 +277,12 @@ def download_roboflow_item(self, job_id: str, job_source_task_id: str, item_dict
 
     with session_scope() as db:
         credential_service = CredentialService(CredentialRepository(db))
-        credentials = credential_service.resolve(SourceType.ROBOFLOW)
+        api_keys = credential_service.resolve_pool(SourceType.ROBOFLOW, "ROBOFLOW_API_KEY")
         task = JobSourceTaskRepository(db).get(uuid.UUID(job_source_task_id))
         min_res = tuple(task.job.config.get("min_resolution", (64, 64))) if task and task.job else (64, 64)
         export_format = task.job.config.get("roboflow", {}).get("export_format", "yolov8") if task and task.job else "yolov8"
 
-    api_key = credentials.get("ROBOFLOW_API_KEY", "")
-    connector = RoboflowConnector(api_key=api_key, export_format=export_format, min_resolution=min_res)
+    connector = RoboflowConnector(api_keys=api_keys, export_format=export_format, min_resolution=min_res)
 
     def fetch(checkpoint, should_stop, on_progress):
         yield from connector.fetch(item, workdir, checkpoint, should_stop, on_progress)

@@ -33,8 +33,14 @@ class CredentialRepository:
         return list(self.db.execute(stmt).scalars().all())
 
     def list_active_for_source(self, source_type: SourceType) -> list[Credential]:
-        stmt = select(Credential).where(
-            Credential.source_type == source_type, Credential.is_active.is_(True)
+        # Least-recently-used first, so a source with several active
+        # credentials for the same key_name (e.g. rotating Roboflow API
+        # keys) offers the least-recently-used one first instead of
+        # whatever arbitrary order Postgres happens to return.
+        stmt = (
+            select(Credential)
+            .where(Credential.source_type == source_type, Credential.is_active.is_(True))
+            .order_by(Credential.last_used_at.asc().nullsfirst(), Credential.created_at.asc())
         )
         return list(self.db.execute(stmt).scalars().all())
 

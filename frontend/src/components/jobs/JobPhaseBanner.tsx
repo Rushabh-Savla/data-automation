@@ -1,6 +1,6 @@
 import type { FilteringProgress } from '@/hooks/useJobProgressSocket'
 import type { JobDetailResponse } from '@/api/types'
-import { isFilteringPhase } from '@/lib/jobPhase'
+import { describeSourceActivity, isFilteringPhase } from '@/lib/jobPhase'
 import { formatRelative } from '@/lib/dateFormat'
 
 /**
@@ -76,6 +76,28 @@ export function JobPhaseBanner({
       <div className="rounded-md border bg-muted/40 px-4 py-3 text-sm">
         <span className="font-medium">Processing</span> — all sources have finished downloading; filtering
         and deduplication are running.
+      </div>
+    )
+  }
+
+  // Default "actively working" case — the job is discovering/downloading
+  // and hasn't reached any of the phases above yet. This used to render
+  // nothing at all beyond the raw status badges, leaving a non-technical
+  // reader with no idea what's happening or what comes next.
+  if (job.status === 'discovering' || job.status === 'running') {
+    const overTarget = job.target_count != null && job.accepted_count > job.target_count
+    return (
+      <div className="rounded-md border bg-muted/40 px-4 py-3 text-sm">
+        <span className="font-medium">{describeSourceActivity(job.source_tasks)}.</span>{' '}
+        Next: once every source finishes, results are automatically filtered for relevance, checked for
+        duplicates, and compared against your target.
+        {overTarget && (
+          <>
+            {' '}
+            Already collected more than the target ({job.accepted_count} of {job.target_count}) — that&apos;s
+            expected; filtering trims it back down to the best matches afterward.
+          </>
+        )}
       </div>
     )
   }
