@@ -10,10 +10,13 @@ yes/no question.
 import pytest
 
 from app.filtering.query_expansion import (
+    content_terms,
     derive_classes,
     negative_prompts,
     normalize_query,
     positive_prompts,
+    query_subjects,
+    singularize,
     subject_phrase,
 )
 
@@ -62,6 +65,63 @@ class TestNormalizeQuery:
 
     def test_does_not_double_an_existing_article(self):
         assert normalize_query("a red car") == "a red car"
+
+
+class TestContentTerms:
+    def test_splits_compound_query_into_subject_words(self):
+        assert content_terms("car and person") == ["car", "person"]
+
+    def test_drops_medium_words_stopwords_connectives_and_short_tokens(self):
+        assert content_terms("weapon on movies scence") == ["weapon"]
+        assert content_terms("people with red bag") == ["people", "red", "bag"]
+        assert content_terms("a tv in an image") == []
+
+
+class TestQuerySubjects:
+    """A list-style query is several requests, not one impossible object.
+
+    On a real job, "cars person" was asked of the VLM verbatim ("Is cars person
+    clearly visible in this image?") and 0 of 45 frames that plainly contained
+    cars and pedestrians were accepted.
+    """
+
+    def test_explicit_list_is_split(self):
+        assert query_subjects("car and person") == ["a car", "a person"]
+        assert query_subjects("car, person and truck") == ["a car", "a person", "a truck"]
+        assert query_subjects("apple or orange") == ["an apple", "an orange"]
+
+    def test_bare_run_of_known_nouns_is_a_list(self):
+        assert query_subjects("cars person") == ["a car", "a person"]
+        assert query_subjects("chair table") == ["a chair", "a table"]
+
+    def test_single_subject_is_unchanged(self):
+        # Exactly what normalize_query has always produced.
+        for query in ("dog", "cars", "weapon on movies scence", "a car in a photo", "red bag"):
+            assert query_subjects(query) == [normalize_query(query)]
+
+    def test_adjective_noun_is_not_split(self):
+        assert query_subjects("red bag") == ["a red bag"]
+        assert query_subjects("police car") == ["police car"]
+
+    def test_relational_query_is_one_subject_even_with_and(self):
+        # "people with hats and bags" is a single request about people.
+        assert query_subjects("people with hats and bags") == [normalize_query("people with hats and bags")]
+        assert query_subjects("pedestrian wearing helmet") == [normalize_query("pedestrian wearing helmet")]
+        assert query_subjects("person with car") == [normalize_query("person with car")]
+
+    def test_duplicates_collapse(self):
+        assert query_subjects("car and cars") == [normalize_query("car and cars")]
+
+
+class TestSingularize:
+    def test_plurals_and_irregulars(self):
+        assert singularize("cars") == "car"
+        assert singularize("people") == "person"
+        assert singularize("buses") == "bus"
+
+    def test_words_ending_in_s_are_left_alone(self):
+        for word in ("bus", "glass", "dress", "debris"):
+            assert singularize(word) == word
 
 
 class TestDeriveClasses:

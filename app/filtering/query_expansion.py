@@ -87,6 +87,30 @@ _CONNECTIVES = {"with", "wearing", "holding", "without", "on", "in", "near", "ne
 
 _PLURAL_EXCEPTIONS = {"people", "men", "women", "children", "police"}
 
+_IRREGULAR_PLURALS = {
+    "people": "person",
+    "men": "man",
+    "women": "woman",
+    "children": "child",
+    "buses": "bus",
+}
+
+# Endings where a trailing "s" is part of the word, not a plural marker.
+_KEEP_S_SUFFIXES = ("ss", "us", "is")
+
+# Words that mark a relation between things rather than a list of them.
+# "people with hats and bags" is one subject; "car and person" is two.
+_RELATIONAL_WORDS = {"with", "wearing", "holding", "without", "on", "in", "near", "next"}
+
+# Concrete single-word nouns the static map already knows -- the vocabulary
+# used to decide that "cars person" is a list of two things rather than an
+# adjective and a noun ("red bag").
+_KNOWN_NOUNS = frozenset(
+    word for key, values in _CATEGORY_EXPANSIONS.items() for word in (key, *values) if " " not in word
+)
+
+_LIST_SEPARATORS = re.compile(r"\s*(?:[,;&+/]|\band\b|\bor\b)\s*")
+
 # Prompt ensemble. CLIP's raw cosine similarities sit in a narrow band
 # (~0.20-0.26 on real data), so a single template's absolute score is not a
 # usable threshold. Averaging several phrasings is the standard way to get a
@@ -120,6 +144,22 @@ _NEGATIVE_PROMPTS = (
 
 def _tokens(query: str) -> list[str]:
     return re.findall(r"[a-z]+", query.lower())
+
+
+def singularize(term: str) -> str:
+    """Light plural stripping: cars -> car, buses -> bus, people -> person.
+
+    Deliberately conservative -- this only has to make plural queries hit a
+    singular vocabulary, not be a stemmer. Words that merely end in "s"
+    ("bus", "glass", "dress", "debris") are left alone.
+    """
+    if term in _IRREGULAR_PLURALS:
+        return _IRREGULAR_PLURALS[term]
+    if len(term) <= 3 or not term.endswith("s") or term.endswith(_KEEP_S_SUFFIXES):
+        return term
+    if term.endswith(("sses", "shes", "ches", "xes")):
+        return term[:-2]
+    return term[:-1]
 
 
 def subject_phrase(query: str) -> str:
@@ -182,6 +222,60 @@ def normalize_query(query: str) -> str:
     return f"a {phrase}" if _needs_article(phrase) else phrase
 
 
+def content_terms(query: str) -> list[str]:
+    """The individual subject words of a query, in order.
+
+    Context words ("scene", "video"), stopwords and connectives ("and", "with")
+    are dropped, so "car and person" -> ["car", "person"]. Connectives are
+    excluded here even though subject_phrase keeps them: "wearing" belongs in
+    the phrase handed to a language model, but as a standalone detector class
+    or dataset-category term it is meaningless and only dilutes the list.
+    """
+    return [
+        w
+        for w in _tokens(query)
+        if w not in _CONTEXT_WORDS and w not in _STOPWORDS and w not in _CONNECTIVES and len(w) > 2
+    ]
+
+
+def query_subjects(query: str) -> list[str]:
+    """The separate things a query asks for, each as a phrase for a VQA question.
+
+    "car and person" is a request for two classes, and an image is relevant if
+    it shows either one. Asking the VLM "Is car and person clearly visible?", or
+    worse "Is cars person clearly visible?" for the query "cars person", makes
+    it look for one thing that is both -- on 45 real nuImages frames that got 0
+    yes, while the same frames answered yes to "a car" 12 times.
+
+    A query is split into several subjects only when it is unambiguously a list:
+      * explicit separators ("and", "or", ",", "&", "/"), or
+      * bare words that are all concrete nouns the static map knows
+        ("cars person" -> car, person), never an adjective + noun ("red bag").
+    A query with a relational word ("people with hats and bags", "pedestrian
+    wearing helmet") is one subject and is returned exactly as normalize_query
+    has always produced it.
+    """
+    single = [normalize_query(query)]
+    if any(word in _RELATIONAL_WORDS for word in _tokens(query)):
+        return single
+
+    subjects: list[str] = []
+    for segment in _LIST_SEPARATORS.split(query.lower()):
+        terms = content_terms(segment)
+        if not terms:
+            continue
+        if all(singularize(t) in _KNOWN_NOUNS for t in terms):
+            # One concrete noun per subject, in the singular the VLM handles best.
+            for term in terms:
+                noun = singularize(term)
+                subjects.append(f"{'an' if noun[0] in 'aeiou' else 'a'} {noun}")
+        else:
+            subjects.append(normalize_query(segment))
+
+    unique = list(dict.fromkeys(s for s in subjects if s))
+    return unique if len(unique) > 1 else single
+
+
 def derive_classes(query: str, overrides: list[str] | None = None) -> list[str]:
     """Concrete, detectable nouns for this query.
 
@@ -191,14 +285,7 @@ def derive_classes(query: str, overrides: list[str] | None = None) -> list[str]:
     if overrides:
         return [c.strip() for c in overrides if c and c.strip()]
 
-    # Connectives are excluded here even though subject_phrase keeps them:
-    # "wearing" belongs in the phrase handed to a language model, but as a
-    # standalone detector class it is meaningless and only dilutes the list.
-    words = [
-        w
-        for w in _tokens(query)
-        if w not in _CONTEXT_WORDS and w not in _STOPWORDS and w not in _CONNECTIVES and len(w) > 2
-    ]
+    words = content_terms(query)
 
     classes: list[str] = []
     for word in words:
