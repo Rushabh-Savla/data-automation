@@ -58,10 +58,18 @@ class Settings(BaseSettings):
     # heartbeat of its own (it is not a JobSourceTask), so
     # watchdog_stall_threshold_s above cannot see it — a job in that state
     # used to sit in `running` indefinitely with nothing able to re-drive
-    # it. Longer than the task threshold because a single legitimate
-    # filtering batch can run for tens of minutes, and re-driving a pass
-    # that is merely slow would waste inference.
-    filtering_stall_threshold_s: int = 1800
+    # it. 10 minutes: a healthy batch of 50 takes ~11s on the GPU and bumps the
+    # job's updated_at as it finishes, so ten idle minutes with every source
+    # terminal is a dead chain, not a slow one. It was 30 (from when a CPU-only batch
+    # could take ~55 min), and a COCO job idled the whole 30 after a restart with all
+    # 1507 images already judged. Re-driving a pass that is merely slow is safe and
+    # only wastes some inference.
+    filtering_stall_threshold_s: int = 600
+    # After a restart, work last seen before the latest worker boot is resumed
+    # once this long has passed (app/domain/recovery.py), instead of waiting out
+    # the two thresholds above. Must exceed the heartbeat interval (60s) so work
+    # on a worker that was not restarted has time to heartbeat again first.
+    watchdog_restart_grace_s: int = 120
 
     # yt-dlp's extract_info() is a single blocking call with no timeout of
     # its own — a connection that stalls after the handshake (accepted but

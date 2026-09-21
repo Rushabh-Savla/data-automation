@@ -143,6 +143,16 @@ def run_relevance_filter(self, job_id: str):
         candidate_ids = asset_repo.list_ids_for_job(job_uuid, status=AssetStatus.PROMOTED, limit=100_000)
         batch_size = job.config.get("relevance_filter_batch_size", _DEFAULT_RELEVANCE_BATCH_SIZE)
 
+    redis_client = get_redis()
+    # Clear any guard left behind by a previous pass, otherwise a re-drive
+    # would arm the barrier and then have its finalize suppressed. This has to
+    # happen before the no-candidates early return below as well: a top-up
+    # round that fetches nothing new (the supply is dry) lands there straight
+    # after the previous round's finalize set the guard, and without the clear
+    # its finalize was swallowed as a "duplicate". Nothing then ended the job
+    # until the watchdog re-drove it filtering_stall_threshold_s (30 min) later.
+    redis_client.delete(_FINALIZE_GUARD_KEY.format(job_id=job_id))
+
     if not candidate_ids:
         # Nothing left to classify — still go through finalize so a job whose
         # assets were all filtered by a previous (crashed) pass reaches dedup
@@ -152,10 +162,6 @@ def run_relevance_filter(self, job_id: str):
 
     batches = _chunk([str(asset_id) for asset_id in candidate_ids], batch_size)
 
-    redis_client = get_redis()
-    # Clear any guard left behind by a previous pass, otherwise a re-drive
-    # would arm the barrier and then have its finalize suppressed.
-    redis_client.delete(_FINALIZE_GUARD_KEY.format(job_id=job_id))
     FanIn(redis_client).start(job_id, _FANIN_NAME, len(batches))
 
     # Publish the denominator up front so the UI can render real filtering
@@ -220,7 +226,9 @@ def _classify_batch(
     if not items:
         return []
 
-    question_subject = query_expansion.normalize_query(job_query)
+    # "car and person" is a request for either class, not for one thing that is
+    # both -- see query_expansion.query_subjects. Most queries are a single subject.
+    subjects = query_expansion.query_subjects(job_query)
 
     try:
         verifier = VisualVerifier()
@@ -231,7 +239,7 @@ def _classify_batch(
         logger.exception(f"Relevance model unavailable; deferring {len(items)} asset(s)")
         return [(asset_id, _ERROR, None) for asset_id, _ in items]
 
-    verdicts = verifier.verify_batch([path for _, path in items], question_subject)
+    verdicts = verifier.verify_batch_any([path for _, path in items], subjects)
 
     decisions: list[tuple[str, str, float | None]] = []
     for (asset_id, _path), verdict in zip(items, verdicts):
@@ -244,7 +252,7 @@ def _classify_batch(
 
     accepted = sum(1 for _, o, _ in decisions if o == _ACCEPT)
     logger.info(
-        f"Relevance ({question_subject!r}): {accepted}/{len(decisions)} accepted"
+        f"Relevance ({subjects!r}): {accepted}/{len(decisions)} accepted"
     )
     return decisions
 
@@ -303,6 +311,21 @@ def rerun_relevance_filter(self, job_id: str, include_rejected: bool = False):
     redis_client.delete(f"job:{job_id}:filtering_dispatched")
 
     run_relevance_filter.delay(job_id)
+
+
+def _all_assets_judged(job_id: str) -> bool:
+    """True when no asset of the job is still waiting for a relevance verdict.
+
+    Never raises: it runs in the `finally` of relevance_filter_batch, which must always
+    reach the FanIn decrement's continuation. If the database cannot be read it says no,
+    which leaves the decision to the counter exactly as before.
+    """
+    try:
+        with session_scope() as db:
+            return AssetRepository(db).count_for_job(uuid.UUID(job_id), status=AssetStatus.PROMOTED) == 0
+    except Exception:
+        logger.exception(f"Could not check whether job {job_id} is fully judged")
+        return False
 
 
 @celery_app.task(name="app.tasks.filtering_tasks.relevance_filter_batch", bind=True)
@@ -407,7 +430,14 @@ def relevance_filter_batch(self, job_id: str, asset_ids: list[str]) -> dict:
             job_id,
             {"type": "relevance_filter_progress", "passed": passed, "rejected": rejected},
         )
-        if FanIn(get_redis()).finish(job_id, _FANIN_NAME) <= 0:
+        last_batch_out = FanIn(get_redis()).finish(job_id, _FANIN_NAME) <= 0
+        # Also hand on when nothing is left awaiting a verdict, even if the counter is not at
+        # zero. A restart kills batches in flight; Celery re-delivers enough of them that every
+        # asset does get judged, but the killed ones never decremented, so the counter never
+        # reached zero and the job sat idle until the watchdog's timer ended it (a COCO job:
+        # all 1507 images judged at 12:17, completed at 12:48). Finalize is guarded against
+        # running twice, so an extra trigger is harmless.
+        if last_batch_out or _all_assets_judged(job_id):
             finalize_relevance_filter.delay(job_id)
 
     if errored:

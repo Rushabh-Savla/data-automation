@@ -122,3 +122,192 @@ class TestBatchFailureDoesNotStrandTheJob:
         assert calls == []
         self._run_failing_batch(monkeypatch, fake, calls, "job-1", ["b"])
         assert calls == ["job-1"]
+
+
+class TestEmptyTopupRoundStillEndsTheJob:
+    """A top-up round that fetches nothing new must still reach completion.
+
+    Seen on a SUN RGB-D job: every matching image was already collected, so
+    round 2 downloaded nothing and run_relevance_filter found no PROMOTED
+    assets. It went straight to finalize -- but round 1's finalize guard (5 min
+    TTL) was still set, so finalize was skipped as a duplicate and the job sat
+    in `running` for the watchdog's 30 minutes before failing.
+    """
+
+    @staticmethod
+    def _run(monkeypatch, fake_redis, finalize_calls, candidate_ids):
+        import contextlib
+
+        import app.tasks.filtering_tasks as ft
+
+        class _CapturingFinalize:
+            def delay(self, jid):
+                finalize_calls.append(jid)
+
+        class _Job:
+            def __init__(self):
+                self.config = {}
+
+        class _Jobs:
+            def __init__(self, db):
+                pass
+
+            def get(self, job_uuid):
+                return _Job()
+
+        class _Assets:
+            def __init__(self, db):
+                pass
+
+            def list_ids_for_job(self, *args, **kwargs):
+                return candidate_ids
+
+        monkeypatch.setattr(ft, "get_redis", lambda: fake_redis)
+        monkeypatch.setattr(ft, "finalize_relevance_filter", _CapturingFinalize())
+        monkeypatch.setattr(ft, "session_scope", lambda: contextlib.nullcontext(object()))
+        monkeypatch.setattr(ft, "JobRepository", _Jobs)
+        monkeypatch.setattr(ft, "AssetRepository", _Assets)
+        ft.run_relevance_filter.run("11111111-1111-1111-1111-111111111111")
+
+    def test_no_new_assets_clears_the_previous_rounds_finalize_guard(self, monkeypatch):
+        import app.tasks.filtering_tasks as ft
+
+        job_id = "11111111-1111-1111-1111-111111111111"
+        fake = _FakeRedis()
+        # Round 1's finalize has just run and left its guard behind.
+        fake.set(ft._FINALIZE_GUARD_KEY.format(job_id=job_id), "1", ex=300)
+        calls: list[str] = []
+
+        self._run(monkeypatch, fake, calls, candidate_ids=[])
+
+        assert calls == [job_id]  # finalize dispatched ...
+        assert ft._FINALIZE_GUARD_KEY.format(job_id=job_id) not in fake.store  # ... and not blocked by the stale guard
+
+    def test_finalize_actually_runs_after_an_empty_round(self, monkeypatch):
+        import app.tasks.filtering_tasks as ft
+
+        job_id = "11111111-1111-1111-1111-111111111111"
+        fake = _FakeRedis()
+        fake.set(ft._FINALIZE_GUARD_KEY.format(job_id=job_id), "1", ex=300)
+
+        self._run(monkeypatch, fake, [], candidate_ids=[])
+
+        # The guard finalize itself takes must now be free to acquire.
+        assert fake.set(ft._FINALIZE_GUARD_KEY.format(job_id=job_id), "1", nx=True, ex=300) is True
+
+    def test_a_round_with_assets_still_clears_the_guard_and_arms_the_barrier(self, monkeypatch):
+        import app.tasks.filtering_tasks as ft
+
+        job_id = "11111111-1111-1111-1111-111111111111"
+        fake = _FakeRedis()
+        fake.set(ft._FINALIZE_GUARD_KEY.format(job_id=job_id), "1", ex=300)
+        dispatched = []
+
+        class _Batch:
+            def delay(self, *args):
+                dispatched.append(args)
+
+        monkeypatch.setattr(ft, "relevance_filter_batch", _Batch())
+        monkeypatch.setattr(ft, "ProgressPublisher", lambda r: type("P", (), {"publish": lambda *a, **k: None})())
+        calls: list[str] = []
+
+        self._run(monkeypatch, fake, calls, candidate_ids=["a", "b"])
+
+        assert ft._FINALIZE_GUARD_KEY.format(job_id=job_id) not in fake.store
+        assert calls == []  # finalize is left to the last batch
+        assert dispatched  # the batches went out
+
+
+class TestFinalizeWhenEverythingIsJudged:
+    """A restart killed filter batches mid-flight. Celery re-delivered enough of them that
+    all 1507 images were judged by 12:17, but the killed batches never decremented the
+    FanIn counter, so it never reached zero and the job idled until the watchdog's 30
+    minute timer (12:47). Finalize must not depend on the counter alone."""
+
+    @staticmethod
+    def _run_batch(monkeypatch, counter_left, all_judged):
+        import app.tasks.filtering_tasks as ft
+
+        finalize_calls = []
+
+        class _CapturingFinalize:
+            def delay(self, jid):
+                finalize_calls.append(jid)
+
+        class _FakeFanIn:
+            def __init__(self, redis):
+                pass
+
+            def finish(self, job_id, name):
+                return counter_left
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError("simulated failure inside the batch body")
+
+        monkeypatch.setattr(ft, "get_redis", lambda: _FakeRedis())
+        monkeypatch.setattr(ft, "FanIn", _FakeFanIn)
+        monkeypatch.setattr(ft, "finalize_relevance_filter", _CapturingFinalize())
+        monkeypatch.setattr(ft, "session_scope", _boom)
+        monkeypatch.setattr(ft, "_all_assets_judged", lambda job_id: all_judged)
+        monkeypatch.setattr(ft, "ProgressPublisher", lambda r: type("P", (), {"publish": lambda *a, **k: None})())
+        ft.relevance_filter_batch.run("job-1", ["a"])
+        return finalize_calls
+
+    def test_finalizes_when_nothing_is_left_even_though_the_counter_is_not_zero(self, monkeypatch):
+        assert self._run_batch(monkeypatch, counter_left=2, all_judged=True) == ["job-1"]
+
+    def test_does_not_finalize_while_assets_still_await_a_verdict(self, monkeypatch):
+        assert self._run_batch(monkeypatch, counter_left=2, all_judged=False) == []
+
+    def test_still_finalizes_when_the_counter_reaches_zero(self, monkeypatch):
+        assert self._run_batch(monkeypatch, counter_left=0, all_judged=False) == ["job-1"]
+
+    def test_a_counter_gone_negative_by_redelivery_still_finalizes(self, monkeypatch):
+        assert self._run_batch(monkeypatch, counter_left=-3, all_judged=False) == ["job-1"]
+
+
+class TestAllAssetsJudged:
+    def _patch(self, monkeypatch, promoted_left=None, raises=False):
+        import contextlib
+
+        import app.tasks.filtering_tasks as ft
+
+        class _Assets:
+            def __init__(self, db):
+                pass
+
+            def count_for_job(self, job_uuid, status=None, **kwargs):
+                assert status == ft.AssetStatus.PROMOTED
+                return promoted_left
+
+        def scope():
+            if raises:
+                raise RuntimeError("database down")
+            return contextlib.nullcontext(object())
+
+        monkeypatch.setattr(ft, "AssetRepository", _Assets)
+        monkeypatch.setattr(ft, "session_scope", scope)
+        return ft
+
+    def test_true_when_no_asset_is_still_promoted(self, monkeypatch):
+        ft = self._patch(monkeypatch, promoted_left=0)
+
+        assert ft._all_assets_judged("11111111-1111-1111-1111-111111111111") is True
+
+    def test_false_while_some_asset_is_still_promoted(self, monkeypatch):
+        ft = self._patch(monkeypatch, promoted_left=3)
+
+        assert ft._all_assets_judged("11111111-1111-1111-1111-111111111111") is False
+
+    def test_a_database_error_says_no_rather_than_raising(self, monkeypatch):
+        # It runs in a `finally`, which must always reach the counter's continuation.
+        ft = self._patch(monkeypatch, raises=True)
+
+        assert ft._all_assets_judged("11111111-1111-1111-1111-111111111111") is False
+
+
+class TestFilteringIdleThreshold:
+    def test_a_dead_chain_is_re_driven_within_ten_minutes_not_thirty(self):
+        from app.core.config import Settings
+
+        assert Settings().filtering_stall_threshold_s <= 600

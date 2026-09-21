@@ -124,6 +124,39 @@ class VisualVerifier:
         """
         return self.verify_batch([image_path], query)[0] is True
 
+    def verify_batch_any(self, image_paths: list[Path], subjects: list[str]) -> list[bool | None]:
+        """Per-image verdicts for a query with several subjects: True when ANY is clearly visible.
+
+        A query like "car and person" asks for either class, so each subject is
+        put to the model as its own question -- the single-subject question is
+        what was measured to work. An image stops being asked about once one
+        subject is a yes, so the extra cost falls only on images that fail the
+        first.
+
+        The None/False distinction is preserved: an image is None (undecided,
+        file kept) unless some subject said yes, or every subject was decided as
+        no, because a rejection deletes the file.
+        """
+        verdicts: list[bool] = [False] * len(image_paths)
+        undecided: set[int] = set()
+        pending = list(range(len(image_paths)))
+
+        for subject in subjects:
+            if not pending:
+                break
+            answers = self.verify_batch([image_paths[i] for i in pending], subject)
+            still_pending = []
+            for index, answer in zip(pending, answers):
+                if answer is True:
+                    verdicts[index] = True
+                    continue
+                if answer is None:
+                    undecided.add(index)
+                still_pending.append(index)
+            pending = still_pending
+
+        return [True if verdicts[i] else (None if i in undecided else False) for i in range(len(image_paths))]
+
     def verify_batch(self, image_paths: list[Path], query: str) -> list[bool | None]:
         """Per-image verdicts: True, False, or None when it could not be decided.
 
