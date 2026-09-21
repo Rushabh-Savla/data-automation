@@ -7,10 +7,11 @@ DAVIS has no vocabulary of "dog"/"car"/"person" to match a query against.
 
 Two deliberate, flagged compromises to fit this platform's bbox-only
 detection pipeline (AnnotationFormat has no segmentation-mask representation):
-  1. Query matching happens against DAVIS's ~60 video *sequence names*
-     (e.g. "dog", "car-roundabout", "boat") via plain substring — the only
-     content-descriptive strings DAVIS ships, an imperfect proxy for a real
-     class vocabulary.
+  1. Query matching happens against DAVIS's video *sequence names* (90 in
+     the trainval split, e.g. "dog", "car-roundabout", "boat") per query term,
+     plus a small hand-checked class->sequence map for classes the names never
+     mention (e.g. "person") — the only content-descriptive strings DAVIS
+     ships, an imperfect proxy for a real class vocabulary.
   2. Each object's bounding box is derived from its segmentation mask's
      bounding rectangle (a standard, lossy but common mask->bbox reduction)
      and labeled with its *sequence* name, since individual objects within
@@ -18,22 +19,23 @@ detection pipeline (AnnotationFormat has no segmentation-mask representation):
 """
 
 import logging
+import re
 import zipfile
 from collections.abc import Iterator
 from pathlib import Path
 
-import requests
-
 from app.connectors.base import (
-    HTTP_HEADERS,
     DiscoveryPage,
     OnProgressFn,
     RawAssetDraft,
     ShouldStopFn,
     SourceItem,
-    download_with_retry,
+    ensure_archive,
+    exclusive_cache_lock,
+    extract_into_cache,
     register_connector,
 )
+from app.connectors.query_terms import expand_terms, singularize
 from app.core.config import get_settings
 from app.core.exceptions import FatalConnectorError, JobStopped, TransientConnectorError
 from app.domain.enums import SourceType
@@ -55,34 +57,83 @@ def _cache_dir() -> Path:
 
 def _ensure_dataset_cached() -> Path:
     """Downloads+extracts the DAVIS 2017 trainval-480p zip once (~830MB) and
-    returns the extracted DAVIS/ directory."""
+    returns the extracted DAVIS/ directory.
+
+    discover() and every download shard call this concurrently, so the
+    download/extract runs under an exclusive lock (see exclusive_cache_lock)."""
     cache_dir = _cache_dir()
     cache_dir.mkdir(parents=True, exist_ok=True)
     davis_dir = cache_dir / "DAVIS"
     if davis_dir.exists():
         return davis_dir
 
-    zip_path = cache_dir / "DAVIS-2017-trainval-480p.zip"
-    if not zip_path.exists():
-        logger.info(f"Downloading DAVIS 2017 trainval-480p ({_ARCHIVE_URL})")
-        tmp_path = zip_path.with_suffix(".zip.tmp")
-        try:
-            download_with_retry(_ARCHIVE_URL, tmp_path, timeout=300, headers=HTTP_HEADERS)
-        except requests.HTTPError as e:
-            raise FatalConnectorError(f"DAVIS archive not accessible: {e}") from e
-        tmp_path.replace(zip_path)
+    with exclusive_cache_lock(cache_dir / ".dataset.lock"):
+        if davis_dir.exists():
+            return davis_dir
 
-    with zipfile.ZipFile(zip_path) as zf:
-        zf.extractall(cache_dir)
+        zip_path = cache_dir / "DAVIS-2017-trainval-480p.zip"
+        ensure_archive(
+            _ARCHIVE_URL, zip_path, label="DAVIS 2017 trainval-480p", timeout=300, validate=zipfile.is_zipfile
+        )
+        extract_into_cache(zip_path, cache_dir, sentinel="DAVIS")
 
     return davis_dir
 
 
+# DAVIS sequences carry no class labels, so a query for a class ("person") can
+# only be answered from what the sequences visibly contain. These lists were
+# checked against the actual frames -- name alone is not enough ("libby" is a
+# dog, "color-run" is a blur of hands) -- and kept conservative: only sequences
+# where the class is the clear subject. Names missing from the cache are
+# skipped, so this stays harmless if the dataset version changes.
+_PERSON_SEQUENCES = (
+    "boxing-fisheye", "breakdance", "breakdance-flare", "cat-girl", "crossing", "dance-jump",
+    "dance-twirl", "dancing", "disc-jockey", "hike", "india", "judo", "kid-football", "lab-coat",
+    "lady-running", "lindy-hop", "loading", "lucia", "parkour", "schoolgirls", "stroller",
+    "swing", "tuk-tuk", "upside-down", "walking",
+)
+# Sequences named after a car are found by name token ("car-roundabout",
+# "classic-car"); these are the cars whose names don't say so.
+_CAR_SEQUENCES = ("drift-chicane", "drift-straight", "drift-turn", "night-race", "rallye")
+_OTHER_VEHICLE_SEQUENCES = ("bus", "motorbike", "tractor-sand", "train", "tuk-tuk")
+_CLASS_TO_SEQUENCES: dict[str, tuple[str, ...]] = {
+    "person": _PERSON_SEQUENCES,
+    "man": _PERSON_SEQUENCES,
+    "woman": _PERSON_SEQUENCES,
+    "human": _PERSON_SEQUENCES,
+    "pedestrian": _PERSON_SEQUENCES,
+    "car": _CAR_SEQUENCES,
+    "vehicle": _CAR_SEQUENCES + _OTHER_VEHICLE_SEQUENCES,
+}
+
+
 def _match_sequences(query: str, sequences: list[str]) -> set[str]:
-    """Substring match, either direction (query in name, or name in query)
-    — same convention as the other connectors added this session."""
+    """Sequences relevant to any term of the query.
+
+    The whole query is still tried as a substring in either direction (query in
+    name, or name in query) -- that is what "a dog running" -> "dog" relies on.
+    On top of that each subject term is matched separately ("car and person"
+    -> "car", "person") against the hyphen-separated tokens of every sequence
+    name, and against _CLASS_TO_SEQUENCES for classes DAVIS never names.
+
+    Activity words ("running", "dancing") are left to the whole-query test:
+    as separate terms they would match unrelated sequences, so "a dog running"
+    would also return "lady-running" and dilute the dog frames.
+    """
     keyword_lower = query.strip().lower()
-    return {s for s in sequences if keyword_lower in s.lower() or s.lower() in keyword_lower}
+    # A sequence name inside the query counts only as a whole word: "bus" is not in "business".
+    matched = {
+        s for s in sequences
+        if keyword_lower in s.lower() or re.search(rf"\b{re.escape(s.lower())}\b", keyword_lower)
+    }
+
+    available = set(sequences)
+    for term in expand_terms(query):
+        if term.endswith("ing") and len(term) > 5:
+            continue
+        matched |= {s for s in sequences if term in {singularize(t) for t in s.lower().split("-")}}
+        matched |= {s for s in _CLASS_TO_SEQUENCES.get(term, ()) if s in available}
+    return matched
 
 
 def _mask_to_boxes(mask_path: Path, sequence_name: str) -> list[BBox]:
@@ -123,6 +174,33 @@ def _evenly_sample(paths: list[Path], k: int) -> list[Path]:
     return [paths[int(i * stride)] for i in range(k)]
 
 
+def _sample_frames(davis_dir: Path, sequences, limit: int) -> list[dict]:
+    """Up to `limit` frames, spread evenly over `sequences` and across each one.
+
+    Evenly-spaced sampling per sequence, not the first N consecutive frames:
+    consecutive video frames are near-identical (same scene, a few pixels of motion
+    apart), so grabbing them in a single burst floods the job with near-duplicates
+    of one source before dedup ever runs (dedup only runs once every source in the
+    job is terminal -- see app/tasks/orchestration_tasks.py). Spreading the same
+    budget across the whole sequence gives real visual variety instead.
+    """
+    sequences = sorted(sequences)
+    if not sequences or limit <= 0:
+        return []
+    # limit // n each, with the remainder handed to the first few sequences: 3 frames over
+    # 2 sequences used to be 1 + 1, which under-filled the limit by the remainder.
+    base, extra = divmod(limit, len(sequences))
+    frames: list[dict] = []
+    for position, seq in enumerate(sequences):
+        per_sequence_limit = max(1, base + (1 if position < extra else 0))
+        frame_dir = davis_dir / "JPEGImages" / "480p" / seq
+        for frame_path in _evenly_sample(sorted(frame_dir.glob("*.jpg")), per_sequence_limit):
+            frames.append({"sequence": seq, "frame": frame_path.stem})
+        if len(frames) >= limit:
+            break
+    return frames[:limit]
+
+
 @register_connector(SourceType.DAVIS)
 class DavisConnector:
     def __init__(self, min_resolution: tuple[int, int] = (64, 64)):
@@ -148,48 +226,37 @@ class DavisConnector:
         if explicit_categories:
             wanted = {c.strip().lower() for c in explicit_categories if c.strip()}
             matched_sequences = {s for s in sequences if s.lower() in wanted}
+            if not matched_sequences:
+                return DiscoveryPage(
+                    items=[], next_cursor=None, exhausted=True,
+                    error_reason=f"No DAVIS video sequences named {explicit_categories!r}",
+                )
         else:
             matched_sequences = _match_sequences(query, sequences)
-        if not matched_sequences:
-            return DiscoveryPage(
-                items=[], next_cursor=None, exhausted=True,
-                error_reason=(
-                    f"No DAVIS video sequences matched query {query!r} — DAVIS has no "
-                    "semantic class vocabulary, only ~60 sequence names; use explicit "
-                    "category overrides with a sequence name"
-                ),
-            )
 
-        # Evenly-spaced sampling per matched sequence, not the first N
-        # consecutive frames: consecutive video frames are near-identical
-        # (same scene, a few pixels of motion apart), so grabbing them in a
-        # single burst floods the job with near-duplicates of one source
-        # before dedup ever runs (dedup only runs once every source in the
-        # job is terminal — see app/tasks/orchestration_tasks.py). Spreading
-        # the same budget across the whole sequence gives real visual
-        # variety instead.
-        per_sequence_limit = max(1, limit // len(matched_sequences))
-        frames: list[dict] = []
-        for seq in sorted(matched_sequences):
-            frame_dir = davis_dir / "JPEGImages" / "480p" / seq
-            all_frame_paths = sorted(frame_dir.glob("*.jpg"))
-            sampled = _evenly_sample(all_frame_paths, per_sequence_limit)
-            for frame_path in sampled:
-                frames.append({"sequence": seq, "frame": frame_path.stem})
-            if len(frames) >= limit:
-                break
-        if not frames:
+        labelled = _sample_frames(davis_dir, matched_sequences, limit)
+
+        # DAVIS has no class vocabulary, only ~90 sequence names, so most queries name
+        # none of them. Fill whatever the matched sequences cannot supply from every other
+        # sequence, and let the relevance filter decide (open_vocab.py). Not for explicit
+        # sequence overrides, which are an exact request.
+        scanned: list[dict] = []
+        if not explicit_categories and len(labelled) < limit:
+            others = [s for s in sequences if s not in matched_sequences]
+            scanned = _sample_frames(davis_dir, others, limit - len(labelled))
+
+        if not labelled and not scanned:
             return DiscoveryPage(items=[], next_cursor=None, exhausted=True)
 
-        shards = [frames[i : i + _SHARD_SIZE] for i in range(0, len(frames), _SHARD_SIZE)]
         items = [
             SourceItem(
                 source_type=SourceType.DAVIS,
-                external_ref={"frames": shard},
+                external_ref={"frames": batch[i : i + _SHARD_SIZE], "unlabelled": unlabelled},
                 license_hint=_LICENSE_NOTE,
                 dataset_identifier="davis-2017-trainval-480p",
             )
-            for shard in shards
+            for batch, unlabelled in ((labelled, False), (scanned, True))
+            for i in range(0, len(batch), _SHARD_SIZE)
         ]
         return DiscoveryPage(items=items, next_cursor=None, exhausted=True)
 
@@ -273,7 +340,7 @@ class DavisConnector:
                 width=w,
                 height=h,
                 classes=registry.names,
-                metadata={"davis_sequence": seq, "davis_frame": frame},
+                metadata={"matched_by": "vlm" if item.external_ref.get("unlabelled") else "label", "davis_sequence": seq, "davis_frame": frame},
             )
             on_progress({"checkpoint": {"index": i + 1}, "downloaded": 1})
             yield draft

@@ -784,7 +784,7 @@ def discover_davis(self, job_id: str, job_source_task_id: str):
 
     item_dicts = [
         {
-            "external_ref": {"frames": s.external_ref["frames"]},
+            "external_ref": {**s.external_ref},
             "license_hint": s.license_hint,
             "dataset_identifier": s.dataset_identifier,
         }
