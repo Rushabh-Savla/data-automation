@@ -908,6 +908,7 @@ def discover_nuscenes(self, job_id: str, job_source_task_id: str):
                 cursor=None,
                 limit=nu_config.get("max_samples", scale_for_topup(_default_image_limit(job.target_count), job, hard_max=50_000)),
                 explicit_categories=nu_config.get("categories"),
+                dataset=nu_config.get("dataset"),
             )
         shards = page.items
 
@@ -928,7 +929,7 @@ def discover_nuscenes(self, job_id: str, job_source_task_id: str):
 
     item_dicts = [
         {
-            "external_ref": {"sample_data_tokens": s.external_ref["sample_data_tokens"]},
+            "external_ref": {**s.external_ref},
             "license_hint": s.license_hint,
             "dataset_identifier": s.dataset_identifier,
         }
