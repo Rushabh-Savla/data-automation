@@ -22,6 +22,7 @@ from app.connectors.sun_rgbd_connector import SunRgbdConnector
 from app.connectors.visual_genome_connector import VisualGenomeConnector
 from app.connectors.web_connector import WebScrapeConnector
 from app.connectors.youtube_connector import YouTubeConnector
+from app.db.repositories.asset_repository import AssetRepository
 from app.db.repositories.credential_repository import CredentialRepository
 from app.db.repositories.job_source_task_repository import JobSourceTaskRepository
 from app.db.session import session_scope
@@ -95,6 +96,21 @@ def scale_for_topup(limit: int, job, *, hard_max: int) -> int:
     """
     return min(hard_max, limit * max(1, topup_round_number(job)))
 
+
+
+def topup_limit(limit: int, job, source_type: SourceType, *, already_seen: int, hard_max: int) -> int:
+    """A discovery limit that leaves room for the quota the planner set.
+
+    scale_for_topup only multiplies by the round number, which is a guess. The
+    planner has already worked out how many new assets this source should
+    fetch this round, and if discovery offers fewer new candidates than that
+    the round cannot deliver it. `already_seen` is what the job has fetched
+    before (every one of those is skipped as a duplicate), so the limit is that
+    plus the quota. It is an upper bound only: the job-wide target check still
+    stops the round once enough has been fetched.
+    """
+    quota = (((job.config or {}).get("_topup") or {}).get("quota") or {}).get(source_type.value, 0)
+    return min(hard_max, max(limit, already_seen + quota))
 
 
 @celery_app.task(name="app.tasks.discovery_tasks.discover_kaggle", bind=True)
@@ -466,15 +482,28 @@ def discover_coco(self, job_id: str, job_source_task_id: str):
         db.commit()
 
         coco_config = job.config.get("coco", {})
+        # train2017 is on by default: val2017 alone is 5,000 images (~535 with a car),
+        # a ceiling no real target fits under. Its annotations are read from a
+        # one-time SQLite index, not re-parsed per call, so the old cost objection
+        # is gone. `{"coco": {"allow_train2017": false}}` keeps a job to val2017.
         connector = CocoConnector(
             split=coco_config.get("split", "val2017"),
-            allow_train2017=coco_config.get("allow_train2017", False),
+            allow_train2017=coco_config.get("allow_train2017", True),
         )
         with heartbeat_during(task_uuid):
             page = connector.discover(
                 job.query,
                 cursor=None,
-                limit=coco_config.get("max_images", scale_for_topup(_default_image_limit(job.target_count), job, hard_max=50_000)),
+                limit=coco_config.get(
+                    "max_images",
+                    topup_limit(
+                        scale_for_topup(_default_image_limit(job.target_count), job, hard_max=50_000),
+                        job,
+                        SourceType.COCO,
+                        already_seen=AssetRepository(db).count_for_job(job_uuid),
+                        hard_max=50_000,
+                    ),
+                ),
                 explicit_categories=coco_config.get("categories"),
             )
         shards = page.items
@@ -496,7 +525,7 @@ def discover_coco(self, job_id: str, job_source_task_id: str):
 
     item_dicts = [
         {
-            "external_ref": {"image_ids": s.external_ref["image_ids"], "split": s.external_ref["split"]},
+            "external_ref": {**s.external_ref},
             "license_hint": None,
             "dataset_identifier": s.dataset_identifier,
         }
@@ -640,7 +669,7 @@ def discover_pascal_voc(self, job_id: str, job_source_task_id: str):
 
     item_dicts = [
         {
-            "external_ref": {"image_ids": s.external_ref["image_ids"]},
+            "external_ref": {**s.external_ref},
             "license_hint": s.license_hint,
             "dataset_identifier": s.dataset_identifier,
         }
@@ -834,7 +863,16 @@ def discover_sun_rgbd(self, job_id: str, job_source_task_id: str):
             page = connector.discover(
                 job.query,
                 cursor=None,
-                limit=sun_config.get("max_images", scale_for_topup(_default_image_limit(job.target_count), job, hard_max=50_000)),
+                limit=sun_config.get(
+                    "max_images",
+                    topup_limit(
+                        scale_for_topup(_default_image_limit(job.target_count), job, hard_max=50_000),
+                        job,
+                        SourceType.SUN_RGBD,
+                        already_seen=AssetRepository(db).count_for_job(job_uuid),
+                        hard_max=50_000,
+                    ),
+                ),
                 explicit_categories=sun_config.get("categories"),
             )
         shards = page.items
@@ -856,7 +894,7 @@ def discover_sun_rgbd(self, job_id: str, job_source_task_id: str):
 
     item_dicts = [
         {
-            "external_ref": {"record_indices": s.external_ref["record_indices"]},
+            "external_ref": {**s.external_ref},
             "license_hint": s.license_hint,
             "dataset_identifier": s.dataset_identifier,
         }
@@ -1001,7 +1039,7 @@ def discover_kitti(self, job_id: str, job_source_task_id: str):
 
     item_dicts = [
         {
-            "external_ref": {"image_ids": s.external_ref["image_ids"]},
+            "external_ref": {**s.external_ref},
             "license_hint": s.license_hint,
             "dataset_identifier": s.dataset_identifier,
         }

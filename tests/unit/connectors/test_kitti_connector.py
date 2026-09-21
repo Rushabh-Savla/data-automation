@@ -46,14 +46,36 @@ class TestDiscover:
         image_ids = {iid for item in page.items for iid in item.external_ref["image_ids"]}
         assert image_ids == {"000001"}
 
-    def test_no_match_returns_error_reason(self, monkeypatch, tmp_path):
+    def test_a_query_no_class_names_scans_instead_of_failing(self, monkeypatch, tmp_path):
         cache_dir = _build_fake_cache(tmp_path)
         monkeypatch.setattr(kitti_mod, "_ensure_dataset_cached", lambda: cache_dir)
 
-        connector = KittiConnector()
-        page = connector.discover("xylophone", cursor=None, limit=200)
-        assert page.items == []
-        assert page.error_reason is not None
+        page = KittiConnector().discover("xylophone", cursor=None, limit=200)
+
+        assert page.error_reason is None
+        assert [i.external_ref["unlabelled"] for i in page.items] == [True]
+        assert {iid for i in page.items for iid in i.external_ref["image_ids"]} == {"000001"}
+
+    def test_explicit_classes_are_exact_and_never_scanned(self, monkeypatch, tmp_path):
+        cache_dir = _build_fake_cache(tmp_path)
+        monkeypatch.setattr(kitti_mod, "_ensure_dataset_cached", lambda: cache_dir)
+
+        page = KittiConnector().discover("anything", cursor=None, limit=200, explicit_categories=["Car"])
+
+        assert {i.external_ref["unlabelled"] for i in page.items} == {False}
+
+    def test_explicit_classes_that_match_nothing_still_report_it(self, monkeypatch, tmp_path):
+        cache_dir = _build_fake_cache(tmp_path)
+        monkeypatch.setattr(kitti_mod, "_ensure_dataset_cached", lambda: cache_dir)
+
+        page = KittiConnector().discover("anything", cursor=None, limit=200, explicit_categories=["Dragon"])
+
+        assert page.items == [] and "Dragon" in page.error_reason
+
+    def test_person_reaches_pedestrian(self, monkeypatch, tmp_path):
+        # KITTI calls people "Pedestrian"; "person" and "people" must find them.
+        assert {"Pedestrian"} <= kitti_mod.match_labels("people walking", kitti_mod._KITTI_CLASSES)
+        assert {"Pedestrian"} <= kitti_mod.match_labels("person", kitti_mod._KITTI_CLASSES)
 
 
 class TestFetch:

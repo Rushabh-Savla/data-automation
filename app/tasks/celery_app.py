@@ -2,8 +2,10 @@
 for the watchdog (stalled-task resume, scheduled-job kickoff, deadline sweep).
 """
 
+import logging
+
 from celery import Celery
-from celery.signals import task_postrun, task_prerun, worker_process_init
+from celery.signals import task_postrun, task_prerun, worker_process_init, worker_ready
 
 from app.core.config import get_settings
 from app.core.logging import configure_logging
@@ -69,6 +71,23 @@ celery_app.conf.update(
         },
     },
 )
+
+
+@worker_ready.connect
+def _record_boot_for_restart_recovery(**_):
+    """Note when this worker came up, so the watchdog can tell work a restart
+    orphaned from work that is merely slow (see app/domain/recovery.py).
+
+    Never allowed to stop a worker starting: without the marker recovery just
+    falls back to the watchdog's ordinary stall timers.
+    """
+    try:
+        from app.core.redis_client import get_redis
+        from app.services.worker_boot import record_worker_boot
+
+        record_worker_boot(get_redis())
+    except Exception:
+        logging.getLogger(__name__).exception("Could not record worker boot time")
 
 
 @worker_process_init.connect

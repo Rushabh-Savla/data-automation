@@ -30,6 +30,8 @@ from app.connectors.base import (
     download_with_retry,
     register_connector,
 )
+from app.connectors.open_vocab import scan_candidates
+from app.connectors.query_terms import match_labels
 from app.core.config import get_settings
 from app.core.exceptions import FatalConnectorError, JobStopped, TransientConnectorError
 from app.domain.enums import SourceType
@@ -78,13 +80,9 @@ def _ensure_dataset_cached() -> Path:
 
 
 def _match_classes(query: str) -> set[str]:
-    """Substring match (case-insensitive, prefer exact when multiple hit) —
-    ported from the reference script's PascalVOCScraper._matches_keyword()."""
-    keyword_lower = query.strip().lower()
-    matches = [c for c in _VOC_CLASSES if keyword_lower in c or c in keyword_lower]
-    if len(matches) > 1 and keyword_lower in matches:
-        matches = [keyword_lower]
-    return set(matches)
+    """The VOC classes the query is asking for (see query_terms.match_labels): per term,
+    with synonyms and plurals. Empty when it names none of the 20."""
+    return match_labels(query, _VOC_CLASSES)
 
 
 def _image_ids_for_classes(devkit_dir: Path, classes: set[str]) -> list[str]:
@@ -136,20 +134,25 @@ class PascalVocConnector:
         if explicit_categories:
             wanted = {c.strip().lower() for c in explicit_categories if c.strip()}
             matched = {c for c in _VOC_CLASSES if c in wanted}
+            if not matched:
+                return DiscoveryPage(
+                    items=[], next_cursor=None, exhausted=True,
+                    error_reason=f"No Pascal VOC categories matched {explicit_categories!r} — VOC has 20 classes",
+                )
         else:
             matched = _match_classes(query)
-        if not matched:
-            return DiscoveryPage(
-                items=[], next_cursor=None, exhausted=True,
-                error_reason=(
-                    f"No Pascal VOC categories matched query {query!r} — VOC's 20-class "
-                    "vocabulary is narrower than free text; use explicit category overrides"
-                ),
-            )
 
         try:
             devkit_dir = _ensure_dataset_cached()
-            image_ids = _image_ids_for_classes(devkit_dir, matched)[:limit]
+            labelled = _image_ids_for_classes(devkit_dir, matched) if matched else []
+            image_ids = labelled[:limit]
+            # VOC is 20 classes. When they cannot fill the limit -- or none names this query --
+            # fill the rest from every other image and let the relevance filter decide
+            # (open_vocab.py). Not for explicit class overrides, which are exact.
+            scan_ids: list[str] = []
+            if not explicit_categories and len(labelled) < limit:
+                everything = _image_ids_for_classes(devkit_dir, set(_VOC_CLASSES))
+                scan_ids = scan_candidates(everything, set(labelled), limit - len(labelled))
         except FatalConnectorError as e:
             return DiscoveryPage(items=[], next_cursor=None, exhausted=True, error_reason=str(e))
         except Exception as e:
@@ -159,18 +162,18 @@ class PascalVocConnector:
                 error_reason=f"Failed to download/index Pascal VOC 2012: {e}",
             )
 
-        if not image_ids:
+        if not image_ids and not scan_ids:
             return DiscoveryPage(items=[], next_cursor=None, exhausted=True)
 
-        shards = [image_ids[i : i + _SHARD_SIZE] for i in range(0, len(image_ids), _SHARD_SIZE)]
         items = [
             SourceItem(
                 source_type=SourceType.PASCAL_VOC,
-                external_ref={"image_ids": shard},
+                external_ref={"image_ids": batch[i : i + _SHARD_SIZE], "unlabelled": unlabelled},
                 license_hint=_LICENSE_NOTE,
                 dataset_identifier="pascal-voc2012",
             )
-            for shard in shards
+            for batch, unlabelled in ((image_ids, False), (scan_ids, True))
+            for i in range(0, len(batch), _SHARD_SIZE)
         ]
         return DiscoveryPage(items=items, next_cursor=None, exhausted=True)
 
@@ -239,7 +242,11 @@ class PascalVocConnector:
                 annotation_format="voc_xml",
                 width=w,
                 height=h,
-                metadata={"voc_image_id": image_id},
+                metadata={
+                    "voc_image_id": image_id,
+                    # "vlm": picked by the relevance model among images not labelled for this query.
+                    "matched_by": "vlm" if item.external_ref.get("unlabelled") else "label",
+                },
             )
             on_progress({"checkpoint": {"index": i + 1}, "downloaded": 1})
             yield draft

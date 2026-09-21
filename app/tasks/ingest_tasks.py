@@ -593,7 +593,15 @@ def download_sun_rgbd_shard(self, job_id: str, job_source_task_id: str, item_dic
     connector = SunRgbdConnector(min_resolution=min_res)
 
     def fetch(checkpoint, should_stop, on_progress):
-        yield from connector.fetch(item, workdir, checkpoint, should_stop, on_progress)
+        # The 6.9GB SUNRGBD.zip is fetched lazily, on the first shard's first
+        # image (discovery only needs the 4MB metadata file), so it is one
+        # long blocking call with no per-image heartbeat yet -- and the other
+        # shards sit waiting on the cache lock meanwhile. On a slow link that
+        # outlasts the watchdog's stall threshold, which then marks the source
+        # stalled and re-runs its discovery, queueing a second set of shards
+        # that block on the same lock.
+        with heartbeat_during(uuid.UUID(job_source_task_id)):
+            yield from connector.fetch(item, workdir, checkpoint, should_stop, on_progress)
 
     return _run_item_download(job_id, job_source_task_id, SourceType.SUN_RGBD, shard_id, fetch, bound_task=self)
 

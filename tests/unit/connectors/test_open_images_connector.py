@@ -59,16 +59,44 @@ class TestDiscover:
         connector = OpenImagesConnector()
         page = connector.discover("dog", cursor=None, limit=200)
 
-        image_ids = {iid for item in page.items for iid in item.external_ref["image_ids"]}
-        assert image_ids == {"img1"}
+        labelled = {iid for item in page.items if not item.external_ref["unlabelled"] for iid in item.external_ref["image_ids"]}
+        assert labelled == {"img1"}
         assert page.error_reason is None
 
-    def test_no_class_match_returns_error_reason(self, monkeypatch, tmp_path):
+    def test_a_query_no_class_names_scans_instead_of_failing(self, monkeypatch, tmp_path):
         _patch_cache(monkeypatch, tmp_path)
-        connector = OpenImagesConnector()
-        page = connector.discover("xylophone", cursor=None, limit=200)
-        assert page.items == []
-        assert page.error_reason is not None
+        page = OpenImagesConnector().discover("xylophone", cursor=None, limit=200)
+
+        assert page.error_reason is None
+        assert {i.external_ref["unlabelled"] for i in page.items} == {True}
+        assert {iid for i in page.items for iid in i.external_ref["image_ids"]}
+
+    def test_the_scan_never_repeats_a_labelled_image(self, monkeypatch, tmp_path):
+        _patch_cache(monkeypatch, tmp_path)
+        page = OpenImagesConnector().discover("dog", cursor=None, limit=200)
+
+        labelled = {iid for i in page.items if not i.external_ref["unlabelled"] for iid in i.external_ref["image_ids"]}
+        scanned = {iid for i in page.items if i.external_ref["unlabelled"] for iid in i.external_ref["image_ids"]}
+        assert labelled and labelled.isdisjoint(scanned)
+
+    def test_explicit_classes_are_exact_and_never_scanned(self, monkeypatch, tmp_path):
+        _patch_cache(monkeypatch, tmp_path)
+        page = OpenImagesConnector().discover("anything", cursor=None, limit=200, explicit_classes=["dog"])
+
+        assert {i.external_ref["unlabelled"] for i in page.items} == {False}
+
+    def test_explicit_classes_that_match_nothing_still_report_it(self, monkeypatch, tmp_path):
+        _patch_cache(monkeypatch, tmp_path)
+        page = OpenImagesConnector().discover("anything", cursor=None, limit=200, explicit_classes=["dragon"])
+
+        assert page.items == [] and "dragon" in page.error_reason
+
+    def test_synonyms_reach_the_class(self, monkeypatch, tmp_path):
+        _patch_cache(monkeypatch, tmp_path)
+        page = OpenImagesConnector().discover("puppy", cursor=None, limit=200)
+
+        labelled = {iid for i in page.items if not i.external_ref["unlabelled"] for iid in i.external_ref["image_ids"]}
+        assert labelled == {"img1"}  # puppy -> dog
 
 
 class _FakeResponse:

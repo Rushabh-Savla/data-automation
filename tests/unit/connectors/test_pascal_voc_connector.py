@@ -48,14 +48,46 @@ class TestDiscover:
         image_ids = {iid for item in page.items for iid in item.external_ref["image_ids"]}
         assert image_ids == {"000001"}  # 000002 excluded (flag -1 = absent)
 
-    def test_no_match_returns_error_reason(self, monkeypatch, tmp_path):
+    def test_a_query_no_class_names_scans_instead_of_failing(self, monkeypatch, tmp_path):
         devkit_dir = _build_fake_devkit_with_imagesets(tmp_path)
         monkeypatch.setattr(voc_mod, "_ensure_dataset_cached", lambda: devkit_dir)
 
-        connector = PascalVocConnector()
-        page = connector.discover("xylophone", cursor=None, limit=200)
-        assert page.items == []
-        assert page.error_reason is not None
+        page = PascalVocConnector().discover("xylophone", cursor=None, limit=200)
+
+        assert page.error_reason is None
+        assert {i.external_ref["unlabelled"] for i in page.items} == {True}
+        assert {iid for i in page.items for iid in i.external_ref["image_ids"]}
+
+    def test_the_scan_never_repeats_a_labelled_image(self, monkeypatch, tmp_path):
+        devkit_dir = _build_fake_devkit_with_imagesets(tmp_path)
+        monkeypatch.setattr(voc_mod, "_ensure_dataset_cached", lambda: devkit_dir)
+
+        page = PascalVocConnector().discover("dog", cursor=None, limit=200)
+
+        labelled = {iid for i in page.items if not i.external_ref["unlabelled"] for iid in i.external_ref["image_ids"]}
+        scanned = {iid for i in page.items if i.external_ref["unlabelled"] for iid in i.external_ref["image_ids"]}
+        assert labelled == {"000001"} and labelled.isdisjoint(scanned)
+
+    def test_explicit_classes_are_exact_and_never_scanned(self, monkeypatch, tmp_path):
+        devkit_dir = _build_fake_devkit_with_imagesets(tmp_path)
+        monkeypatch.setattr(voc_mod, "_ensure_dataset_cached", lambda: devkit_dir)
+
+        page = PascalVocConnector().discover("anything", cursor=None, limit=200, explicit_categories=["dog"])
+
+        assert {i.external_ref["unlabelled"] for i in page.items} == {False}
+
+    def test_explicit_classes_that_match_nothing_still_report_it(self, monkeypatch, tmp_path):
+        devkit_dir = _build_fake_devkit_with_imagesets(tmp_path)
+        monkeypatch.setattr(voc_mod, "_ensure_dataset_cached", lambda: devkit_dir)
+
+        page = PascalVocConnector().discover("anything", cursor=None, limit=200, explicit_categories=["dragon"])
+
+        assert page.items == [] and "dragon" in page.error_reason
+
+    def test_compound_class_names_are_reachable(self):
+        assert voc_mod._match_classes("a dining table") == {"diningtable"}
+        assert voc_mod._match_classes("potted plant") == {"pottedplant"}
+        assert voc_mod._match_classes("puppy") == {"dog"}
 
 
 class TestFetch:

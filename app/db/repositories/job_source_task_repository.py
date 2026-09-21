@@ -12,6 +12,7 @@ from app.domain.enums import (
     JobSourceTaskStatus,
     SourceType,
 )
+from app.domain.recovery import is_orphaned
 
 
 class JobSourceTaskRepository:
@@ -44,7 +45,9 @@ class JobSourceTaskRepository:
             return False
         return all(t.status in JOB_SOURCE_TASK_TERMINAL_STATUSES for t in tasks)
 
-    def list_stalled(self, stall_threshold_s: int, now: datetime | None = None) -> list[JobSourceTask]:
+    def list_stalled(
+        self, stall_threshold_s: int, now: datetime | None = None, *, orphan_cutoff: datetime | None = None
+    ) -> list[JobSourceTask]:
         # Excludes tasks whose parent Job already reached a terminal status
         # (cancelled/completed/failed) — otherwise a task that stalled right
         # before its job was cancelled sits in a non-terminal task status
@@ -68,7 +71,10 @@ class JobSourceTaskRepository:
         )
         stalled = []
         for t in self.db.execute(stmt).scalars().all():
-            if t.last_heartbeat_at is None or t.last_heartbeat_at.timestamp() < cutoff:
+            silent = t.last_heartbeat_at is None or t.last_heartbeat_at.timestamp() < cutoff
+            # Also stalled if it last heartbeat before the latest worker boot: the
+            # process that owned it died in the restart (see app/domain/recovery.py).
+            if silent or is_orphaned(t.last_heartbeat_at, orphan_cutoff):
                 stalled.append(t)
         return stalled
 

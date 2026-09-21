@@ -19,10 +19,12 @@ from app.db.repositories.job_source_task_repository import JobSourceTaskReposito
 from app.db.session import session_scope
 from app.domain.completion import JobCompletionEvaluator, JobSnapshot
 from app.domain.enums import AssetStatus, JobSourceTaskStatus, JobStatus, SourceType
+from app.domain.recovery import is_orphaned, orphan_cutoff
 from app.domain.state_machine import JobStateMachine
-from app.domain.topup import SourceState, TopupPlanner, TopupSnapshot
+from app.domain.topup import SourceState, TopupPlanner, TopupSnapshot, filtering_incomplete
 from app.services.cancellation_service import CancellationService
 from app.services.progress_service import ProgressPublisher
+from app.services.worker_boot import last_worker_boot
 from app.tasks.celery_app import celery_app
 
 logger = logging.getLogger(__name__)
@@ -205,6 +207,35 @@ def check_and_advance_job(job_id: str) -> None:
     run_relevance_filter.delay(job_id)
 
 
+# How long to wait before asking the relevance filter to try again, and how many
+# times: 30 x 2min is an hour of a model that will not load. After that the
+# watchdog's own re-drive (every filtering_stall_threshold_s) keeps the job alive.
+_REFILTER_DELAY_S = 120
+_REFILTER_MAX_ATTEMPTS = 30
+
+
+def _defer_until_filtered(job_id: str, undecided: int, total: int) -> None:
+    """Retries the relevance filter shortly instead of planning from a filter that failed."""
+    redis_client = get_redis()
+    key = f"job:{job_id}:refilter_attempts"
+    attempts = int(redis_client.incr(key))
+    redis_client.expire(key, 6 * 3600)
+    if attempts > _REFILTER_MAX_ATTEMPTS:
+        logger.error(
+            f"Top-up for job {job_id}: {undecided}/{total} asset(s) still undecided after "
+            f"{_REFILTER_MAX_ATTEMPTS} filtering retries; leaving it to the watchdog"
+        )
+        return
+    logger.warning(
+        f"Top-up for job {job_id}: {undecided}/{total} asset(s) could not be judged by the "
+        f"relevance filter (model unavailable?); retrying it in {_REFILTER_DELAY_S}s "
+        f"(attempt {attempts}/{_REFILTER_MAX_ATTEMPTS}) instead of planning another round"
+    )
+    from app.tasks.filtering_tasks import run_relevance_filter
+
+    run_relevance_filter.apply_async(args=[job_id], countdown=_REFILTER_DELAY_S)
+
+
 @celery_app.task(name="app.tasks.orchestration_tasks.plan_topup_round", bind=True)
 def plan_topup_round(self, job_id: str):
     """Decides whether to fetch more data, or to finish the job.
@@ -246,13 +277,25 @@ def plan_topup_round(self, job_id: str):
             topup_state = (job.config or {}).get("_topup") or {}
             round_number = int(topup_state.get("round", 1))
             previous_accepted = topup_state.get("accepted_after_last_round")
+            previous_promoted = topup_state.get("promoted_after_last_round")
 
             # Post-filter survivors, deliberately not job.accepted_count: that
             # column is incremented optimistically at promotion time and only
             # corrected once filtering has run. Sizing a round off it would
             # repeat the original mistake of reacting to a pre-filter number.
             accepted = asset_repo.count_for_job(job_uuid, status=AssetStatus.RELEVANCE_PASSED)
-            promoted_total = asset_repo.count_for_job(job_uuid)
+            total_assets = asset_repo.count_for_job(job_uuid)
+            # Assets the filter could not decide are still PROMOTED. Counting them as
+            # rejections read a filter outage as a 2% yield (see filtering_incomplete).
+            undecided = asset_repo.count_for_job(job_uuid, status=AssetStatus.PROMOTED)
+            if filtering_incomplete(undecided, total_assets):
+                # Nothing was written in this transaction, so dispatching from inside it
+                # cannot race a commit. Deliberately does not fall through to the trim
+                # and completion below: the job is not done, its filtering is.
+                _defer_until_filtered(job_id, undecided, total_assets)
+                return
+            get_redis().delete(f"job:{job_id}:refilter_attempts")
+            promoted_total = total_assets - undecided
 
             tasks = task_repo.list_for_job(job_uuid)
             sources = [
@@ -275,6 +318,9 @@ def plan_topup_round(self, job_id: str):
                     gained_last_round=(
                         accepted - previous_accepted if previous_accepted is not None else None
                     ),
+                    promoted_last_round=(
+                        promoted_total - previous_promoted if previous_promoted is not None else None
+                    ),
                 )
             )
 
@@ -295,6 +341,7 @@ def plan_topup_round(self, job_id: str):
                     "round": plan.round_number,
                     "quota": plan.quota,
                     "accepted_after_last_round": accepted,
+                    "promoted_after_last_round": promoted_total,
                     # Raw (pre-filter) accepted_count as of right now, before
                     # this round's downloads start — the fixed baseline
                     # build_on_progress anchors this round's target to. Not
@@ -506,13 +553,17 @@ def watchdog_scan():
     deadline-based jobs that should have completed but didn't get an event."""
     settings = get_settings()
     now = datetime.now(timezone.utc)
+    # Work last seen before the latest worker boot belongs to a process that died
+    # in a restart; once the grace period has passed it is resumed immediately
+    # rather than after the stall thresholds (app/domain/recovery.py).
+    restart_cutoff = orphan_cutoff(last_worker_boot(get_redis()), now, settings.watchdog_restart_grace_s)
 
     with session_scope() as db:
         job_repo = JobRepository(db)
         task_repo = JobSourceTaskRepository(db)
 
         # -- Resume stalled tasks -----------------------------------------------
-        for task in task_repo.list_stalled(settings.watchdog_stall_threshold_s, now):
+        for task in task_repo.list_stalled(settings.watchdog_stall_threshold_s, now, orphan_cutoff=restart_cutoff):
             logger.warning(f"Watchdog: task {task.id} stalled (source={task.source_type}), resuming")
             task_repo.set_status(task.id, JobSourceTaskStatus.STALLED)
             task_repo.increment_counts(task.id, errors=0)  # no-op, keeps intent explicit
@@ -540,8 +591,16 @@ def watchdog_scan():
                 evaluate_job_completion.delay(str(job.id))
             elif (
                 job.status in (JobStatus.RUNNING, JobStatus.DISCOVERING)
-                and (now - job.updated_at).total_seconds() > settings.filtering_stall_threshold_s
+                and (
+                    (now - job.updated_at).total_seconds() > settings.filtering_stall_threshold_s
+                    # ... or it has been idle since before the last worker boot, i.e.
+                    # the chain was killed by a restart and nothing is coming back.
+                    or is_orphaned(job.updated_at, restart_cutoff)
+                )
                 and task_repo.all_terminal_for_job(job.id)
+                # Re-driving is idempotent but not free, and the pass takes a while
+                # to bump updated_at: without this it would be re-driven every scan.
+                and get_redis().set(f"watchdog:redrive:{job.id}", "1", nx=True, ex=300)
             ):
                 # Post-ingestion stall: every source finished, but the
                 # filtering -> dedup -> completion chain died part-way and

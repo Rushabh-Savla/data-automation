@@ -31,6 +31,8 @@ from app.connectors.base import (
     download_with_retry,
     register_connector,
 )
+from app.connectors.open_vocab import scan_candidates
+from app.connectors.query_terms import match_labels
 from app.core.config import get_settings
 from app.core.exceptions import FatalConnectorError, JobStopped, TransientConnectorError
 from app.domain.enums import SourceType
@@ -141,31 +143,37 @@ class KittiConnector:
         if explicit_categories:
             wanted = {c.strip().lower() for c in explicit_categories if c.strip()}
             matched = {c for c in _KITTI_CLASSES if c.lower() in wanted}
+            if not matched:
+                return DiscoveryPage(
+                    items=[], next_cursor=None, exhausted=True,
+                    error_reason=f"No KITTI object types matched {explicit_categories!r} — 8 driving-scene classes",
+                )
         else:
-            keyword_lower = query.strip().lower()
-            matched = {c for c in _KITTI_CLASSES if keyword_lower in c.lower() or c.lower() in keyword_lower}
-        if not matched:
-            return DiscoveryPage(
-                items=[], next_cursor=None, exhausted=True,
-                error_reason=(
-                    f"No KITTI object types matched query {query!r} — KITTI's vocabulary is "
-                    "just 8 driving-scene classes; use explicit category overrides"
-                ),
-            )
+            matched = match_labels(query, _KITTI_CLASSES)
 
-        image_ids = sorted({iid for cls in matched for iid in class_index.get(cls, [])})[:limit]
-        if not image_ids:
+        labelled = sorted({iid for cls in matched for iid in class_index.get(cls, [])})
+        image_ids = labelled[:limit]
+
+        # KITTI is 8 driving-scene classes. When they cannot fill the limit -- or none names
+        # this query -- fill the rest from every other image and let the relevance filter
+        # decide (open_vocab.py). Not for explicit class overrides, which are exact.
+        scan_ids: list = []
+        if not explicit_categories and len(labelled) < limit:
+            universe = {iid for ids in class_index.values() for iid in ids}
+            scan_ids = scan_candidates(universe, set(labelled), limit - len(labelled))
+
+        if not image_ids and not scan_ids:
             return DiscoveryPage(items=[], next_cursor=None, exhausted=True)
 
-        shards = [image_ids[i : i + _SHARD_SIZE] for i in range(0, len(image_ids), _SHARD_SIZE)]
         items = [
             SourceItem(
                 source_type=SourceType.KITTI,
-                external_ref={"image_ids": shard},
+                external_ref={"image_ids": batch[i : i + _SHARD_SIZE], "unlabelled": unlabelled},
                 license_hint=_LICENSE_NOTE,
                 dataset_identifier="kitti-object-2d",
             )
-            for shard in shards
+            for batch, unlabelled in ((image_ids, False), (scan_ids, True))
+            for i in range(0, len(batch), _SHARD_SIZE)
         ]
         return DiscoveryPage(items=items, next_cursor=None, exhausted=True)
 
@@ -243,7 +251,11 @@ class KittiConnector:
                 width=w,
                 height=h,
                 classes=registry.names,
-                metadata={"kitti_image_id": image_id},
+                metadata={
+                    "kitti_image_id": image_id,
+                    # "vlm": picked by the relevance model among images not labelled for this query.
+                    "matched_by": "vlm" if item.external_ref.get("unlabelled") else "label",
+                },
             )
             on_progress({"checkpoint": {"index": i + 1}, "downloaded": 1})
             yield draft
