@@ -120,6 +120,15 @@ def cancel_job(job_id: uuid.UUID, db: Session = Depends(get_db)):
     return _to_detail(job, JobSourceTaskRepository(db).list_for_job(job_id))
 
 
+@router.post("/{job_id}/reopen", response_model=JobDetailResponse)
+def reopen_job(job_id: uuid.UUID, db: Session = Depends(get_db)):
+    """Sends a completed_partial job back for another discovery pass toward
+    its original target_count, appending to the same job_id rather than
+    requiring a disconnected new job."""
+    job = _apply_control(db, job_id, lambda svc: svc.reopen(job_id))
+    return _to_detail(job, JobSourceTaskRepository(db).list_for_job(job_id))
+
+
 @router.get("/{job_id}/progress", response_model=JobProgressResponse)
 def get_job_progress(job_id: uuid.UUID, db: Session = Depends(get_db)):
     job = _get_job_or_404(db, job_id)

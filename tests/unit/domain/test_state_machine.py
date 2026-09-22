@@ -28,6 +28,16 @@ class TestJobStateMachine:
         # goes straight to cancelled rather than through cancelling.
         assert JobStateMachine.transition(JobStatus.DRAFT, "cancel") == JobStatus.CANCELLED
 
+    def test_completed_partial_can_reopen(self):
+        assert JobStateMachine.transition(JobStatus.COMPLETED_PARTIAL, "reopen") == JobStatus.DISCOVERING
+
+    @pytest.mark.parametrize("current", [JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED])
+    def test_reopen_is_not_offered_from_other_terminal_statuses(self, current):
+        # COMPLETED already met its target; FAILED/CANCELLED are a different
+        # intent than "try again for more of the same".
+        with pytest.raises(IllegalTransitionError):
+            JobStateMachine.transition(current, "reopen")
+
     @pytest.mark.parametrize(
         "current,event",
         [

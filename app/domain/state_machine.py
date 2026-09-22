@@ -22,6 +22,14 @@ _TRANSITIONS: dict[str, dict[JobStatus, JobStatus]] = {
     "resume": {
         JobStatus.PAUSED: JobStatus.RUNNING,
     },
+    # A completed_partial job whose sources gave up short of target_count can
+    # be sent back for another discovery pass instead of spinning up a
+    # disconnected new job whose assets would live under a separate job_id.
+    # Deliberately not offered from COMPLETED (target already met) or FAILED/
+    # CANCELLED (a different intent than "try again for more of the same").
+    "reopen": {
+        JobStatus.COMPLETED_PARTIAL: JobStatus.DISCOVERING,
+    },
     "cancel": {
         JobStatus.DRAFT: JobStatus.CANCELLED,
         JobStatus.SCHEDULED: JobStatus.CANCELLED,

@@ -240,6 +240,49 @@ class JobService:
         self.publisher.publish(str(job_id), {"type": "job_status", "status": job.status.value})
         return job
 
+    def reopen(self, job_id: uuid.UUID) -> Job:
+        """Sends a `completed_partial` job back for another discovery pass,
+        so results append to this same job_id/job_source_task_id instead of
+        living under a disconnected new job.
+
+        Unlike resume() (which only redrives non-terminal tasks left over
+        from a pause), reopen() targets tasks that are *terminal* — that is
+        exactly the state a source is in after topup gave up on it. discover_
+        youtube et al overwrite the task's status themselves on entry
+        regardless of what it was, but it's set to PENDING here first for UI/
+        heartbeat consistency with how plan_topup_round redrives a source.
+
+        job.config["_topup"] is cleared entirely, not just its round number:
+        TopupPlanner.plan() stops immediately once round_number >= max_rounds
+        (domain/topup.py), and discovery_tasks.py's scale_for_topup/
+        topup_limit and _helpers.py's mark_target_reached all read the same
+        dict — leaving a stale round/quota from the finished run would make
+        the very next evaluation stop the reopened pass immediately, skew its
+        discovery limit, or fire mark_target_reached prematurely off a
+        now-meaningless baseline.
+        """
+        job = self.job_repo.get_or_404(job_id)
+        job.status = JobStateMachine.transition(job.status, "reopen")
+        job.completion_reason = None
+        job.completed_at = None
+        JobRepository.apply_status_timestamps(job, job.status)
+        job.config = {k: v for k, v in (job.config or {}).items() if k != "_topup"}
+        self.db.flush()
+
+        for task in self.task_repo.list_for_job(job_id):
+            if task.status not in JOB_SOURCE_TASK_TERMINAL_STATUSES:
+                continue  # still actively working (e.g. a slower sibling source) -- leave it alone
+            source_type = SourceType(task.source_type)
+            task_path = _SOURCE_DISCOVERY_TASKS.get(source_type)
+            if task_path is None:
+                continue
+            self.task_repo.set_status(task.id, JobSourceTaskStatus.PENDING)
+            self.task_repo.heartbeat(task.id)
+            self._dispatch(task_path, str(job_id), str(task.id))
+
+        self.publisher.publish(str(job_id), {"type": "job_status", "status": job.status.value})
+        return job
+
     def cancel(self, job_id: uuid.UUID) -> Job:
         job = self.job_repo.get_or_404(job_id)
         job.status = JobStateMachine.transition(job.status, "cancel")
