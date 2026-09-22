@@ -301,6 +301,11 @@ class DiscoveryPage:
     # "we searched and there's nothing" from "the search itself failed",
     # which otherwise look identical to an operator.
     error_reason: str | None = None
+    # Set with a zero-item page when it's a temporary condition (e.g. a
+    # rate-limit cooldown), not real exhaustion — tells the caller to retry
+    # in ~N seconds instead of marking the source done. None (default, and
+    # every existing connector) keeps the normal exhausted-page handling.
+    retry_after_s: float | None = None
 
 
 @dataclass

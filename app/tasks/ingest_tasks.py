@@ -50,6 +50,11 @@ logger = logging.getLogger(__name__)
 
 FetchFn = Callable[..., Iterator[RawAssetDraft]]
 
+# Separate, higher ceiling for errors that carry a real retry_after_s
+# (e.g. a rate-limit cooldown) — each retry waits minutes, not seconds,
+# so more attempts are affordable than a task's normal max_retries=5.
+_RATE_LIMIT_RETRY_CEILING = 10
+
 
 def _run_item_download(
     job_id: str,
@@ -164,11 +169,28 @@ def _run_item_download(
             logger.error(f"Fatal error downloading {checkpoint_key} (recorded as error, not task failure): {e}")
             return {"item": checkpoint_key, "accepted": accepted, "rejected": rejected, "error": str(e)}
         except (TransientConnectorError, ConnectionError, TimeoutError) as e:
-            retries = getattr(getattr(bound_task, "request", None), "retries", None)
+            retry_after_s = getattr(e, "retry_after_s", None)
+            retries_so_far = getattr(getattr(bound_task, "request", None), "retries", None) or 0
+
+            # Rate-limit style errors carry a real wait time — retry with
+            # that instead of the decorator's fast exponential backoff
+            # (which exhausts in seconds, not the minutes a cooldown needs).
+            if retry_after_s and bound_task is not None and retries_so_far < _RATE_LIMIT_RETRY_CEILING:
+                unbind_context()
+                raise bound_task.retry(countdown=retry_after_s, max_retries=_RATE_LIMIT_RETRY_CEILING, exc=e)
+
             max_retries = getattr(bound_task, "max_retries", None)
-            if bound_task is not None and retries is not None and max_retries is not None and retries < max_retries:
+            if bound_task is not None and not retry_after_s and max_retries is not None and retries_so_far < max_retries:
                 unbind_context()
                 raise  # attempts remain — let autoretry_for retry this task again
+
+            if retry_after_s:
+                # Rate-limiting, not a real error — don't count it against the
+                # source; just skip this item, topup will pick up the slack.
+                unbind_context()
+                logger.warning(f"Skipping {checkpoint_key} after repeated rate-limiting: {e}")
+                return {"item": checkpoint_key, "accepted": accepted, "rejected": rejected}
+
             with session_scope() as err_db:
                 err_repo = JobSourceTaskRepository(err_db)
                 err_repo.increment_counts(task_uuid, errors=1)

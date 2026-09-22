@@ -51,13 +51,67 @@ from app.connectors.base import (
     register_connector,
 )
 from app.core.config import get_settings
-from app.core.exceptions import FatalConnectorError, JobStopped, TransientConnectorError
+from app.core.exceptions import FatalConnectorError, JobStopped, RateLimitedError, TransientConnectorError
 from app.domain.enums import SourceType
 
 logger = logging.getLogger(__name__)
 
 YT_API_BASE = "https://www.googleapis.com/youtube/v3"
 _MEDIA_EXTENSIONS = {".mp4", ".mkv", ".webm", ".avi", ".m4a", ".mov", ".flv"}
+
+# ffmpeg's own diagnosis (captured from stderr, see _classify_ffmpeg_error)
+# when the input file is truncated/incomplete rather than genuinely
+# unreadable for some other reason. Observed cause: YouTube's evolving
+# "SABR-only" server-side restriction (see build_ytdlp_options' extractor_args
+# comment) can serve only the first few hundred KB of even itag 18 (the
+# fallback 360p muxed format) while yt-dlp still reports "100% downloaded" and
+# the container's own duration metadata still claims the full video length.
+# Re-downloading the same URL/format reproduces the identical truncated bytes
+# every time (verified directly) -- it is not a transient network blip, so
+# retrying it (the previous behavior) only burns all 5 retries for a
+# guaranteed-identical failure.
+_TRUNCATED_STREAM_SIGNATURES = (
+    "partial file",
+    "moov atom not found",
+    "invalid data found when processing input",
+    "cannot determine format",
+)
+
+# -- Rate-limit cooldown ----------------------------------------------------
+# YouTube rate-limits by IP, not per-video — once one task hits a 429/403,
+# every other task on this host will too. This is a shared Redis flag: while
+# it's set, discover()/fetch() fail fast instead of making a request that
+# would likely fail the same way.
+_RATE_LIMIT_COOLDOWN_KEY = "youtube:rate_limit_cooldown"
+
+
+def _start_rate_limit_cooldown(cooldown_s: int) -> None:
+    from app.core.redis_client import get_redis
+
+    get_redis().set(_RATE_LIMIT_COOLDOWN_KEY, "1", ex=cooldown_s)
+
+
+def _rate_limit_cooldown_active() -> bool:
+    from app.core.redis_client import get_redis
+
+    return bool(get_redis().exists(_RATE_LIMIT_COOLDOWN_KEY))
+
+
+def _rate_limit_cooldown_remaining_s() -> float:
+    """Seconds left on the cooldown, so callers can reschedule instead of
+    failing outright. Floors to 5s if the TTL is already gone."""
+    from app.core.redis_client import get_redis
+
+    ttl = get_redis().ttl(_RATE_LIMIT_COOLDOWN_KEY)
+    return max(5.0, ttl) if ttl and ttl > 0 else 5.0
+
+
+def _raise_if_rate_limit_cooldown_active() -> None:
+    if _rate_limit_cooldown_active():
+        raise RateLimitedError(
+            "YouTube rate-limit cooldown is active for this host",
+            retry_after_s=_rate_limit_cooldown_remaining_s(),
+        )
 
 # A single literal query has a finite pool of matching videos, and cc_only
 # filtering (default on) shrinks that further — mirrors web_connector.py's
@@ -75,8 +129,11 @@ _QUERY_VARIANT_SUFFIXES = (
     " clip",
     " compilation",
 )
-_DISCOVER_MAX_RESULTS_PER_CALL = 50  # YouTube Data API's own per-call ceiling
 _DISCOVER_MAX_VARIANT_ATTEMPTS = len(_QUERY_VARIANT_SUFFIXES)
+
+
+_SEARCH_PAGE_SIZE = 50  # YouTube Data API's own per-page ceiling
+_SEARCH_MAX_PAGES = 20  # safety bound on the pagination loop below, not a real cap
 
 
 def search_videos(
@@ -87,6 +144,9 @@ def search_videos(
 ) -> list[SourceItem]:
     """YouTube Data API v3 search — requires a valid api_key.
 
+    Pages via nextPageToken until max_results is reached; a single page
+    tops out at 50 (the API's own limit), not max_results itself.
+
     Returns an empty list (not an exception) on any API failure so the
     caller can fall back to search_videos_ytdlp() without special-casing
     the two error modes (missing key vs. API call failed).
@@ -94,41 +154,52 @@ def search_videos(
     if not api_key:
         return []
 
-    params = {
-        "key": api_key,
-        "q": query,
-        "type": "video",
-        "part": "snippet",
-        "maxResults": min(max_results, 50),
-        "order": "relevance",
-    }
-    if license_filter:
-        params["videoLicense"] = license_filter
+    items: list[SourceItem] = []
+    page_token = None
+    for _ in range(_SEARCH_MAX_PAGES):
+        params = {
+            "key": api_key,
+            "q": query,
+            "type": "video",
+            "part": "snippet",
+            "maxResults": min(_SEARCH_PAGE_SIZE, max_results - len(items)),
+            "order": "relevance",
+        }
+        if license_filter:
+            params["videoLicense"] = license_filter
+        if page_token:
+            params["pageToken"] = page_token
 
-    try:
-        resp = requests.get(f"{YT_API_BASE}/search", params=params, timeout=15)
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as e:
-        logger.error(f"YouTube API search failed: {e}")
-        return []
+        try:
+            resp = requests.get(f"{YT_API_BASE}/search", params=params, timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            logger.error(f"YouTube API search failed: {e}")
+            break
 
-    video_ids = [
-        item["id"]["videoId"]
-        for item in data.get("items", [])
-        if item.get("id", {}).get("videoId")
-    ]
-    if not video_ids:
-        return []
+        video_ids = [
+            item["id"]["videoId"]
+            for item in data.get("items", [])
+            if item.get("id", {}).get("videoId")
+        ]
+        if video_ids:
+            items.extend(_video_details(video_ids, api_key, license_filter))
 
+        page_token = data.get("nextPageToken")
+        if not page_token or len(items) >= max_results:
+            break
+
+    return items
+
+
+def _video_details(video_ids: list[str], api_key: str, license_filter: str | None) -> list[SourceItem]:
+    """Resolves search-result video IDs to full SourceItems (license lives
+    in contentDetails/status, not the search endpoint)."""
     try:
         det_resp = requests.get(
             f"{YT_API_BASE}/videos",
-            params={
-                "key": api_key,
-                "id": ",".join(video_ids),
-                "part": "snippet,contentDetails,status",
-            },
+            params={"key": api_key, "id": ",".join(video_ids), "part": "snippet,contentDetails,status"},
             timeout=15,
         )
         det_resp.raise_for_status()
@@ -249,19 +320,45 @@ class _ErrorCapturingLogger:
     the only way to learn *why* is to intercept the messages yt-dlp would
     otherwise just print — without this, a real cause like a 403 from
     YouTube's CDN gets reported to operators as an opaque "file not found",
-    which is indistinguishable from an actual code bug."""
+    which is indistinguishable from an actual code bug.
+
+    `last_warning` exists because plenty of real download failures under
+    ignoreerrors=True are only ever reported via yt-dlp's report_warning()
+    (logger.warning()), not report_error() -- observed directly: a video that
+    intermittently produced no file at all, with last_error staying None
+    every time (fetch()'s only fallback then was the unhelpful literal
+    "unknown reason (no file produced, no error captured)"). Kept separate
+    from last_error (not overwritten by it) so a real error is never masked
+    by an unrelated, often-benign warning (e.g. every single call logs the
+    same SABR-format-availability warning regardless of outcome) — fetch()
+    only falls back to last_warning when last_error was never set at all.
+    """
 
     def __init__(self) -> None:
         self.last_error: str | None = None
+        self.last_warning: str | None = None
 
     def debug(self, msg: str) -> None:
         pass
 
     def warning(self, msg: str) -> None:
-        pass
+        self.last_warning = _clean_log_message(msg)
 
     def error(self, msg: str) -> None:
-        self.last_error = msg
+        self.last_error = _clean_log_message(msg)
+
+
+def _clean_log_message(msg: str) -> str:
+    """Strips the raw '\\r' yt-dlp embeds when a message follows an
+    overwritten progress line (observed verbatim in production:
+    "ERROR: \\r[download] Got error: ..."), which otherwise flows straight
+    into job_source_tasks.error_message and is rendered as-is by
+    JobSourceTaskTable.tsx -- a literal carriage return in the middle of the
+    string a user reads on the job detail page. '\\r' is a progress-bar
+    redraw convention (each segment overwrites the previous on a real
+    terminal); only the text after the last one is the actual final message.
+    """
+    return msg.rsplit("\r", 1)[-1].strip()
 
 
 def build_ytdlp_options(
@@ -292,7 +389,20 @@ def build_ytdlp_options(
         "writeinfojson": True,
         "writesubtitles": False,
         "max_downloads": max_downloads,
-        "retries": 5,
+        # Low on purpose: download_youtube_video (ingest_tasks.py) already
+        # retries the WHOLE task up to 5x with growing backoff (retry_backoff,
+        # capped at 600s) -- that outer retry is what actually gives a flaky
+        # connection time to recover. yt-dlp's own retries here fire back-to-
+        # back inside a single attempt with no comparable wait, so leaving
+        # this at 5 meant a single stubborn video could cost up to 5 (outer)
+        # x 5 (inner) = 25 raw HTTP hits to YouTube's CDN before ever giving
+        # up (observed directly: video _RN5IrQy168, every one of them an
+        # early connection drop under 20KB in). That's needless load on top
+        # of being exactly the kind of aggressive-automated-traffic pattern
+        # that gets a host rate-limited/blocked in the first place. 2 still
+        # absorbs a one-off blip within a single attempt; the outer retry
+        # covers everything beyond that, with actual backoff.
+        "retries": 2,
         "fragment_retries": 10,
         "file_access_retries": 3,
         # Bounds each socket op so a connection that stalls after the
@@ -409,6 +519,16 @@ class YouTubeConnector:
         downstream relevance-filter rejection had no way to make up the
         shortfall; discover() just declared itself exhausted immediately.
         """
+        if _rate_limit_cooldown_active():
+            # Not exhausted — a cooldown is temporary. discover() never
+            # raises, so this reports it via retry_after_s instead, telling
+            # the caller to reschedule rather than treat the source as done.
+            return DiscoveryPage(
+                items=[], next_cursor=None, exhausted=False,
+                error_reason="YouTube rate-limit cooldown is active for this host",
+                retry_after_s=_rate_limit_cooldown_remaining_s(),
+            )
+
         license_filter = "creativeCommon" if self.cc_only else None
         seen_video_ids: set[str] = set()
         items: list[SourceItem] = []
@@ -419,17 +539,15 @@ class YouTubeConnector:
                 break
             variant_query = f"{query}{suffix}".strip()
 
+            remaining = limit - len(items)
+
             # --- Path 1: YouTube Data API v3 ---
-            variant_items = search_videos(
-                variant_query, api_key, max_results=_DISCOVER_MAX_RESULTS_PER_CALL, license_filter=license_filter
-            )
+            variant_items = search_videos(variant_query, api_key, max_results=remaining, license_filter=license_filter)
             if variant_items:
                 api_returned_anything = True
             else:
                 # --- Path 2: yt-dlp (no API key needed, or API path came up empty) ---
-                variant_items = search_videos_ytdlp(
-                    variant_query, max_results=_DISCOVER_MAX_RESULTS_PER_CALL, cc_only=self.cc_only
-                )
+                variant_items = search_videos_ytdlp(variant_query, max_results=remaining, cc_only=self.cc_only)
 
             for si in variant_items:
                 vid_id = si.external_ref["video_id"]
@@ -457,6 +575,37 @@ class YouTubeConnector:
         # variant is a one-shot search, not a paginated feed.
         return DiscoveryPage(items=items, next_cursor=None, exhausted=True, error_reason=error_reason)
 
+    @staticmethod
+    def _local_video(video_dir: Path, video_id: str) -> Path | None:
+        """The downloaded video for `video_id` in `video_dir`, if there is one."""
+        if not video_id:
+            return None
+        candidates = [p for p in video_dir.glob(f"{video_id}.*") if p.suffix.lower() in _MEDIA_EXTENSIONS]
+        return candidates[0] if candidates else None
+
+    @staticmethod
+    def _forget_archived_video(archive_file: Path, video_id: str) -> None:
+        """Removes just this video's line from yt-dlp's download_archive file.
+
+        `archive_file` is shared by every video downloaded under the same
+        job_source_task (see download_youtube_video: workdir is keyed by
+        job_source_task_id, not by video), so a blanket unlink() here would
+        make yt-dlp forget every other video already recorded under this
+        same task -- including one a sibling fetch() call is concurrently
+        mid-download on. Only this video's entry needs to go, so yt-dlp
+        stops skipping it as "already downloaded" and actually re-fetches it.
+        """
+        if not archive_file.exists() or not video_id:
+            return
+        lines = archive_file.read_text().splitlines()
+        kept = [line for line in lines if line.split()[-1:] != [video_id]]
+        if kept == lines:
+            return
+        if kept:
+            archive_file.write_text("\n".join(kept) + "\n")
+        else:
+            archive_file.unlink(missing_ok=True)
+
     def fetch(
         self,
         item: SourceItem,
@@ -477,7 +626,21 @@ class YouTubeConnector:
         stage = checkpoint.get("stage", "downloading")
         video_path: Path | None = None
 
+        if stage == "extracting" and self._local_video(video_dir, item.external_ref.get("video_id", "")) is None:
+            # Resumed at the "extracting" stage, but the downloaded video is gone: the scratch
+            # directory was cleaned up, or the task was re-driven after a restart. This used to be
+            # a fatal error ("No local video file to extract frames from"), which lost the video
+            # for good -- most recent YouTube jobs ended completed_partial on it. Download it
+            # again instead. The archive entry has to go too: yt-dlp would otherwise skip the
+            # video as "already downloaded" and produce no file. Frames extracted before the
+            # interruption are produced again and skipped as duplicates downstream.
+            logger.warning(f"Local video for {url} is missing on resume; downloading it again")
+            self._forget_archived_video(archive_file, item.external_ref.get("video_id", ""))
+            stage = "downloading"
+            checkpoint = {}
+
         if stage == "downloading":
+            _raise_if_rate_limit_cooldown_active()
             opts = build_ytdlp_options(video_dir, archive_file, cc_only=self.cc_only)
             error_logger = _ErrorCapturingLogger()
             opts["logger"] = error_logger
@@ -511,7 +674,11 @@ class YouTubeConnector:
                 if p.suffix.lower() in _MEDIA_EXTENSIONS
             ]
             if not candidates:
-                reason = error_logger.last_error or "unknown reason (no file produced, no error captured)"
+                reason = (
+                    error_logger.last_error
+                    or (f"{error_logger.last_warning} (warning only, no error was logged)" if error_logger.last_warning else None)
+                    or "unknown reason (no file produced, no error captured)"
+                )
                 raise self._classify_error(RuntimeError(reason), url, video_id=video_id)
             video_path = candidates[0]
             license_name = (
@@ -520,11 +687,7 @@ class YouTubeConnector:
             on_progress({"checkpoint": {"stage": "extracting", "frame_index": 0}, "downloaded": 1})
         else:
             video_id = item.external_ref.get("video_id", "")
-            candidates = [
-                p for p in video_dir.glob(f"{video_id}.*")
-                if p.suffix.lower() in _MEDIA_EXTENSIONS
-            ]
-            video_path = candidates[0] if candidates else None
+            video_path = self._local_video(video_dir, video_id)
             license_name = item.license_hint or "unknown"
 
         if video_path is None or not video_path.exists():
@@ -645,15 +808,19 @@ class YouTubeConnector:
             "-vf", f"fps={fps}",
             "-q:v", "2",
             out_pattern,
-            "-loglevel", "quiet",
+            # "error" (not "quiet"): quiet discarded ffmpeg's own diagnosis of
+            # *why* it failed, leaving only a bare "exit status N" -- captured
+            # below so a failure is actually diagnosable instead of requiring
+            # a manual repro to find out what ffmpeg was complaining about.
+            "-loglevel", "error",
             "-y",
         ]
         try:
-            subprocess.run(cmd, check=True, timeout=3600)
+            subprocess.run(cmd, check=True, timeout=3600, capture_output=True, text=True)
         except FileNotFoundError:
             raise FatalConnectorError("ffmpeg not found on PATH")
         except subprocess.CalledProcessError as e:
-            raise TransientConnectorError(f"ffmpeg failed for {vpath.stem}: {e}")
+            raise self._classify_ffmpeg_error(e, vpath)
         except subprocess.TimeoutExpired:
             raise TransientConnectorError(f"ffmpeg timeout for {vpath.stem}")
 
@@ -697,6 +864,33 @@ class YouTubeConnector:
                 f.unlink(missing_ok=True)
 
     @staticmethod
+    def _classify_ffmpeg_error(e: subprocess.CalledProcessError, vpath: Path) -> Exception:
+        """Turns a raw ffmpeg CalledProcessError into a clean, classified one.
+
+        Two things wrong with just re-raising `e` directly (the previous
+        behavior): its str() is "Command [<full argv, including this host's
+        absolute /work/... container path>] returned non-zero exit status N"
+        -- an internal implementation detail with no diagnosis, that then
+        gets stored verbatim in job_source_tasks.error_message and rendered
+        as-is to the user (see JobSourceTaskTable.tsx). And a permanently
+        truncated source (see _TRUNCATED_STREAM_SIGNATURES) was previously
+        classified as TransientConnectorError, wasting all 5 retries on an
+        identical guaranteed failure instead of failing once, clearly.
+        """
+        stderr = (e.stderr or "").strip()
+        # ffmpeg's actual diagnosis is usually the last line before its generic
+        # "Conversion failed!" trailer -- prefer that over the trailer itself.
+        lines = [line for line in stderr.splitlines() if line.strip() and line.strip() != "Conversion failed!"]
+        reason = lines[-1].strip() if lines else f"ffmpeg exited {e.returncode} (no diagnostic captured)"
+        if any(sig in stderr.lower() for sig in _TRUNCATED_STREAM_SIGNATURES):
+            return FatalConnectorError(
+                f"YouTube served an incomplete/corrupted video stream for {vpath.stem} "
+                f"(truncated download, not a network blip -- retrying the same format "
+                f"reproduces the identical truncated file): {reason}"
+            )
+        return TransientConnectorError(f"ffmpeg failed for {vpath.stem}: {reason}")
+
+    @staticmethod
     def _classify_error(e: Exception, url: str, video_id: str | None = None) -> Exception:
         msg = str(e).lower()
         ref = f"video_id={video_id}" if video_id else url
@@ -710,9 +904,14 @@ class YouTubeConnector:
             # fatal error would reach immediately (recorded as a per-item
             # error, chord continues with the rest of the job).
             return FatalConnectorError(f"Video requires sign-in/age verification ({ref}): {e}")
+        if "429" in msg or "too many requests" in msg:
+            _start_rate_limit_cooldown(get_settings().youtube_rate_limit_cooldown_s)
+            return RateLimitedError(f"YouTube rate-limited this host for {ref} (HTTP 429): {e}")
         if "403" in msg or "forbidden" in msg:
-            return TransientConnectorError(
-                f"YouTube CDN refused the video download for {ref} (HTTP 403 — this host's network is "
-                f"likely being rate-limited/blocked by YouTube for automated downloads, not a code bug): {e}"
-            )
+            _start_rate_limit_cooldown(get_settings().youtube_rate_limit_cooldown_s)
+            return TransientConnectorError(f"YouTube CDN refused the download for {ref} (HTTP 403 — likely rate-limited): {e}")
+        if "bytes read" in msg and "more expected" in msg:
+            # Connection cut early, mid-transfer — same rate-limit signature as 403/429.
+            _start_rate_limit_cooldown(get_settings().youtube_rate_limit_cooldown_s)
+            return TransientConnectorError(f"YouTube CDN cut the download short for {ref} (likely rate-limited): {e}")
         return TransientConnectorError(f"yt-dlp failed for {ref}: {e}")

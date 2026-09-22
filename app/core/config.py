@@ -77,6 +77,10 @@ class Settings(BaseSettings):
     # operation so yt-dlp's existing retries/backoff can actually kick in.
     youtube_socket_timeout_s: int = 30
 
+    # How long every YouTube task backs off after a 429/403/incomplete-read
+    # (rate-limited by IP, shared across all tasks — see youtube_connector.py).
+    youtube_rate_limit_cooldown_s: int = 600
+
     # -- Fast-path source selection --------------------------------------------------
     # For small target counts, fanning out to every connector at once wastes time —
     # Kaggle/Roboflow download whole datasets and YouTube downloads+extracts video

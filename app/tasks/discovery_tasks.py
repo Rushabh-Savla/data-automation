@@ -319,6 +319,7 @@ def discover_youtube(self, job_id: str, job_source_task_id: str):
         yt_config = job.config.get("youtube", {})
         explicit_urls: list[str] = yt_config.get("urls", [])
         discovery_error_reason: str | None = None
+        discovery_retry_after_s: float | None = None
         if explicit_urls:
             items = [{"url": u, "video_id": _video_id_from_url(u), "license": "unknown"} for u in explicit_urls]
         else:
@@ -327,10 +328,15 @@ def discover_youtube(self, job_id: str, job_source_task_id: str):
             with heartbeat_during(task_uuid):
                 page = connector.discover(
                     job.query, cursor=None,
-                    limit=yt_config.get("max_videos", scale_for_topup(_default_container_limit(job.target_count), job, hard_max=200)),
+                    # Unlike Kaggle/Roboflow "containers" (a handful yield everything
+                    # needed), one video caps out at frames_per_video frames — reaching
+                    # a large target needs many more videos, so this scales like the
+                    # image-scan sources below instead of the tiny container default.
+                    limit=yt_config.get("max_videos", scale_for_topup(_default_image_limit(job.target_count), job, hard_max=50_000)),
                     api_key=credentials.get("YOUTUBE_API_KEY", ""),
                 )
             discovery_error_reason = page.error_reason
+            discovery_retry_after_s = page.retry_after_s
             items = [
                 {
                     "url": si.external_ref["url"],
@@ -341,6 +347,17 @@ def discover_youtube(self, job_id: str, job_source_task_id: str):
             ]
 
         if not items:
+            if discovery_retry_after_s:
+                # Temporary (e.g. rate-limit cooldown), not exhausted — reschedule
+                # instead of marking the source done. Status stays DISCOVERING.
+                logger.info(
+                    f"YouTube discovery for job {job_id} deferred {discovery_retry_after_s:.0f}s: "
+                    f"{discovery_error_reason}"
+                )
+                task_repo.heartbeat(task_uuid)
+                db.commit()
+                unbind_context()
+                raise self.retry(countdown=discovery_retry_after_s, max_retries=10)
             task_repo.set_status(
                 task_uuid,
                 JobSourceTaskStatus.COMPLETED_PARTIAL,
