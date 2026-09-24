@@ -16,6 +16,7 @@ class SourceType(str, enum.Enum):
     SUN_RGBD = "sun_rgbd"
     NUSCENES = "nuscenes"
     KITTI = "kitti"
+    NAS_SHARE = "nas_share"
 
 
 class JobStatus(str, enum.Enum):

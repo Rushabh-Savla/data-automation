@@ -75,6 +75,9 @@ dependencies = [
     "croniter>=3.0.0",
     "torch==2.6.0",
     "torchvision==0.21.0",
+    "smbprotocol>=1.17.0",
+    "paramiko>=5.0.0",
+    "defusedxml>=0.7.1",
 ]
 
 [tool.uv.sources]

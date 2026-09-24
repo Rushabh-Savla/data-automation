@@ -3,7 +3,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.v1 import assets, credentials, exports, jobs, sources, stats
+from app.api.v1 import assets, credentials, exports, jobs, nas, sources, stats
 from app.api.ws import job_progress_ws
 from app.core.config import get_settings
 from app.core.logging import configure_logging
@@ -40,6 +40,7 @@ app.include_router(credentials.router, prefix="/api/v1")
 app.include_router(sources.router, prefix="/api/v1")
 app.include_router(stats.router, prefix="/api/v1")
 app.include_router(exports.router, prefix="/api/v1")
+app.include_router(nas.router, prefix="/api/v1")
 app.include_router(job_progress_ws.router)
 
 

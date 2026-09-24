@@ -34,6 +34,8 @@ _SOURCE_ENV_KEYS: dict[SourceType, dict[str, str]] = {
     SourceType.SUN_RGBD: {},
     SourceType.NUSCENES: {},
     SourceType.KITTI: {},
+    # Configured on its own page (host/share/auth), not as a key/value credential.
+    SourceType.NAS_SHARE: {},
 }
 
 
