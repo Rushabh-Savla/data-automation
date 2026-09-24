@@ -48,6 +48,12 @@ def get_implemented_sources() -> set[SourceType]:
     return set(_SOURCE_DISCOVERY_TASKS.keys())
 
 
+# Sources that only run when a job names them. The NAS share is the user's own
+# library: pulling it into every auto-sourced job (which also fans out to every
+# public dataset) would mix private images into results nobody asked to include.
+_EXPLICIT_ONLY_SOURCES: frozenset[SourceType] = frozenset({SourceType.NAS_SHARE})
+
+
 def _resume_pending_items(
     source_type: SourceType, job_id: str, job_source_task_id: str, checkpoint: dict | None
 ) -> bool:
@@ -118,7 +124,7 @@ class JobService:
         # the caller to know and list connector names up front.
         was_auto_sourced = not sources
         if not sources:
-            sources = sorted(get_implemented_sources(), key=lambda s: s.value)
+            sources = sorted(get_implemented_sources() - _EXPLICIT_ONLY_SOURCES, key=lambda s: s.value)
             if not sources:
                 raise ValueError("No source connectors are implemented yet")
 

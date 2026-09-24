@@ -692,3 +692,46 @@ def download_kitti_shard(self, job_id: str, job_source_task_id: str, item_dict: 
         yield from connector.fetch(item, workdir, checkpoint, should_stop, on_progress)
 
     return _run_item_download(job_id, job_source_task_id, SourceType.KITTI, shard_id, fetch, bound_task=self)
+
+
+@celery_app.task(
+    name="app.tasks.ingest_tasks.download_nas_share_shard",
+    bind=True,
+    autoretry_for=(TransientConnectorError, ConnectionError, TimeoutError),
+    retry_backoff=True,
+    retry_backoff_max=600,
+    retry_jitter=True,
+    max_retries=5,
+)
+def download_nas_share_shard(self, job_id: str, job_source_task_id: str, item_dict: dict):
+    from app.connectors.nas_share_connector import NasShareConnector
+    from app.services.nas_config_service import get_saved_params
+
+    settings = get_settings()
+    item = SourceItem(
+        source_type=SourceType.NAS_SHARE,
+        external_ref=item_dict["external_ref"],
+        license_hint=item_dict.get("license_hint"),
+        dataset_identifier=item_dict.get("dataset_identifier"),
+    )
+    shard_id = hashlib.md5(str(item.external_ref["paths"]).encode()).hexdigest()[:12]
+    workdir = settings.work_root / job_source_task_id
+    workdir.mkdir(parents=True, exist_ok=True)
+
+    with session_scope() as db:
+        task = JobSourceTaskRepository(db).get(uuid.UUID(job_source_task_id))
+        min_res = tuple(task.job.config.get("min_resolution", (64, 64))) if task and task.job else (64, 64)
+
+    # Credentials are resolved here, inside the worker, from the encrypted config —
+    # never carried in item_dict (which is stored in Celery messages/checkpoints).
+    params = get_saved_params()
+    connector = NasShareConnector(params, min_resolution=min_res) if params is not None else None
+
+    def fetch(checkpoint, should_stop, on_progress):
+        if connector is None:
+            # Raised inside fetch (not before the driver) so it is recorded as an item
+            # error instead of breaking the chord for every other shard.
+            raise FatalConnectorError("NAS is not configured")
+        yield from connector.fetch(item, workdir, checkpoint, should_stop, on_progress)
+
+    return _run_item_download(job_id, job_source_task_id, SourceType.NAS_SHARE, shard_id, fetch, bound_task=self)
