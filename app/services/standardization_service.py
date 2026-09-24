@@ -11,11 +11,13 @@ from functools import lru_cache
 from pathlib import Path
 
 from PIL import Image
+from sqlalchemy.orm import object_session
 
 from app.connectors.base import RawAssetDraft
 from app.db.models.asset import Asset
 from app.db.repositories.asset_repository import AssetRepository
 from app.domain.enums import AnnotationFormat, AssetStatus, SourceType
+from app.storage import asset_files
 from app.storage.base import StorageBackend
 
 Image.MAX_IMAGE_PIXELS = None  # suppress DecompressionBomb warnings on large datasets
@@ -26,6 +28,20 @@ logger = logging.getLogger(__name__)
 class AssetRejected(Exception):
     """Raised when a draft fails validation (corrupt, too small, etc.) —
     caller should count it toward JobSourceTask.rejected_count, not error_count."""
+
+
+def _refresh_paths(asset: Asset) -> None:
+    """Re-read the asset's file paths from the database. Callers (trim, dedup, the
+    relevance filter) load the asset earlier in their transaction; if the image was
+    moved to the NAS in between, their copy still holds the old local path and the
+    NAS copy would be left behind. Fail-open: if the asset is not attached to a
+    session, the paths it already has are used."""
+    try:
+        session = object_session(asset)
+        if session is not None:
+            session.refresh(asset, attribute_names=["nas_path", "annotation_nas_path"])
+    except Exception as e:
+        logger.debug(f"Could not refresh file paths for asset {getattr(asset, 'id', '?')}: {e}")
 
 
 def delete_asset_files(asset: Asset) -> None:
@@ -39,12 +55,15 @@ def delete_asset_files(asset: Asset) -> None:
     (whose delete() expects a path relative to its own root) — the same
     convention get_asset_file already follows for reads. Per-file
     try/except: a deletion failure is logged and never raised, matching
-    the fail-open pattern used throughout the filtering pipeline."""
+    the fail-open pattern used throughout the filtering pipeline. A path may
+    also be "nas://..." (image already moved to the UI-connected NAS);
+    asset_files.delete removes it there — the local branch is unchanged."""
+    _refresh_paths(asset)
     for path_str in (asset.nas_path, asset.annotation_nas_path):
         if not path_str:
             continue
         try:
-            Path(path_str).unlink(missing_ok=True)
+            asset_files.delete(path_str)
         except Exception as e:
             logger.warning(f"Failed to delete asset file {path_str} for asset {asset.id}: {e}")
 

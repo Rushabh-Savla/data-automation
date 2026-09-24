@@ -25,6 +25,7 @@ celery_app = Celery(
         "app.tasks.orchestration_tasks",
         "app.tasks.filtering_tasks",
         "app.tasks.export_tasks",
+        "app.tasks.nas_tasks",
     ],
 )
 
@@ -47,6 +48,9 @@ celery_app.conf.update(
         "app.tasks.orchestration_tasks.*": {"queue": "orchestration"},
         "app.tasks.filtering_tasks.*": {"queue": "filtering"},
         "app.tasks.export_tasks.*": {"queue": "export"},
+        # Reuses the "standardize" queue (already consumed by every worker) so
+        # NAS offloading needs no new queue or docker-compose change.
+        "app.tasks.nas_tasks.*": {"queue": "standardize"},
     },
     beat_schedule={
         "watchdog-scan": {
@@ -68,6 +72,17 @@ celery_app.conf.update(
         "purge-orphan-work-dirs": {
             "task": "app.tasks.cleanup_tasks.purge_orphan_work_dirs",
             "schedule": 6 * 3600.0,
+        },
+        # Moves kept images that are still on local disk onto the NAS (NAS was
+        # down when they passed, or they predate the NAS being connected).
+        "nas-offload-sweep": {
+            "task": "app.tasks.nas_tasks.sweep_unoffloaded_assets",
+            "schedule": 300.0,
+        },
+        # Removes the NAS copy of images that stopped being kept (see nas_tasks).
+        "nas-leak-sweep": {
+            "task": "app.tasks.nas_tasks.sweep_leaked_nas_files",
+            "schedule": 60.0,
         },
     },
 )

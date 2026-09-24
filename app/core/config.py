@@ -24,6 +24,10 @@ class Settings(BaseSettings):
     nas_root: Path = Path("./nas_data")
     # Scratch space for in-flight downloads before they're promoted to NAS.
     work_root: Path = Path("./work_data")
+    # Local read-through cache for images that live on a remote (UI-connected)
+    # NAS: viewing, thumbnails and exports fetch a file once and reuse it, and the
+    # oldest entries are evicted past this size so the cache never fills the disk.
+    nas_cache_max_gb: float = 5.0
 
     # -- Auth --------------------------------------------------------------------
     # Comma-separated list of valid API keys. Any one of them is accepted.

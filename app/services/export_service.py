@@ -3,6 +3,7 @@ optionally converting annotations to a consistent YOLO or COCO format across
 sources whose annotations arrived in different formats.
 """
 
+import dataclasses
 import json
 import shutil
 import zipfile
@@ -19,6 +20,7 @@ from app.services.format_conversion import (
     parse_voc_xml,
     parse_yolo_txt,
 )
+from app.storage import asset_files
 
 
 @dataclass
@@ -42,6 +44,24 @@ class ExportAssetView:
     height: int | None
     classes: list = field(default_factory=list)
     asset_metadata: dict = field(default_factory=dict)
+
+
+def _localize(asset: ExportAssetView) -> ExportAssetView:
+    """For an asset whose files live on the UI-connected NAS, fetch them into the
+    local cache and return a view pointing at the local copies, so the builders
+    below (which read paths from disk) work unchanged. Local assets are returned
+    as-is — the same object, so nothing changes when no NAS is involved."""
+    if not (asset_files.is_remote(asset.nas_path) or asset_files.is_remote(asset.annotation_nas_path)):
+        return asset
+    changes: dict = {}
+    for attr in ("nas_path", "annotation_nas_path"):
+        value = getattr(asset, attr)
+        if asset_files.is_remote(value):
+            try:
+                changes[attr] = str(asset_files.materialize(value))
+            except FileNotFoundError:
+                changes[attr] = None  # gone from the NAS: skipped like a missing local file
+    return dataclasses.replace(asset, **changes)
 
 
 class ExportService:
@@ -79,6 +99,7 @@ class ExportService:
         manifest = []
 
         for i, asset in enumerate(assets):
+            asset = _localize(asset)
             if not asset.nas_path or not Path(asset.nas_path).exists():
                 continue
             dest_img = images_dir / Path(asset.nas_path).name
@@ -120,6 +141,7 @@ class ExportService:
         included = 0
 
         for i, asset in enumerate(assets):
+            asset = _localize(asset)
             if not asset.nas_path or not Path(asset.nas_path).exists():
                 continue
             dest_img = images_dir / Path(asset.nas_path).name
@@ -166,6 +188,7 @@ class ExportService:
         included = 0
 
         for i, asset in enumerate(assets):
+            asset = _localize(asset)
             if not asset.nas_path or not Path(asset.nas_path).exists():
                 continue
             dest_img = images_dir / Path(asset.nas_path).name

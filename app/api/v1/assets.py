@@ -15,6 +15,7 @@ from app.domain.enums import AssetStatus, SourceType
 from app.schemas.asset import AssetResponse
 from app.schemas.common import PageResponse
 from app.services.standardization_service import delete_asset_files
+from app.storage import asset_files
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +48,26 @@ def _generate_thumbnail(src: Path, dest: Path) -> None:
         logger.warning(f"Thumbnail generation failed for {src}: {e}")
 
 
+def _remote_file_response(asset_id: uuid.UUID, nas_path: str, *, thumbnail: bool) -> FileResponse:
+    """Serve an image that lives on the UI-connected NAS: fetched into the local
+    cache on first use (thumbnails are cached separately and far smaller). A NAS
+    that cannot be reached is a 503 the UI can explain, not a 500."""
+    try:
+        if thumbnail:
+            thumb_path = asset_files.thumbnail_cache_file(nas_path)
+            if not thumb_path.exists():
+                src = asset_files.materialize(nas_path)
+                thumb_path.parent.mkdir(parents=True, exist_ok=True)
+                _generate_thumbnail(src, thumb_path)
+            if thumb_path.exists():
+                return FileResponse(thumb_path, media_type="image/jpeg")
+        return FileResponse(asset_files.materialize(nas_path))
+    except FileNotFoundError:
+        raise HTTPException(404, f"Asset {asset_id}'s file no longer exists on the NAS")
+    except asset_files.NasUnreachable as e:
+        raise HTTPException(503, str(e))
+
+
 @router.get("/jobs/{job_id}/assets", response_model=PageResponse[AssetResponse])
 def list_assets(
     job_id: uuid.UUID,
@@ -76,6 +97,8 @@ def get_asset_file(asset_id: uuid.UUID, db: Session = Depends(get_db)):
     asset = AssetRepository(db).get(asset_id)
     if asset is None or not asset.nas_path:
         raise HTTPException(404, f"Asset {asset_id} not found or has no stored file")
+    if asset_files.is_remote(asset.nas_path):
+        return _remote_file_response(asset_id, asset.nas_path, thumbnail=False)
     if not Path(asset.nas_path).exists():
         # The asset row can outlive its NAS file — relevance rejection,
         # dedup, and trim_excess_assets all delete the file but leave the
@@ -99,6 +122,8 @@ def get_asset_thumbnail(asset_id: uuid.UUID, db: Session = Depends(get_db)):
     asset = AssetRepository(db).get(asset_id)
     if asset is None or not asset.nas_path:
         raise HTTPException(404, f"Asset {asset_id} not found or has no stored file")
+    if asset_files.is_remote(asset.nas_path):
+        return _remote_file_response(asset_id, asset.nas_path, thumbnail=True)
 
     nas_path = Path(asset.nas_path)
     thumb_path = _thumbnail_path_for(nas_path)
