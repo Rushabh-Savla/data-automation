@@ -34,6 +34,7 @@ export const jobCreateSchema = z
         'sun_rgbd',
         'nuscenes',
         'kitti',
+        'nas_share',
       ]),
     ),
 

@@ -1,5 +1,5 @@
 import { NavLink } from 'react-router-dom'
-import { LayoutDashboardIcon, ListChecksIcon, KeyIcon, PlusIcon } from 'lucide-react'
+import { LayoutDashboardIcon, ListChecksIcon, KeyIcon, HardDriveIcon, PlusIcon } from 'lucide-react'
 
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
@@ -8,6 +8,7 @@ const navItems = [
   { to: '/', label: 'Dashboard', icon: LayoutDashboardIcon, end: true },
   { to: '/jobs', label: 'Jobs', icon: ListChecksIcon, end: false },
   { to: '/credentials', label: 'Credentials', icon: KeyIcon, end: false },
+  { to: '/nas', label: 'NAS', icon: HardDriveIcon, end: false },
 ]
 
 export function Sidebar() {

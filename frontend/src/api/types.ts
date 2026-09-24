@@ -23,6 +23,7 @@ export type SourceType =
   | 'sun_rgbd'
   | 'nuscenes'
   | 'kitti'
+  | 'nas_share'
 
 export type JobStatus =
   | 'draft'
@@ -373,6 +374,57 @@ export interface StatsOverview {
   active_jobs: number
   total_jobs: number
   total_assets: number
+}
+
+// -- NAS (app/schemas/nas.py)
+
+export type NasProtocol = 'smb' | 'sftp' | 'ftp' | 'webdav' | 'nfs' | 'local'
+export type NasAuthMode = 'anonymous' | 'password'
+
+/** The saved connection. The password is never returned, only `has_password`. */
+export interface NasConfig {
+  configured: boolean
+  protocol: NasProtocol
+  host: string
+  port: number | null
+  share: string
+  base_path: string
+  storage_path: string
+  use_as_storage: boolean
+  auth_mode: NasAuthMode
+  username: string
+  domain: string
+  has_password: boolean
+  use_tls: boolean
+  verify_tls: boolean
+  updated_at: string | null
+}
+
+/** Body for PUT /nas/config and POST /nas/test. A blank/omitted `password`
+ * keeps the stored one. */
+export interface NasConfigInput {
+  protocol: NasProtocol
+  host: string
+  port: number | null
+  share: string
+  base_path: string
+  storage_path: string
+  use_as_storage: boolean
+  auth_mode: NasAuthMode
+  username: string
+  domain: string
+  password?: string | null
+  use_tls: boolean
+  verify_tls: boolean
+}
+
+export interface NasTestResult {
+  ok: boolean
+  can_read: boolean
+  can_write: boolean
+  message: string
+  latency_ms: number | null
+  sample_files: string[]
 }
 
 // -- WebSocket event payloads (app/services/progress_service.py publishers)

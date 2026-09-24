@@ -32,6 +32,7 @@ const SOURCE_KEY_HINTS: Record<SourceType, string[]> = {
   sun_rgbd: [],
   nuscenes: [],
   kitti: [],
+  nas_share: [],
 }
 
 interface CredentialFormDialogProps {
@@ -100,11 +101,14 @@ export function CredentialFormDialog({ credential, trigger }: CredentialFormDial
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  {Object.entries(sourceTypeLabels).map(([v, label]) => (
-                    <SelectItem key={v} value={v}>
-                      {label}
-                    </SelectItem>
-                  ))}
+                  {/* NAS is configured on its own page, not with an API key. */}
+                  {Object.entries(sourceTypeLabels)
+                    .filter(([v]) => v !== 'nas_share')
+                    .map(([v, label]) => (
+                      <SelectItem key={v} value={v}>
+                        {label}
+                      </SelectItem>
+                    ))}
                 </SelectContent>
               </Select>
             </div>

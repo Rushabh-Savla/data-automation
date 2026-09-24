@@ -14,7 +14,7 @@ export class ApiError extends Error {
 }
 
 interface RequestOptions {
-  method?: 'GET' | 'POST' | 'PATCH' | 'DELETE'
+  method?: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE'
   body?: unknown
   // Accepts any flat options-bag object (e.g. ListJobsFilters) — named
   // filter interfaces don't carry an explicit index signature, so `object`

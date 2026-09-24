@@ -7,6 +7,7 @@ import { JobCreatePage } from '@/pages/JobCreatePage'
 import { JobDetailPage } from '@/pages/JobDetailPage'
 import { JobAssetsPage } from '@/pages/JobAssetsPage'
 import { CredentialsPage } from '@/pages/CredentialsPage'
+import { NasPage } from '@/pages/NasPage'
 import { NotFoundPage } from '@/pages/NotFoundPage'
 
 export const router = createBrowserRouter([
@@ -20,6 +21,7 @@ export const router = createBrowserRouter([
       { path: 'jobs/:jobId', element: <JobDetailPage /> },
       { path: 'jobs/:jobId/assets', element: <JobAssetsPage /> },
       { path: 'credentials', element: <CredentialsPage /> },
+      { path: 'nas', element: <NasPage /> },
       { path: '*', element: <NotFoundPage /> },
     ],
   },

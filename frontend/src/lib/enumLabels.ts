@@ -22,6 +22,7 @@ export const sourceTypeLabels: Record<SourceType, string> = {
   sun_rgbd: 'SUN RGB-D',
   nuscenes: 'nuScenes',
   kitti: 'KITTI',
+  nas_share: 'NAS Share',
 }
 
 export const jobStatusLabels: Record<JobStatus, string> = {
