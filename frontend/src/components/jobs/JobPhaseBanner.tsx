@@ -1,5 +1,5 @@
 import type { FilteringProgress } from '@/hooks/useJobProgressSocket'
-import type { JobDetailResponse } from '@/api/types'
+import { JOB_ACTIVE_STATUSES, type JobDetailResponse } from '@/api/types'
 import { describeSourceActivity, isFilteringPhase } from '@/lib/jobPhase'
 import { formatRelative } from '@/lib/dateFormat'
 
@@ -62,7 +62,11 @@ export function JobPhaseBanner({
     )
   }
 
-  if (job.topup_round && job.topup_round > 1) {
+  // topup_round is left on the job's config after the round that set it
+  // finishes (see backend RCA), so it must not be trusted on its own —
+  // without the active-status check, a finished job keeps showing "still
+  // collecting" forever.
+  if (job.topup_round && job.topup_round > 1 && JOB_ACTIVE_STATUSES.includes(job.status)) {
     return (
       <div className="rounded-md border bg-muted/40 px-4 py-3 text-sm">
         <span className="font-medium">Collecting more data</span> — round {job.topup_round}, because filtering

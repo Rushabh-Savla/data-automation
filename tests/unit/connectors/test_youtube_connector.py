@@ -263,7 +263,10 @@ class TestFetchResume:
         (call,) = fetch_env.extracted.calls
         assert call["start_index"] == 0
         assert call["license"] == "Creative Commons Attribution license"
-        assert progress[0] == {"checkpoint": {"stage": "extracting", "frame_index": 0}, "downloaded": 1}
+        # No "downloaded": 1 here -- only per-frame ticks (from
+        # _extract_frames, faked out in this fixture) count toward
+        # "downloaded", so it stays in lockstep with accepted/rejected.
+        assert progress[0] == {"checkpoint": {"stage": "extracting", "frame_index": 0}}
 
     def test_download_that_produces_no_file_is_still_an_error(self, tmp_path: Path, fetch_env, monkeypatch):
         # The fallback must not paper over a genuine download failure.

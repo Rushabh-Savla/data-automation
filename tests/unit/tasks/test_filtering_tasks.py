@@ -124,6 +124,95 @@ class TestBatchFailureDoesNotStrandTheJob:
         assert calls == ["job-1"]
 
 
+class TestReactiveTrimAfterTerminalJob:
+    """A batch can still write a RELEVANCE_PASSED verdict after its job has
+    already gone terminal: trim_excess_assets (this module) only ever runs
+    once, from plan_topup_round's final round, sized off whatever was
+    already RELEVANCE_PASSED at that moment -- a straggler from the same
+    round that was still mid-classification then is invisible to it.
+    Regression: a target_count=11 job settled at 14 instead of 11. These
+    pin that a late PASS re-triggers trim_excess_assets only when the job
+    is already terminal, never while it's still actively running (trimming
+    mid-round would destroy the margin the next round is trying to build —
+    see run_deduplication's docstring)."""
+
+    @staticmethod
+    def _run_batch(monkeypatch, job_status, outcome):
+        import app.tasks.filtering_tasks as ft
+        from contextlib import contextmanager
+        from types import SimpleNamespace
+
+        asset = SimpleNamespace(status=ft.AssetStatus.PROMOTED, nas_path="/nas/x.jpg")
+        job = SimpleNamespace(status=job_status, query="cars")
+
+        class _FakeAssetRepo:
+            def __init__(self, db):
+                pass
+
+            def get(self, asset_id):
+                return asset
+
+            def set_status(self, asset_id, status, relevance_score=None, is_duplicate_of=None):
+                asset.status = status
+
+        class _FakeJobRepo:
+            def __init__(self, db):
+                pass
+
+            def get(self, job_id):
+                return job
+
+            def increment_counts(self, *args, **kwargs):
+                pass
+
+        @contextmanager
+        def fake_session_scope():
+            yield object()
+
+        trim_calls: list[str] = []
+        fake_redis = _FakeRedis()
+        monkeypatch.setattr(ft, "session_scope", fake_session_scope)
+        monkeypatch.setattr(ft, "AssetRepository", _FakeAssetRepo)
+        monkeypatch.setattr(ft, "JobRepository", _FakeJobRepo)
+        monkeypatch.setattr(ft, "_classify_batch", lambda query, items: [(items[0][0], outcome, 1.0)])
+        monkeypatch.setattr(ft, "get_redis", lambda: fake_redis)
+        monkeypatch.setattr(ft, "finalize_relevance_filter", SimpleNamespace(delay=lambda jid: None))
+        monkeypatch.setattr(ft, "delete_asset_files", lambda a: None)
+        monkeypatch.setattr(ft, "trim_excess_assets", lambda jid: trim_calls.append(jid))
+
+        ft.FanIn(fake_redis).start("11111111-1111-1111-1111-111111111111", ft._FANIN_NAME, 1)
+        ft.relevance_filter_batch.run("11111111-1111-1111-1111-111111111111", ["22222222-2222-2222-2222-222222222222"])
+        return trim_calls
+
+    def test_trims_when_a_pass_lands_after_the_job_is_already_completed(self, monkeypatch):
+        import app.tasks.filtering_tasks as ft
+        from app.domain.enums import JobStatus
+
+        calls = self._run_batch(monkeypatch, JobStatus.COMPLETED, ft._ACCEPT)
+        assert calls == ["11111111-1111-1111-1111-111111111111"]
+
+    def test_trims_when_a_pass_lands_after_the_job_is_already_completed_partial(self, monkeypatch):
+        import app.tasks.filtering_tasks as ft
+        from app.domain.enums import JobStatus
+
+        calls = self._run_batch(monkeypatch, JobStatus.COMPLETED_PARTIAL, ft._ACCEPT)
+        assert calls == ["11111111-1111-1111-1111-111111111111"]
+
+    def test_does_not_trim_while_the_job_is_still_running(self, monkeypatch):
+        import app.tasks.filtering_tasks as ft
+        from app.domain.enums import JobStatus
+
+        calls = self._run_batch(monkeypatch, JobStatus.RUNNING, ft._ACCEPT)
+        assert calls == []
+
+    def test_does_not_trim_when_the_batch_had_no_pass(self, monkeypatch):
+        import app.tasks.filtering_tasks as ft
+        from app.domain.enums import JobStatus
+
+        calls = self._run_batch(monkeypatch, JobStatus.COMPLETED, ft._REJECT)
+        assert calls == []
+
+
 class TestEmptyTopupRoundStillEndsTheJob:
     """A top-up round that fetches nothing new must still reach completion.
 

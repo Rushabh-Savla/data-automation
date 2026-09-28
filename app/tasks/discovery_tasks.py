@@ -36,6 +36,7 @@ from app.tasks.ingest_tasks import (
     download_davis_shard,
     download_kaggle_dataset,
     download_kitti_shard,
+    download_nas_share_shard,
     download_nuscenes_shard,
     download_open_images_shard,
     download_pascal_voc_shard,
@@ -62,16 +63,25 @@ def _default_container_limit(target_count: int | None, *, min_n: int = 5, max_n:
     return min(max_n, max(min_n, (target_count or 100) // divisor))
 
 
-def _default_image_limit(target_count: int | None, *, min_n: int = 200, max_n: int = 5000, multiplier: int = 3) -> int:
+def _default_image_limit(target_count: int | None, *, min_n: int = 20, max_n: int = 5000, multiplier: int = 3) -> int:
     """How many candidate images to pull by default from a locally-cached,
     fixed-vocabulary dataset (COCO/Open Images/Pascal VOC/Visual Genome/
-    DAVIS/SUN RGB-D/nuImages/KITTI), scaled with the job's target count.
-    These connectors match against a pre-downloaded local index, not a
-    rate-limited/costly external API, so there's no reason to truncate a
-    much larger matched set down to a flat 200 — that silently drops
-    candidates before relevance filtering (which routinely rejects 90%+)
-    ever gets a chance to work with them, capping every such job's
-    realistic ceiling at whatever ~10-20% of 200 survives filtering."""
+    DAVIS/SUN RGB-D/nuImages/KITTI) or YouTube, scaled with the job's
+    target count. `multiplier` alone already gives relevance filtering
+    (which routinely rejects a majority of candidates) real headroom
+    proportional to what was actually asked for -- `min_n` here is only a
+    floor against degenerate near-zero targets (target_count 1-6ish),
+    not a substitute for that scaling.
+
+    Previously min_n=200 unconditionally, regardless of target_count: a
+    target of 11-20 still got at least 200 candidates discovered and
+    dispatched for download, most of them guaranteed to be thrown away
+    (observed directly: a target_count=20 YouTube job discovering/
+    dispatching 400 downloads on top of a live queue already contended by
+    other jobs). Worse than wasted local compute for COCO/etc. -- every
+    dispatched item is a real Celery task competing for the same limited
+    worker pool every other job's downloads share, so one oversized small
+    job measurably slows down everything else running at the time."""
     return min(max_n, max(min_n, (target_count or 200) * multiplier))
 
 
@@ -324,7 +334,7 @@ def discover_youtube(self, job_id: str, job_source_task_id: str):
             items = [{"url": u, "video_id": _video_id_from_url(u), "license": "unknown"} for u in explicit_urls]
         else:
             credentials = CredentialService(CredentialRepository(db)).resolve(SourceType.YOUTUBE)
-            connector = YouTubeConnector(cc_only=yt_config.get("cc_only", True))
+            connector = YouTubeConnector(cc_only=yt_config.get("cc_only", False))
             with heartbeat_during(task_uuid):
                 page = connector.discover(
                     job.query, cursor=None,
@@ -1069,3 +1079,91 @@ def discover_kitti(self, job_id: str, job_source_task_id: str):
 
 
 register_source_discovery_task(SourceType.KITTI, "app.tasks.discovery_tasks.discover_kitti")
+
+
+@celery_app.task(name="app.tasks.discovery_tasks.discover_nas_share", bind=True)
+def discover_nas_share(self, job_id: str, job_source_task_id: str):
+    from app.connectors.nas_share_connector import NasShareConnector
+    from app.services.nas_config_service import get_saved_params
+
+    job_uuid = uuid.UUID(job_id)
+    task_uuid = uuid.UUID(job_source_task_id)
+    bind_context(job_uuid, task_uuid)
+
+    with session_scope() as db:
+        task_repo = JobSourceTaskRepository(db)
+        task = task_repo.get(task_uuid)
+        if task is None:
+            unbind_context()
+            return
+
+        job = task.job
+        task_repo.set_status(task_uuid, JobSourceTaskStatus.DISCOVERING)
+        task_repo.heartbeat(task_uuid)
+        # commit (not flush): walking a large share can take a while inside this
+        # open transaction; see discover_coco for why the heartbeat must be visible.
+        db.commit()
+
+        try:
+            params = get_saved_params()
+        except Exception as e:  # e.g. encryption key missing/rotated
+            params, config_error = None, f"NAS credentials could not be read: {e}"
+        else:
+            config_error = "NAS is not configured — add it under NAS in the sidebar"
+
+        if params is None:
+            task_repo.set_status(task_uuid, JobSourceTaskStatus.COMPLETED_PARTIAL, error_message=config_error)
+            db.commit()
+            check_and_advance_job(job_id)
+            unbind_context()
+            return
+
+        nas_config = job.config.get("nas_share", {})
+        connector = NasShareConnector(params, min_resolution=tuple(job.config.get("min_resolution", (64, 64))))
+        with heartbeat_during(task_uuid):
+            page = connector.discover(
+                job.query,
+                cursor=None,
+                limit=nas_config.get(
+                    "max_images",
+                    topup_limit(
+                        scale_for_topup(_default_image_limit(job.target_count), job, hard_max=50_000),
+                        job,
+                        SourceType.NAS_SHARE,
+                        already_seen=AssetRepository(db).count_for_job(job_uuid),
+                        hard_max=50_000,
+                    ),
+                ),
+            )
+        shards = page.items
+
+        if not shards:
+            task_repo.set_status(
+                task_uuid,
+                JobSourceTaskStatus.COMPLETED_PARTIAL,
+                error_message=page.error_reason or "No images found on the NAS",
+            )
+            db.commit()
+            check_and_advance_job(job_id)
+            unbind_context()
+            return
+
+        total_images = sum(len(s.external_ref["paths"]) for s in shards)
+        task_repo.increment_counts(task_uuid, discovered=total_images)
+        db.flush()
+
+    item_dicts = [
+        {
+            "external_ref": {**s.external_ref},
+            "license_hint": s.license_hint,
+            "dataset_identifier": s.dataset_identifier,
+        }
+        for s in shards
+    ]
+
+    download_group = [download_nas_share_shard.s(job_id, job_source_task_id, item) for item in item_dicts]
+    chord(download_group)(on_source_finished.s(job_id, job_source_task_id))
+    unbind_context()
+
+
+register_source_discovery_task(SourceType.NAS_SHARE, "app.tasks.discovery_tasks.discover_nas_share")

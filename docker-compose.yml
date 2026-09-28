@@ -1,5 +1,6 @@
 services:
   postgres:
+    restart: unless-stopped
     image: postgres:16-alpine
     environment:
       POSTGRES_USER: postgres
@@ -16,6 +17,7 @@ services:
       retries: 10
 
   redis:
+    restart: unless-stopped
     image: redis:7-alpine
     ports:
       - "6378:6379"
@@ -26,6 +28,7 @@ services:
       retries: 10
 
   api:
+    restart: unless-stopped
     build:
       context: .
       dockerfile: docker/Dockerfile.api
@@ -59,6 +62,8 @@ services:
   # slow inference tasks from starving connector downloads (and vice versa),
   # and lets each side size its concurrency for its own bottleneck.
   worker:
+    restart: unless-stopped
+    stop_grace_period: 90s
     build:
       context: .
       dockerfile: docker/Dockerfile.worker
@@ -105,6 +110,8 @@ services:
   # the filtering worker must not be able to exhaust the GPU and take them
   # down with it.
   worker-gpu:
+    restart: unless-stopped
+    stop_grace_period: 90s
     build:
       context: .
       dockerfile: docker/Dockerfile.worker
@@ -147,6 +154,7 @@ services:
         condition: service_healthy
 
   beat:
+    restart: unless-stopped
     build:
       context: .
       dockerfile: docker/Dockerfile.worker
@@ -174,6 +182,7 @@ services:
         condition: service_healthy
 
   flower:
+    restart: unless-stopped
     build:
       context: .
       dockerfile: docker/Dockerfile.worker
@@ -188,6 +197,7 @@ services:
         condition: service_healthy
 
   frontend:
+    restart: unless-stopped
     build:
       context: .
       dockerfile: docker/Dockerfile.frontend

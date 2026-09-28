@@ -88,12 +88,14 @@ from celery.exceptions import SoftTimeLimitExceeded
 from app.db.repositories.asset_repository import AssetRepository
 from app.db.repositories.job_repository import JobRepository
 from app.db.session import session_scope
-from app.domain.enums import AssetStatus
+from app.domain.enums import JOB_TERMINAL_STATUSES, AssetStatus
 from app.filtering.dedup import HybridDeduplicator
 from app.services.fan_in import FanIn
 from app.services.job_counters import reconcile
 from app.services.progress_service import ProgressPublisher
 from app.services.standardization_service import delete_asset_files
+from app.storage import asset_files
+from app.tasks.nas_tasks import schedule_offload
 from app.core.config import get_settings
 from app.core.redis_client import get_redis
 from app.tasks.celery_app import celery_app
@@ -371,7 +373,12 @@ def relevance_filter_batch(self, job_id: str, asset_ids: list[str]) -> dict:
                 # redelivery.
                 if asset.status != AssetStatus.PROMOTED:
                     continue
-                items.append((asset_id_str, str(asset.nas_path)))
+                try:
+                    items.append((asset_id_str, asset_files.local_path_for_read(str(asset.nas_path))))
+                except (FileNotFoundError, asset_files.NasUnreachable) as e:
+                    # Image is on the NAS and could not be fetched right now: leave it
+                    # PROMOTED for a later pass rather than judge it blind.
+                    logger.warning(f"Skipping asset {asset_id_str}: {e}")
 
         # -- Inference phase: NO session held. -----------------------------
         decisions = _classify_batch(query, items)
@@ -379,6 +386,7 @@ def relevance_filter_batch(self, job_id: str, asset_ids: list[str]) -> dict:
         # -- Write-back phase: short transactions, chunked so a kill keeps
         #    whatever was already decided. ---------------------------------
         for chunk in _chunk(decisions, _WRITEBACK_CHUNK):
+            chunk_passed: list[str] = []
             with session_scope() as db:
                 job_repo = JobRepository(db)
                 asset_repo = AssetRepository(db)
@@ -396,6 +404,7 @@ def relevance_filter_batch(self, job_id: str, asset_ids: list[str]) -> dict:
                         asset_repo.set_status(
                             asset_uuid, AssetStatus.RELEVANCE_PASSED, relevance_score=score
                         )
+                        chunk_passed.append(asset_id_str)
                         passed += 1
                     else:
                         asset = asset_repo.get(asset_uuid)
@@ -414,6 +423,33 @@ def relevance_filter_batch(self, job_id: str, asset_ids: list[str]) -> dict:
                         # now that we know it's actually irrelevant.
                         job_repo.increment_counts(job_uuid, accepted=-1, rejected=1)
                         rejected += 1
+
+            # The chunk's verdicts are committed now. If a NAS is connected, the kept
+            # images move onto it (and off local disk); a no-op otherwise. Never raises.
+            schedule_offload(chunk_passed)
+
+        # A batch can still land PASSED verdicts after the job has already
+        # gone terminal: trim_excess_assets (filtering_tasks.py) only ever
+        # runs once, from plan_topup_round's final round, sized off whatever
+        # was already RELEVANCE_PASSED at that moment -- an asset from the
+        # same round that was still downloading/awaiting classification then
+        # is invisible to it. Observed directly: a target_count=11 job
+        # finished target_count_reached at 8 passed, then kept climbing to
+        # 14 as the rest of that round's batches finalized, with nothing
+        # left to re-trim a job that's already COMPLETED. Re-checking here,
+        # every time a PASS is written, closes that gap regardless of which
+        # timing path produced the straggler -- trim_excess_assets is a
+        # cheap no-op (one query) whenever there's nothing to trim, so this
+        # costs nothing on the far more common case where the job is still
+        # actively running and this must NOT fire (trimming mid-round would
+        # destroy the very margin the next round is trying to build, see
+        # run_deduplication's docstring on why trim isn't called from there).
+        if passed:
+            with session_scope() as db:
+                job = JobRepository(db).get(job_uuid)
+                job_is_terminal = job is not None and job.status in JOB_TERMINAL_STATUSES
+            if job_is_terminal:
+                trim_excess_assets(job_id)
 
     except SoftTimeLimitExceeded:
         # Swallowed on purpose: re-raising would skip nothing (the finally

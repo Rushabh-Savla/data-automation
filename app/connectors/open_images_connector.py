@@ -32,6 +32,8 @@ from app.connectors.base import (
     SourceItem,
     register_connector,
 )
+from app.connectors.open_vocab import scan_candidates
+from app.connectors.query_terms import match_labels
 from app.core.config import get_settings
 from app.core.exceptions import JobStopped, TransientConnectorError
 from app.domain.enums import SourceType
@@ -118,16 +120,13 @@ class OpenImagesConnector:
         if explicit_classes:
             wanted = {c.strip().lower() for c in explicit_classes if c.strip()}
             matched_ids = {lid for lid, name in descriptions.items() if name.lower() in wanted}
+            if not matched_ids:
+                return DiscoveryPage(
+                    items=[], next_cursor=None, exhausted=True,
+                    error_reason=f"No Open Images classes matched {explicit_classes!r}",
+                )
         else:
             matched_ids = self._match_classes(query, descriptions)
-        if not matched_ids:
-            return DiscoveryPage(
-                items=[], next_cursor=None, exhausted=True,
-                error_reason=(
-                    f"No Open Images classes matched query {query!r} — its taxonomy is "
-                    "narrower than free text; use explicit class overrides"
-                ),
-            )
 
         try:
             ann_csv_path = _ensure_annotations_cached(self.split)
@@ -138,48 +137,57 @@ class OpenImagesConnector:
                 error_reason=f"Failed to download Open Images {self.split} annotations: {e}",
             )
 
+        # Open Images has ~600 classes, so many queries name none of them. Labelled images
+        # come first; when they cannot fill the limit -- or none names this query -- the rest
+        # is filled from every other image, and the relevance filter decides (open_vocab.py).
+        # Not for explicit class overrides, which are an exact request. The file is only read
+        # to the end when a scan is needed: a full labelled set stops the read at the limit.
+        scan_wanted = not explicit_classes
         image_ids: list[str] = []
         seen: set[str] = set()
+        every_image: set[str] = set()
         with open(ann_csv_path, encoding="utf-8") as f:
             for row in csv.DictReader(f):
+                every_image.add(row["ImageID"])
                 if row.get("LabelName") in matched_ids and row["ImageID"] not in seen:
                     seen.add(row["ImageID"])
                     image_ids.append(row["ImageID"])
                     if len(image_ids) >= limit:
                         break
 
-        if not image_ids:
+        scan_ids: list[str] = []
+        if scan_wanted and len(image_ids) < limit:
+            scan_ids = scan_candidates(every_image, seen, limit - len(image_ids))
+
+        if not image_ids and not scan_ids:
             return DiscoveryPage(items=[], next_cursor=None, exhausted=True)
 
-        shards = [image_ids[i : i + _SHARD_SIZE] for i in range(0, len(image_ids), _SHARD_SIZE)]
         items = [
             SourceItem(
                 source_type=SourceType.OPEN_IMAGES,
-                external_ref={"image_ids": shard, "split": self.split, "label_ids": sorted(matched_ids)},
+                external_ref={
+                    "image_ids": batch[i : i + _SHARD_SIZE],
+                    "split": self.split,
+                    "label_ids": sorted(matched_ids),
+                    "unlabelled": unlabelled,
+                },
                 license_hint=_LICENSE_NOTE,
                 dataset_identifier=f"open-images-{self.split}",
             )
-            for shard in shards
+            for batch, unlabelled in ((image_ids, False), (scan_ids, True))
+            for i in range(0, len(batch), _SHARD_SIZE)
         ]
         return DiscoveryPage(items=items, next_cursor=None, exhausted=True)
 
     @staticmethod
     def _match_classes(query: str, descriptions: dict[str, str]) -> set[str]:
-        """Two-directional substring match (case-insensitive, prefer exact
-        when multiple hit) — same convention as every other connector added
-        this session. The reference script's original one-directional check
-        (`keyword in name`) missed plain plurals like "cats" not being a
-        substring of "cat", which a real job caught."""
-        keyword_lower = query.strip().lower()
-        matches = [
-            (lid, name) for lid, name in descriptions.items()
-            if keyword_lower in name.lower() or name.lower() in keyword_lower
-        ]
-        if len(matches) > 1:
-            exact = [(lid, name) for lid, name in matches if name.lower() == keyword_lower]
-            if exact:
-                matches = exact
-        return {lid for lid, _ in matches}
+        """Ids of the Open Images classes the query is asking for (see
+        query_terms.match_labels): per term, with synonyms and plurals, so "puppy" finds
+        Dog and "cats" finds Cat. Empty when the query names none of them."""
+        ids_by_name: dict[str, list[str]] = {}
+        for lid, name in descriptions.items():
+            ids_by_name.setdefault(name, []).append(lid)
+        return {lid for name in match_labels(query, ids_by_name) for lid in ids_by_name[name]}
 
     # -- Download ----------------------------------------------------------------
 
@@ -280,7 +288,12 @@ class OpenImagesConnector:
                 width=w,
                 height=h,
                 classes=registry.names,
-                metadata={"open_images_image_id": image_id, "split": split},
+                metadata={
+                    "open_images_image_id": image_id,
+                    "split": split,
+                    # "vlm": picked by the relevance model among images not labelled for this query.
+                    "matched_by": "vlm" if item.external_ref.get("unlabelled") else "label",
+                },
             )
             on_progress({"checkpoint": {"index": i + 1}, "downloaded": 1})
             yield draft

@@ -160,6 +160,13 @@ class JobRepository:
 
         if status in JOB_TERMINAL_STATUSES:
             values["completed_at"] = datetime.now(timezone.utc)
+            # Drop the top-up bookkeeping now that no further round will
+            # ever run: JobResponse surfaces config["_topup"]["round"] as
+            # topup_round unconditionally, and left in place it makes a
+            # finished job's UI banner claim it's still "collecting more
+            # data" forever. The JSONB `-` operator removes the key
+            # server-side (no-op if absent) without a read-modify-write.
+            values["config"] = Job.config.op("-")("_topup")
         self.db.execute(update(Job).where(Job.id == job_id).values(**values))
 
     def increment_counts(

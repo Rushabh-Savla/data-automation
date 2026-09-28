@@ -113,6 +113,7 @@ def _raise_if_rate_limit_cooldown_active() -> None:
             retry_after_s=_rate_limit_cooldown_remaining_s(),
         )
 
+
 # A single literal query has a finite pool of matching videos, and cc_only
 # filtering (default on) shrinks that further — mirrors web_connector.py's
 # _QUERY_VARIANT_SUFFIXES fix for the same "job stops way short of target"
@@ -684,7 +685,13 @@ class YouTubeConnector:
             license_name = (
                 info.get("license", "unknown") if info is not None else (item.license_hint or "unknown")
             )
-            on_progress({"checkpoint": {"stage": "extracting", "frame_index": 0}, "downloaded": 1})
+            # No "downloaded": 1 here -- a video isn't itself an Asset, only
+            # the frames extracted from it are, and those are counted below
+            # in _extract_frames(). Counting the video too double-counted
+            # "downloaded" against "accepted"/"rejected"/"duplicate"/"errors"
+            # (which only ever count frames), inflating it by exactly one
+            # per video with nothing on the other side to balance it.
+            on_progress({"checkpoint": {"stage": "extracting", "frame_index": 0}})
         else:
             video_id = item.external_ref.get("video_id", "")
             video_path = self._local_video(video_dir, video_id)

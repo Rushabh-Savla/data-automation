@@ -44,7 +44,7 @@ export function SourcePicker({ useAuto, onUseAutoChange, selected, onSelectedCha
 
       <button
         type="button"
-        onClick={() => onUseAutoChange(false)}
+        onClick={() => onUseAutoChange(!useAuto)}
         className="self-start text-xs text-muted-foreground underline-offset-2 hover:underline"
       >
         {useAuto ? 'Choose specific sources instead' : 'Use Auto instead'}
@@ -56,7 +56,8 @@ export function SourcePicker({ useAuto, onUseAutoChange, selected, onSelectedCha
             {isLoading &&
               Array.from({ length: 4 }).map((_, i) => <Skeleton key={i} className="h-9 w-28" />)}
 
-            {sources?.map((source) => {
+            {/* The NAS is set up under Credentials and is not offered as a job source. */}
+            {sources?.filter((source) => source.source_type !== 'nas_share').map((source) => {
               const isSelected = selected.includes(source.source_type)
               const disabled = !source.connector_implemented
               const chip = (
