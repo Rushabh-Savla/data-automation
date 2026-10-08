@@ -670,10 +670,21 @@ class YouTubeConnector:
                 )
 
             video_id = info.get("id") if info is not None else item.external_ref["video_id"]
-            candidates = [
-                p for p in video_dir.glob(f"{video_id}.*")
-                if p.suffix.lower() in _MEDIA_EXTENSIONS
-            ]
+            if info is not None:
+                candidates = [
+                    p for p in video_dir.glob(f"{video_id}.*")
+                    if p.suffix.lower() in _MEDIA_EXTENSIONS
+                ]
+            else:
+                # MaxDownloadsReached fallthrough: no `info` dict, so the id we have
+                # may not match the real downloaded filename (e.g. it was parsed from
+                # a share-link URL still carrying a tracking query string). video_dir
+                # is a fresh per-task workdir holding only this one video, so match
+                # on any media file instead of requiring the filename to start with id.
+                candidates = [
+                    p for p in video_dir.glob("*")
+                    if p.suffix.lower() in _MEDIA_EXTENSIONS
+                ]
             if not candidates:
                 reason = (
                     error_logger.last_error

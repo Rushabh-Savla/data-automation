@@ -7,6 +7,7 @@ block another source's chord from completing — the concrete mechanism for
 
 import logging
 import uuid
+from urllib.parse import parse_qs, urlparse
 
 from celery import chord
 
@@ -331,7 +332,13 @@ def discover_youtube(self, job_id: str, job_source_task_id: str):
         discovery_error_reason: str | None = None
         discovery_retry_after_s: float | None = None
         if explicit_urls:
-            items = [{"url": u, "video_id": _video_id_from_url(u), "license": "unknown"} for u in explicit_urls]
+            items = []
+            for u in explicit_urls:
+                video_id = _video_id_from_url(u)
+                if video_id is None:
+                    logger.warning(f"Skipping non-single-video YouTube URL for job {job_id}: {u}")
+                    continue
+                items.append({"url": u, "video_id": video_id, "license": "unknown"})
         else:
             credentials = CredentialService(CredentialRepository(db)).resolve(SourceType.YOUTUBE)
             connector = YouTubeConnector(cc_only=yt_config.get("cc_only", False))
@@ -395,10 +402,27 @@ def discover_youtube(self, job_id: str, job_source_task_id: str):
     unbind_context()
 
 
-def _video_id_from_url(url: str) -> str:
-    if "watch?v=" in url:
-        return url.split("watch?v=")[1].split("&")[0]
-    return url.rstrip("/").rsplit("/", 1)[-1]
+def _video_id_from_url(url: str) -> str | None:
+    """Extract a single video id from a YouTube URL, or None if the URL
+    does not point at a single video (e.g. a playlist or channel link)."""
+    parsed = urlparse(url)
+    path = parsed.path.rstrip("/")
+
+    if path == "/watch":
+        values = parse_qs(parsed.query).get("v")
+        return values[0] if values else None
+
+    if "/playlist" in path or "/channel/" in path or "/c/" in path or path.startswith("/@"):
+        return None
+
+    for prefix in ("/shorts/", "/embed/", "/v/"):
+        if path.startswith(prefix):
+            return path[len(prefix):].split("/")[0] or None
+
+    if parsed.netloc.endswith("youtu.be"):
+        return path.lstrip("/").split("/")[0] or None
+
+    return None
 
 
 register_source_discovery_task(SourceType.YOUTUBE, "app.tasks.discovery_tasks.discover_youtube")

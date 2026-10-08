@@ -75,7 +75,8 @@ export function JobCreateForm() {
         />
         {errors.query && <p className="text-xs text-destructive">{errors.query.message}</p>}
 
-        <Input {...register('name')} placeholder="Job name (optional)" className="max-w-sm" />
+        <Input {...register('name')} placeholder="Job name" className="max-w-sm" />
+        {errors.name && <p className="text-xs text-destructive">{errors.name.message}</p>}
       </div>
 
       <section className="flex flex-col gap-2">
@@ -173,7 +174,12 @@ export function JobCreateForm() {
         </Card>
       </section>
 
-      <JobConfigAdvancedSection control={control} register={register} activeSources={[...activeSources]} />
+      <JobConfigAdvancedSection
+        control={control}
+        register={register}
+        activeSources={[...activeSources]}
+        jobName={watch('name')}
+      />
 
       <CardContent className="flex justify-end gap-2 p-0">
         <Button type="submit" disabled={isSubmitting} size="lg">

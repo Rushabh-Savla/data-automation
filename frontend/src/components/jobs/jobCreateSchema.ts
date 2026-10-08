@@ -9,6 +9,26 @@ import type { JobConfig, JobCreateRequest, SourceType } from '@/api/types'
 // type split that RHF v7 + @hookform/resolvers can't cleanly infer through
 // without threading three generic params everywhere, for no real benefit
 // since these are all optional advanced fields anyway.
+const YOUTUBE_HOSTS = new Set(['youtube.com', 'www.youtube.com', 'm.youtube.com', 'youtu.be'])
+
+function isSingleVideoYoutubeUrl(value: string): boolean {
+  let parsed: URL
+  try {
+    parsed = new URL(value)
+  } catch {
+    return false
+  }
+  if (!YOUTUBE_HOSTS.has(parsed.hostname)) return false
+
+  if (parsed.hostname === 'youtu.be') {
+    return parsed.pathname.replace(/\/+$/, '').length > 1
+  }
+  if (parsed.pathname === '/watch') {
+    return parsed.searchParams.has('v')
+  }
+  return /^\/(shorts|embed|v)\/[^/]+/.test(parsed.pathname)
+}
+
 const optionalNumberString = z
   .string()
   .optional()
@@ -17,7 +37,10 @@ const optionalNumberString = z
 export const jobCreateSchema = z
   .object({
     query: z.string().min(1, 'Tell us what you want to collect'),
-    name: z.string().optional(),
+    name: z
+      .string()
+      .min(1, 'Job name is required')
+      .refine((v) => v.trim().length > 0, { message: 'Job name is required' }),
 
     useAutoSources: z.boolean(),
     sources: z.array(
@@ -75,7 +98,15 @@ export const jobCreateSchema = z
     youtubeCcOnly: z.boolean().optional(),
     youtubeFrameMode: z.string().optional(),
     youtubeFramesPerVideo: optionalNumberString,
-    youtubeUrls: z.array(z.object({ url: z.string() })).optional(),
+    youtubeUrls: z
+      .array(
+        z.object({
+          url: z.string().refine((v) => v.trim() === '' || isSingleVideoYoutubeUrl(v.trim()), {
+            message: 'Enter a single video URL (watch/shorts/youtu.be) — playlist and channel links are not supported',
+          }),
+        }),
+      )
+      .optional(),
 
     webMaxResults: optionalNumberString,
     webSafesearch: z.string().optional(),

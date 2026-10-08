@@ -17,7 +17,9 @@ from app.connectors.nas.base import NasClient, join_relpath, open_client
 from app.core.config import get_settings
 from app.core.exceptions import ConnectorError, FatalConnectorError, TransientConnectorError
 from app.core.redis_client import get_redis
+from app.core.slugify import job_folder_name
 from app.db.models.asset import Asset
+from app.db.models.job import Job
 from app.db.repositories.asset_repository import AssetRepository
 from app.db.session import session_scope
 from app.domain.enums import AssetStatus
@@ -31,15 +33,28 @@ _LOCK_TTL_S = 900
 _SWEEP_BATCH = 500
 
 
-def _remote_rel_for(storage_path: str, local_file: Path) -> str:
+def _remote_rel_for(storage_path: str, local_file: Path, job_folder: str | None = None) -> str:
     """<storage_path>/<job>/<source>/{images|annotations}/<name> — the same
-    layout the local staging area uses, so a job's files stay together."""
+    layout the local staging area uses, so a job's files stay together.
+
+    The local layout's leading segment is always the job's UUID; on the NAS it is
+    replaced with `job_folder` (a human-readable, still-unique folder name derived
+    from the job's name) when the caller has one, so the job stays easy to find."""
     settings = get_settings()
     try:
         rel = local_file.resolve().relative_to(settings.nas_root.resolve()).as_posix()
     except ValueError:
         rel = "/".join(local_file.parts[-4:])
+    if job_folder is not None:
+        _job_id_segment, _, remainder = rel.partition("/")
+        if remainder:
+            rel = f"{job_folder}/{remainder}"
     return join_relpath(storage_path, rel)
+
+
+def _job_folder_for_asset(db, job_id: uuid.UUID) -> str:
+    job_name = db.execute(select(Job.name).where(Job.id == job_id)).scalar_one_or_none()
+    return job_folder_name(job_name, job_id)
 
 
 def _upload_verified(client: NasClient, local_file: Path, rel: str) -> None:
@@ -110,11 +125,12 @@ def _offload(asset_uuid: uuid.UUID) -> str:
             if asset.annotation_nas_path and not asset_files.is_remote(asset.annotation_nas_path)
             else None
         )
+        job_folder = _job_folder_for_asset(db, asset.job_id)
 
     if not image_local.exists():
         return "local_missing"
-    image_rel = _remote_rel_for(params.storage_path, image_local)
-    ann_rel = _remote_rel_for(params.storage_path, ann_local) if ann_local and ann_local.exists() else None
+    image_rel = _remote_rel_for(params.storage_path, image_local, job_folder)
+    ann_rel = _remote_rel_for(params.storage_path, ann_local, job_folder) if ann_local and ann_local.exists() else None
 
     attempted: list[str] = []
     try:

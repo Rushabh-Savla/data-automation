@@ -25,7 +25,6 @@ from app.connectors.nas.base import (
     NasClient,
     NasConnectionError,
     NasNotFoundError,
-    join_relpath,
     normalize_relpath,
     open_client,
 )
@@ -160,10 +159,6 @@ def delete(path: str, strict: bool = False) -> None:
                 raise
             raise _translate(exc) from exc
         logger.warning(f"Could not delete {path} from the NAS: {exc}")
-
-
-def remote_dir_for_job(storage_path: str, job_id: str) -> str:
-    return join_relpath(storage_path, job_id)
 
 
 def _evict_if_needed() -> None:

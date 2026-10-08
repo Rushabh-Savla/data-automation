@@ -29,7 +29,7 @@ class JobCreateRequest(BaseModel):
             "a query, not pick sources by hand."
         ),
     )
-    name: str | None = None
+    name: str = Field(..., min_length=1, description="Job name — also used to name its NAS storage folder")
     target_count: int | None = Field(default=None, gt=0)
     deadline_at: datetime | None = None
     scheduled_start_at: datetime | None = None
