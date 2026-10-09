@@ -18,6 +18,11 @@ class FakeDb:
 
     def execute(self, stmt):
         asset = self.asset
+        # _job_folder_for_asset's select(Job.name) query: no job name on file in
+        # this fake DB, so job_folder_name() falls back to the plain job id,
+        # matching the `world.job` string the remote-path assertions expect.
+        if list(getattr(stmt, "selected_columns", {}).keys()) == ["name"]:
+            return SimpleNamespace(scalar_one_or_none=lambda: None)
         return SimpleNamespace(
             scalar_one_or_none=lambda: asset,
             scalars=lambda: iter(getattr(self, "ids", [])),
@@ -49,7 +54,7 @@ def world(tmp_path, monkeypatch):
     params = NasConnectionParams(protocol="local", share=str(nas), storage_path="data_automation")
     asset = SimpleNamespace(
         id=uuid.uuid4(), status=AssetStatus.RELEVANCE_PASSED,
-        nas_path=str(local_img), annotation_nas_path=str(local_ann),
+        nas_path=str(local_img), annotation_nas_path=str(local_ann), job_id=uuid.UUID(job),
     )
     db = FakeDb(asset)
 
@@ -208,18 +213,25 @@ class TestRemotePathLayout:
 
 
 class TestScheduling:
-    def test_schedule_offload_dispatches_one_task_per_asset(self, monkeypatch):
+    def test_schedule_offload_dispatches_one_batch_task(self, monkeypatch):
         sent = []
         monkeypatch.setattr(nt, "is_storage_active", lambda: True)
-        monkeypatch.setattr(nt.offload_asset_to_nas, "delay", lambda i: sent.append(i))
+        monkeypatch.setattr(nt, "_cooldown_active", lambda r: False)
+        monkeypatch.setattr(nt.offload_asset_batch, "delay", lambda ids: sent.append(ids))
         nt.schedule_offload(["a", "b"])
-        assert sent == ["a", "b"]
+        assert sent == [["a", "b"]]
 
     def test_schedule_offload_is_a_noop_without_a_nas(self, monkeypatch):
         monkeypatch.setattr(nt, "is_storage_active", lambda: False)
-        monkeypatch.setattr(nt.offload_asset_to_nas, "delay", lambda i: pytest.fail("must not dispatch"))
+        monkeypatch.setattr(nt.offload_asset_batch, "delay", lambda ids: pytest.fail("must not dispatch"))
         nt.schedule_offload(["a"])
         nt.schedule_offload([])
+
+    def test_schedule_offload_skips_while_the_nas_is_cooling_down(self, monkeypatch):
+        monkeypatch.setattr(nt, "is_storage_active", lambda: True)
+        monkeypatch.setattr(nt, "_cooldown_active", lambda r: True)
+        monkeypatch.setattr(nt.offload_asset_batch, "delay", lambda ids: pytest.fail("must not dispatch"))
+        nt.schedule_offload(["a"])
 
     def test_schedule_offload_never_raises_into_the_filter(self, monkeypatch):
         def broken():
@@ -232,9 +244,16 @@ class TestScheduling:
         sent = []
         world.db.ids = [uuid.uuid4(), uuid.uuid4()]
         monkeypatch.setattr(nt, "is_storage_active", lambda: True)
-        monkeypatch.setattr(nt.offload_asset_to_nas, "delay", lambda i: sent.append(i))
+        monkeypatch.setattr(nt, "_cooldown_active", lambda r: False)
+        monkeypatch.setattr(nt.offload_asset_batch, "delay", lambda ids: sent.extend(ids))
         assert nt.sweep_unoffloaded_assets() == 2 and len(sent) == 2
         monkeypatch.setattr(nt, "is_storage_active", lambda: False)
+        assert nt.sweep_unoffloaded_assets() == 0
+
+    def test_sweeper_skips_while_the_nas_is_cooling_down(self, monkeypatch):
+        monkeypatch.setattr(nt, "is_storage_active", lambda: True)
+        monkeypatch.setattr(nt, "_cooldown_active", lambda r: True)
+        monkeypatch.setattr(nt.offload_asset_batch, "delay", lambda ids: pytest.fail("must not dispatch"))
         assert nt.sweep_unoffloaded_assets() == 0
 
 
@@ -243,6 +262,9 @@ class TestOffloadTaskLock:
         held = set()
 
         class R:
+            def get(self, key):
+                return None
+
             def set(self, key, val, nx=False, ex=None):
                 if key in held:
                     return None
@@ -253,13 +275,15 @@ class TestOffloadTaskLock:
                 held.discard(key)
 
         monkeypatch.setattr(nt, "get_redis", lambda: R())
+        monkeypatch.setattr(nt, "get_active_storage_params", lambda: object())
+        monkeypatch.setattr(nt, "open_client", lambda params: contextlib.nullcontext(object()))
         calls = []
-        monkeypatch.setattr(nt, "_offload", lambda a: calls.append(a) or "offloaded")
+        monkeypatch.setattr(nt, "_offload", lambda a, client=None: calls.append(a) or "offloaded")
         aid = str(uuid.uuid4())
         held.add(f"nas_offload:{aid}")
-        assert nt.offload_asset_to_nas.run(aid) == "in_flight" and calls == []
+        assert nt.offload_asset_batch.run([aid]) == {aid: "in_flight"} and calls == []
         held.clear()
-        assert nt.offload_asset_to_nas.run(aid) == "offloaded"
+        assert nt.offload_asset_batch.run([aid]) == {aid: "offloaded"}
         assert held == set(), "the lock must be released when the work is done"
 
 

@@ -14,7 +14,6 @@ doesn't mean re-implementing that machinery (DRY).
 
 import hashlib
 import logging
-import math
 import uuid
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -313,19 +312,6 @@ def download_roboflow_item(self, job_id: str, job_source_task_id: str, item_dict
 
 
 
-def _default_frames_per_video(target_count: int | None) -> int:
-    """Per-video frame ceiling, scaled to the job's target.
-
-    Floored so a small job still gets usable coverage from each video, and
-    capped so a large job does not let one video dominate. The divisor
-    expresses "no single video should supply more than roughly a fifth of
-    what we need", which leaves room for breadth across the rest.
-    """
-    if not target_count:
-        return 60
-    return max(30, min(300, math.ceil(target_count / 5)))
-
-
 @celery_app.task(
     name="app.tasks.ingest_tasks.download_youtube_video",
     bind=True,
@@ -351,32 +337,20 @@ def download_youtube_video(self, job_id: str, job_source_task_id: str, item_dict
         task = JobSourceTaskRepository(db).get(uuid.UUID(job_source_task_id))
         yt_config = task.job.config.get("youtube", {}) if task and task.job else {}
         min_res = tuple(task.job.config.get("min_resolution", (320, 240))) if task and task.job else (320, 240)
-        # Read inside the session: `task` is detached once this block exits,
-        # so touching task.job afterwards raises DetachedInstanceError.
-        target_count = task.job.target_count if task and task.job else None
 
-    # Seconds between extracted frames, user-configurable per job; 1.0 (today's
-    # default: one frame per second) when unset or not a usable positive number.
-    frame_interval_s = yt_config.get("frame_interval_s", 1.0)
-    extraction_fps = 1.0 / frame_interval_s if frame_interval_s and frame_interval_s > 0 else 1.0
+    # Frames extracted per second of video, user-configurable per job; 1.0
+    # (one frame per second) when unset or not a usable positive number.
+    extraction_fps = yt_config.get("fps", 1.0)
+    if not extraction_fps or extraction_fps <= 0:
+        extraction_fps = 1.0
 
     connector = YouTubeConnector(
-        # A per-video ceiling, defaulted rather than left unbounded.
-        #
-        # At fps=1.0 with no cap, a single video contributes one frame per
-        # second of its runtime: one video in a real job produced 178 frames,
-        # and seven videos consumed the job's entire download budget while
-        # nine more were never touched. Those 178 frames are consecutive
-        # seconds of the same footage, so they are near-identical -- they
-        # inflate the count without adding the visual variety a training set
-        # needs, and they crowd out the breadth that would have come from the
-        # untouched videos.
-        #
-        # Capping per video spends the same budget across more sources. The
-        # cap is not a fixed constant because that would starve a small job
-        # and over-restrict a large one; it scales with the target while
-        # keeping any one video to a minority share of it.
-        frames_per_video=yt_config.get("frames_per_video", _default_frames_per_video(target_count)),
+        # No default ceiling: an unset "frames_per_video" means every frame
+        # the chosen fps/interval produces is kept, for both auto-discovered
+        # and explicit-URL videos. Operators who want a per-video ceiling
+        # (e.g. to keep one video from dominating a large auto-discovery job)
+        # set it explicitly via job config.
+        frames_per_video=yt_config.get("frames_per_video"),
         # "fps" extracts exactly one frame per second — deterministic and
         # matches the documented behaviour. "scene" was the old default but
         # produced unpredictable frame counts and often zero results.

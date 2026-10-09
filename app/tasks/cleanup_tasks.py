@@ -78,9 +78,11 @@ def purge_orphan_work_dirs() -> dict:
 
     from sqlalchemy import select
 
+    from app.db.models.asset import Asset
     from app.db.models.job_source_task import JobSourceTask
     from app.db.session import session_scope
-    from app.domain.enums import JOB_SOURCE_TASK_TERMINAL_STATUSES
+    from app.domain.enums import JOB_SOURCE_TASK_TERMINAL_STATUSES, AssetStatus
+    from app.storage import asset_files
 
     settings = get_settings()
     work_root = settings.work_root
@@ -118,13 +120,40 @@ def purge_orphan_work_dirs() -> dict:
         ).all()
         status_by_id = {row[0]: row[1] for row in rows}
 
+        # Assets that are still local, waiting for the NAS offload — a long
+        # NAS outage can leave these sitting past _ORPHAN_MIN_AGE_S. Deleting
+        # the workdir out from under them would silently and permanently lose
+        # the image (offload_asset_batch would find the local file gone and
+        # have nothing left to retry).
+        pending_offload_task_ids = {
+            row[0]
+            for row in db.execute(
+                select(Asset.job_source_task_id)
+                .where(
+                    Asset.job_source_task_id.in_(list(task_ids.values())),
+                    Asset.status == AssetStatus.RELEVANCE_PASSED,
+                    Asset.nas_path.is_not(None),
+                    ~Asset.nas_path.like(f"{asset_files.NAS_SCHEME}%"),
+                )
+                .distinct()
+            ).scalars()
+        }
+
     removed = 0
+    skipped_pending_offload = 0
     reclaimed = 0
     for entry, task_id in task_ids.items():
         status = status_by_id.get(task_id)
         # Absent => the task (or its whole job) was deleted; terminal => it is
         # finished and will not resume. Anything else is still live.
         if status is not None and status not in JOB_SOURCE_TASK_TERMINAL_STATUSES:
+            continue
+        if task_id in pending_offload_task_ids:
+            skipped_pending_offload += 1
+            logger.warning(
+                f"purge_orphan_work_dirs: skipping {entry} — still has image(s) "
+                "awaiting NAS offload; the offload sweeper will retry them"
+            )
             continue
         try:
             size = sum(f.stat().st_size for f in entry.rglob("*") if f.is_file())
@@ -139,4 +168,9 @@ def purge_orphan_work_dirs() -> dict:
             f"purge_orphan_work_dirs: removed {removed} orphaned workdir(s), "
             f"reclaimed {reclaimed / 1e9:.2f} GB"
         )
-    return {"scanned": len(candidates), "removed": removed, "reclaimed_bytes": reclaimed}
+    return {
+        "scanned": len(candidates),
+        "removed": removed,
+        "skipped_pending_offload": skipped_pending_offload,
+        "reclaimed_bytes": reclaimed,
+    }

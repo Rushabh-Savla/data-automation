@@ -32,6 +32,16 @@ class Settings(BaseSettings):
     # download) — a cheap NAS/router can drop connections or restart under a
     # burst of concurrent SSH sessions, so this is deliberately small.
     nas_sftp_max_concurrency: int = 2
+    # Delay between consecutive uploads inside one offload batch (one SSH
+    # session handles a whole batch; this paces the writes themselves) — a
+    # weak NAS can still buckle under back-to-back writes even once per-file
+    # handshake overhead is gone.
+    nas_sftp_upload_pacing_s: float = 0.2
+    # After the NAS drops a connection or fails to connect, pause all further
+    # offload dispatch for this long instead of letting every worker retry
+    # (and reconnect) on its own schedule — a wave of simultaneous reconnects
+    # right as a crashed NAS comes back up can retrigger the crash.
+    nas_offload_cooldown_s: int = 180
 
     # -- Auth --------------------------------------------------------------------
     # Comma-separated list of valid API keys. Any one of them is accepted.

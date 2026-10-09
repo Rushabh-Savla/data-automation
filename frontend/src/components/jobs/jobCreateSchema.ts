@@ -98,7 +98,7 @@ export const jobCreateSchema = z
     youtubeCcOnly: z.boolean().optional(),
     youtubeFrameMode: z.string().optional(),
     youtubeFramesPerVideo: optionalNumberString,
-    youtubeFrameInterval: optionalNumberString,
+    youtubeFps: optionalNumberString,
     youtubeUrls: z
       .array(
         z.object({
@@ -217,7 +217,7 @@ export const jobCreateDefaultValues: JobCreateFormValues = {
   youtubeCcOnly: undefined,
   youtubeFrameMode: undefined,
   youtubeFramesPerVideo: undefined,
-  youtubeFrameInterval: undefined,
+  youtubeFps: undefined,
   youtubeUrls: [],
   webMaxResults: undefined,
   webSafesearch: undefined,
@@ -285,8 +285,8 @@ export function buildConfigPayload(values: JobCreateFormValues): JobConfig {
   if (values.youtubeFrameMode) youtube.frame_mode = values.youtubeFrameMode
   const youtubeFramesPerVideo = toNumber(values.youtubeFramesPerVideo)
   if (youtubeFramesPerVideo) youtube.frames_per_video = youtubeFramesPerVideo
-  const youtubeFrameInterval = toNumber(values.youtubeFrameInterval)
-  if (youtubeFrameInterval) youtube.frame_interval_s = youtubeFrameInterval
+  const youtubeFps = toNumber(values.youtubeFps)
+  if (youtubeFps) youtube.fps = youtubeFps
   const validUrls = (values.youtubeUrls ?? []).filter((u) => u.url.trim() !== '')
   if (validUrls.length) youtube.urls = validUrls.map((u) => u.url)
   if (Object.keys(youtube).length) config.youtube = youtube

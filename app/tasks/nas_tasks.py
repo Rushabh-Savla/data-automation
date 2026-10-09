@@ -2,12 +2,18 @@
 
 Pipeline position: downloads and filtering still work on local staging files (the
 relevance model and CLIP need real files, and rejected images should never cost
-NAS traffic). The moment an image is judged relevant, offload_asset_to_nas uploads
+NAS traffic). The moment an image is judged relevant, offload_asset_batch uploads
 it to the NAS, verifies the copy, repoints Asset.nas_path at "nas://...", and only
 then removes the local file. Nothing here can fail a job: if the NAS is
-unreachable the image simply stays local and is retried, later, by the sweeper."""
+unreachable the image simply stays local and is retried, later, by the sweeper.
+
+Assets are offloaded in batches over one shared SFTP/SSH connection rather than
+one task + one fresh connection per asset — a weak NAS can crash under a storm
+of back-to-back connection churn even though each one individually honors the
+nas_sftp_max_concurrency cap (see base.limited_concurrency)."""
 
 import logging
+import time
 import uuid
 from pathlib import Path
 
@@ -31,6 +37,20 @@ logger = logging.getLogger(__name__)
 
 _LOCK_TTL_S = 100
 _SWEEP_BATCH = 50
+_SWEEP_DISPATCH_CHUNK = 10
+
+# Set for nas_offload_cooldown_s after a connect/transient failure, so a NAS
+# that just crashed and came back isn't immediately hit by every worker's
+# independent retry at once (see offload_asset_batch).
+_COOLDOWN_KEY = "nas_offload:cooldown"
+
+
+def _cooldown_active(redis) -> bool:
+    return bool(redis.get(_COOLDOWN_KEY))
+
+
+def _start_cooldown(redis) -> None:
+    redis.set(_COOLDOWN_KEY, "1", ex=get_settings().nas_offload_cooldown_s)
 
 
 def _remote_rel_for(storage_path: str, local_file: Path, job_folder: str | None = None) -> str:
@@ -84,7 +104,7 @@ def _still_kept(asset_uuid: uuid.UUID, remote_image: str) -> bool:
 
 
 @celery_app.task(
-    name="app.tasks.nas_tasks.offload_asset_to_nas",
+    name="app.tasks.nas_tasks.offload_asset_batch",
     bind=True,
     autoretry_for=(TransientConnectorError,),
     retry_backoff=True,
@@ -92,20 +112,62 @@ def _still_kept(asset_uuid: uuid.UUID, remote_image: str) -> bool:
     retry_jitter=True,
     max_retries=6,
 )
-def offload_asset_to_nas(self, asset_id: str) -> str:
-    asset_uuid = uuid.UUID(asset_id)
+def offload_asset_batch(self, asset_ids: list[str]) -> dict:
+    """Uploads a whole chunk of assets over one SFTP/SSH connection instead of
+    reconnecting per asset. Each asset still goes through its own in-flight
+    lock so the sweeper and the filter can't double-upload the same one.
+
+    A connect/transient failure starts a cooldown (see _start_cooldown) and
+    re-raises so Celery retries this whole batch with backoff; assets already
+    offloaded earlier in the batch are idempotently skipped on retry (their
+    nas_path is already a nas:// path by then). A fatal failure (bad login)
+    is not retried — the images stay local and the sweeper picks them up once
+    the configuration is fixed, same as before.
+    """
+    if not asset_ids:
+        return {}
     redis = get_redis()
-    lock_key = f"nas_offload:{asset_id}"
-    # The sweeper and the filter can both ask for the same asset; one uploader at a time.
-    if not redis.set(lock_key, "1", nx=True, ex=_LOCK_TTL_S):
-        return "in_flight"
+    if _cooldown_active(redis):
+        return {"skipped_cooldown": len(asset_ids)}
+
+    params = get_active_storage_params()
+    if params is None:
+        return {"no_nas_storage": len(asset_ids)}
+
+    settings = get_settings()
+    results: dict[str, str] = {}
     try:
-        return _offload(asset_uuid)
-    finally:
-        redis.delete(lock_key)
+        with open_client(params) as client:
+            for i, asset_id in enumerate(asset_ids):
+                lock_key = f"nas_offload:{asset_id}"
+                # The sweeper and the filter can both ask for the same asset; one uploader at a time.
+                if not redis.set(lock_key, "1", nx=True, ex=_LOCK_TTL_S):
+                    results[asset_id] = "in_flight"
+                    continue
+                try:
+                    results[asset_id] = _offload(uuid.UUID(asset_id), client=client)
+                finally:
+                    redis.delete(lock_key)
+                if settings.nas_sftp_upload_pacing_s and i < len(asset_ids) - 1:
+                    time.sleep(settings.nas_sftp_upload_pacing_s)
+    except TransientConnectorError:
+        # Keeps every not-yet-processed asset local; Celery retries the whole
+        # batch with backoff, and the cooldown stops other batches piling on
+        # in the meantime.
+        _start_cooldown(redis)
+        raise
+    except FatalConnectorError as exc:
+        # Bad login / missing share: retrying now cannot help. The images stay
+        # local and the sweeper tries again once the user has fixed the config.
+        logger.warning(f"NAS offload batch could not connect, keeping {len(asset_ids)} asset(s) local: {exc}")
+        return {"failed_connect": len(asset_ids)}
+    return results
 
 
-def _offload(asset_uuid: uuid.UUID) -> str:
+def _offload(asset_uuid: uuid.UUID, client: NasClient | None = None) -> str:
+    """Offloads one asset. Pass an already-open `client` to reuse a connection
+    across a batch (see offload_asset_batch); omit it to open and close a
+    connection for just this one asset (used directly by the sweeper/tests)."""
     params = get_active_storage_params()
     if params is None:
         return "no_nas_storage"
@@ -128,24 +190,34 @@ def _offload(asset_uuid: uuid.UUID) -> str:
         job_folder = _job_folder_for_asset(db, asset.job_id)
 
     if not image_local.exists():
+        # Silent before: the asset is now unrecoverable (no local file, never
+        # offloaded) and nothing else will ever flag it, so this must be loud.
+        logger.warning(f"NAS offload of asset {asset_uuid} skipped: local file {image_local} is gone")
         return "local_missing"
     image_rel = _remote_rel_for(params.storage_path, image_local, job_folder)
     ann_rel = _remote_rel_for(params.storage_path, ann_local, job_folder) if ann_local and ann_local.exists() else None
 
     attempted: list[str] = []
+
+    def _upload_all(c: NasClient) -> None:
+        try:
+            attempted.append(image_rel)
+            _upload_verified(c, image_local, image_rel)
+            if ann_rel:
+                attempted.append(ann_rel)
+                _upload_verified(c, ann_local, ann_rel)
+        except BaseException:
+            # Never leave a half-written or unverified copy at its final path: if
+            # this asset ends up rejected, nothing else knows the file exists.
+            _discard_remote(c, attempted)
+            raise
+
     try:
-        with open_client(params) as client:
-            try:
-                attempted.append(image_rel)
-                _upload_verified(client, image_local, image_rel)
-                if ann_rel:
-                    attempted.append(ann_rel)
-                    _upload_verified(client, ann_local, ann_rel)
-            except BaseException:
-                # Never leave a half-written or unverified copy at its final path: if
-                # this asset ends up rejected, nothing else knows the file exists.
-                _discard_remote(client, attempted)
-                raise
+        if client is not None:
+            _upload_all(client)
+        else:
+            with open_client(params) as c:
+                _upload_all(c)
     except FileNotFoundError:
         # Rejected/trimmed/deleted mid-upload, and its local file went with it.
         return "local_missing"
@@ -204,6 +276,8 @@ def sweep_unoffloaded_assets() -> int:
     library migrates it gradually instead of in one burst."""
     if not is_storage_active():
         return 0
+    if _cooldown_active(get_redis()):
+        return 0
     with session_scope() as db:
         ids = [
             str(i)
@@ -217,8 +291,8 @@ def sweep_unoffloaded_assets() -> int:
                 .limit(_SWEEP_BATCH)
             ).scalars()
         ]
-    for asset_id in ids:
-        offload_asset_to_nas.delay(asset_id)
+    for i in range(0, len(ids), _SWEEP_DISPATCH_CHUNK):
+        offload_asset_batch.delay(ids[i : i + _SWEEP_DISPATCH_CHUNK])
     return len(ids)
 
 
@@ -275,7 +349,8 @@ def schedule_offload(asset_ids: list[str]) -> None:
     try:
         if not is_storage_active():
             return
-        for asset_id in asset_ids:
-            offload_asset_to_nas.delay(asset_id)
+        if _cooldown_active(get_redis()):
+            return
+        offload_asset_batch.delay(asset_ids)
     except Exception:
         logger.exception("Could not schedule NAS offload; the sweeper will pick these up")

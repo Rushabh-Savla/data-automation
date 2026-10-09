@@ -21,12 +21,23 @@ export function YoutubeConfigFields({
 
   const maxVideosRaw = useWatch({ control, name: 'youtubeMaxVideos' })
   const framesPerVideoRaw = useWatch({ control, name: 'youtubeFramesPerVideo' })
+  const watchedUrls = useWatch({ control, name: 'youtubeUrls' })
 
-  const maxVideos = Number(maxVideosRaw)
-  const framesPerVideo = Number(framesPerVideoRaw)
+  // Explicit URLs ignore "Max videos" entirely on the backend (every URL given
+  // is used) — only fall back to "Max videos" when no URLs are provided.
+  // "Frames per video" left blank is unbounded on the backend (no implicit
+  // cap), so the warning below only has something to compare once the user
+  // explicitly types a ceiling.
+  const explicitUrlCount = (watchedUrls ?? []).filter((u) => (u?.url ?? '').trim() !== '').length
+  const framesPerVideo = framesPerVideoRaw ? Number(framesPerVideoRaw) : undefined
+  const effectiveVideoCount =
+    explicitUrlCount > 0 ? explicitUrlCount : maxVideosRaw ? Number(maxVideosRaw) : undefined
   const maxPossibleFrames =
-    maxVideosRaw && framesPerVideoRaw && Number.isFinite(maxVideos) && Number.isFinite(framesPerVideo)
-      ? maxVideos * framesPerVideo
+    effectiveVideoCount !== undefined &&
+    framesPerVideo !== undefined &&
+    Number.isFinite(effectiveVideoCount) &&
+    Number.isFinite(framesPerVideo)
+      ? effectiveVideoCount * framesPerVideo
       : undefined
   const showLowYieldWarning =
     maxPossibleFrames !== undefined && targetCount !== undefined && maxPossibleFrames < targetCount
@@ -57,11 +68,11 @@ export function YoutubeConfigFields({
         </div>
         <div className="flex flex-col gap-1.5">
           <Label>Frames per video</Label>
-          <Input type="number" min={1} placeholder="100" {...register('youtubeFramesPerVideo')} />
+          <Input type="number" min={1} placeholder="No limit" {...register('youtubeFramesPerVideo')} />
         </div>
         <div className="flex flex-col gap-1.5">
-          <Label>Frame interval (sec)</Label>
-          <Input type="number" min={0.1} step={0.1} placeholder="1" {...register('youtubeFrameInterval')} />
+          <Label>FPS (Per Video)</Label>
+          <Input type="number" min={0.1} step={0.1} placeholder="1" {...register('youtubeFps')} />
         </div>
         <div className="flex flex-col justify-end gap-1.5 pb-1.5">
           <Controller
@@ -79,10 +90,10 @@ export function YoutubeConfigFields({
 
       {showLowYieldWarning && (
         <p className="text-xs text-amber-600 dark:text-amber-500">
-          Max videos × frames per video caps this source at {maxPossibleFrames} candidate frame
-          {maxPossibleFrames === 1 ? '' : 's'}, below the job's target of {targetCount} accepted —
-          some frames will also be rejected by relevance/dedup filtering, so raise these values or
-          lower the target to avoid the job failing with "Sources exhausted".
+          {explicitUrlCount > 0 ? 'Video count' : 'Max videos'} × frames per video caps this source at{' '}
+          {maxPossibleFrames} candidate frame{maxPossibleFrames === 1 ? '' : 's'}, below the job's target of{' '}
+          {targetCount} accepted — some frames will also be rejected by relevance/dedup filtering, so raise
+          these values or lower the target to avoid the job failing with "Sources exhausted".
         </p>
       )}
 
