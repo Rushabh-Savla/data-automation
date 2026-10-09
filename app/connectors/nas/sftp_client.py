@@ -12,6 +12,7 @@ from pathlib import Path
 
 import paramiko
 
+from app.connectors.base import limited_concurrency
 from app.connectors.nas.base import (
     CONNECT_TIMEOUT_S,
     IO_TIMEOUT_S,
@@ -21,22 +22,36 @@ from app.connectors.nas.base import (
     NasNotFoundError,
     RemoteEntry,
 )
+from app.core.config import get_settings
 
 
 class SftpClient(NasClient):
     def connect(self) -> None:
-        p = self.params
-        if not p.host.strip():
-            raise NasNotFoundError("Enter the NAS host name or IP address")
-        if not p.username:
-            raise NasAuthError("SFTP needs a user name and password")
-        self._ssh = paramiko.SSHClient()
-        # A NAS on a LAN has no CA-signed host key and the UI has no place to pin
-        # one, so an unknown key is accepted on first use. Credentials still
-        # travel encrypted; the trade-off is no protection against an active
-        # man-in-the-middle on the first connection.
-        self._ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        # Held for the whole connection's lifetime (released in close()), not just
+        # this call: a cheap NAS/router can drop connections or restart under a
+        # burst of concurrent SSH sessions, so only a couple may be open at once.
+        settings = get_settings()
+        self._slot = limited_concurrency(
+            settings.work_root / "_shared_cache" / "nas_sftp",
+            "nas_sftp_session",
+            settings.nas_sftp_max_concurrency,
+        )
+        self._slot.__enter__()
+        # Everything below must go through this one try/except: the slot is only
+        # ever released by close(), so any raise before reaching it — including
+        # the validation checks — would otherwise leak the slot permanently.
         try:
+            p = self.params
+            if not p.host.strip():
+                raise NasNotFoundError("Enter the NAS host name or IP address")
+            if not p.username:
+                raise NasAuthError("SFTP needs a user name and password")
+            self._ssh = paramiko.SSHClient()
+            # A NAS on a LAN has no CA-signed host key and the UI has no place to pin
+            # one, so an unknown key is accepted on first use. Credentials still
+            # travel encrypted; the trade-off is no protection against an active
+            # man-in-the-middle on the first connection.
+            self._ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
             self._ssh.connect(
                 p.host,
                 port=p.port or 22,
@@ -64,6 +79,10 @@ class SftpClient(NasClient):
                     obj.close()
                 except Exception:
                     pass
+        slot = getattr(self, "_slot", None)
+        if slot is not None:
+            slot.__exit__(None, None, None)
+            self._slot = None
 
     def _abs(self, rel: str) -> str:
         if self._root:

@@ -28,6 +28,10 @@ class Settings(BaseSettings):
     # NAS: viewing, thumbnails and exports fetch a file once and reuse it, and the
     # oldest entries are evicted past this size so the cache never fills the disk.
     nas_cache_max_gb: float = 5.0
+    # Max simultaneous SFTP/SSH sessions to the NAS (copy, delete, read-through
+    # download) — a cheap NAS/router can drop connections or restart under a
+    # burst of concurrent SSH sessions, so this is deliberately small.
+    nas_sftp_max_concurrency: int = 2
 
     # -- Auth --------------------------------------------------------------------
     # Comma-separated list of valid API keys. Any one of them is accepted.

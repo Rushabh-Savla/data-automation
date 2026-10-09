@@ -29,8 +29,8 @@ from app.tasks.celery_app import celery_app
 
 logger = logging.getLogger(__name__)
 
-_LOCK_TTL_S = 900
-_SWEEP_BATCH = 500
+_LOCK_TTL_S = 100
+_SWEEP_BATCH = 50
 
 
 def _remote_rel_for(storage_path: str, local_file: Path, job_folder: str | None = None) -> str:
@@ -223,7 +223,7 @@ def sweep_unoffloaded_assets() -> int:
 
 
 _NOT_KEPT = (AssetStatus.RELEVANCE_REJECTED, AssetStatus.DUPLICATE, AssetStatus.FAILED)
-_RECONCILE_BATCH = 200
+_RECONCILE_BATCH = 100
 
 
 @celery_app.task(name="app.tasks.nas_tasks.sweep_leaked_nas_files")

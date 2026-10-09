@@ -114,6 +114,7 @@ export interface YoutubeConfig {
   cc_only?: boolean
   frame_mode?: string
   frames_per_video?: number
+  frame_interval_s?: number
   urls?: string[]
 }
 

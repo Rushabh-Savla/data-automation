@@ -179,6 +179,7 @@ export function JobCreateForm() {
         register={register}
         activeSources={[...activeSources]}
         jobName={watch('name')}
+        targetCount={watch('targetCountEnabled') ? watch('targetCount') : undefined}
       />
 
       <CardContent className="flex justify-end gap-2 p-0">

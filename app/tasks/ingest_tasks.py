@@ -355,6 +355,11 @@ def download_youtube_video(self, job_id: str, job_source_task_id: str, item_dict
         # so touching task.job afterwards raises DetachedInstanceError.
         target_count = task.job.target_count if task and task.job else None
 
+    # Seconds between extracted frames, user-configurable per job; 1.0 (today's
+    # default: one frame per second) when unset or not a usable positive number.
+    frame_interval_s = yt_config.get("frame_interval_s", 1.0)
+    extraction_fps = 1.0 / frame_interval_s if frame_interval_s and frame_interval_s > 0 else 1.0
+
     connector = YouTubeConnector(
         # A per-video ceiling, defaulted rather than left unbounded.
         #
@@ -376,6 +381,7 @@ def download_youtube_video(self, job_id: str, job_source_task_id: str, item_dict
         # matches the documented behaviour. "scene" was the old default but
         # produced unpredictable frame counts and often zero results.
         frame_mode=yt_config.get("frame_mode", "fps"),
+        extraction_fps=extraction_fps,
         min_resolution=min_res,
         # False = do not filter by CC license at download time. yt-dlp's
         # flat search metadata omits the license field so cc_only=True

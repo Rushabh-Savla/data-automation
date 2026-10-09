@@ -28,9 +28,16 @@ interface JobConfigAdvancedSectionProps {
   register: UseFormRegister<JobCreateFormValues>
   activeSources: SourceType[]
   jobName?: string
+  targetCount?: number
 }
 
-export function JobConfigAdvancedSection({ control, register, activeSources, jobName }: JobConfigAdvancedSectionProps) {
+export function JobConfigAdvancedSection({
+  control,
+  register,
+  activeSources,
+  jobName,
+  targetCount,
+}: JobConfigAdvancedSectionProps) {
   const [open, setOpen] = useState(false)
 
   return (
@@ -71,7 +78,7 @@ export function JobConfigAdvancedSection({ control, register, activeSources, job
               <CardTitle className="text-sm">YouTube</CardTitle>
             </CardHeader>
             <CardContent className="p-0">
-              <YoutubeConfigFields control={control} register={register} />
+              <YoutubeConfigFields control={control} register={register} targetCount={targetCount} />
             </CardContent>
           </Card>
         )}

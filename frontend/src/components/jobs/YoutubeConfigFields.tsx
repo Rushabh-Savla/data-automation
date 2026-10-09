@@ -1,4 +1,4 @@
-import { Controller, useFieldArray, type Control, type UseFormRegister } from 'react-hook-form'
+import { Controller, useFieldArray, useWatch, type Control, type UseFormRegister } from 'react-hook-form'
 import { PlusIcon, XIcon } from 'lucide-react'
 
 import type { JobCreateFormValues } from '@/components/jobs/jobCreateSchema'
@@ -11,11 +11,25 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 export function YoutubeConfigFields({
   control,
   register,
+  targetCount,
 }: {
   control: Control<JobCreateFormValues>
   register: UseFormRegister<JobCreateFormValues>
+  targetCount?: number
 }) {
   const { fields, append, remove } = useFieldArray({ control, name: 'youtubeUrls' })
+
+  const maxVideosRaw = useWatch({ control, name: 'youtubeMaxVideos' })
+  const framesPerVideoRaw = useWatch({ control, name: 'youtubeFramesPerVideo' })
+
+  const maxVideos = Number(maxVideosRaw)
+  const framesPerVideo = Number(framesPerVideoRaw)
+  const maxPossibleFrames =
+    maxVideosRaw && framesPerVideoRaw && Number.isFinite(maxVideos) && Number.isFinite(framesPerVideo)
+      ? maxVideos * framesPerVideo
+      : undefined
+  const showLowYieldWarning =
+    maxPossibleFrames !== undefined && targetCount !== undefined && maxPossibleFrames < targetCount
 
   return (
     <div className="flex flex-col gap-3">
@@ -30,14 +44,12 @@ export function YoutubeConfigFields({
             control={control}
             name="youtubeFrameMode"
             render={({ field }) => (
-              <Select value={field.value ?? 'scene'} onValueChange={field.onChange}>
+              <Select value={field.value ?? 'fps'} onValueChange={field.onChange}>
                 <SelectTrigger>
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="scene">Scene change</SelectItem>
                   <SelectItem value="fps">Fixed interval</SelectItem>
-                  <SelectItem value="every_n">Every Nth frame</SelectItem>
                 </SelectContent>
               </Select>
             )}
@@ -46,6 +58,10 @@ export function YoutubeConfigFields({
         <div className="flex flex-col gap-1.5">
           <Label>Frames per video</Label>
           <Input type="number" min={1} placeholder="100" {...register('youtubeFramesPerVideo')} />
+        </div>
+        <div className="flex flex-col gap-1.5">
+          <Label>Frame interval (sec)</Label>
+          <Input type="number" min={0.1} step={0.1} placeholder="1" {...register('youtubeFrameInterval')} />
         </div>
         <div className="flex flex-col justify-end gap-1.5 pb-1.5">
           <Controller
@@ -60,6 +76,15 @@ export function YoutubeConfigFields({
           />
         </div>
       </div>
+
+      {showLowYieldWarning && (
+        <p className="text-xs text-amber-600 dark:text-amber-500">
+          Max videos × frames per video caps this source at {maxPossibleFrames} candidate frame
+          {maxPossibleFrames === 1 ? '' : 's'}, below the job's target of {targetCount} accepted —
+          some frames will also be rejected by relevance/dedup filtering, so raise these values or
+          lower the target to avoid the job failing with "Sources exhausted".
+        </p>
+      )}
 
       <div className="flex flex-col gap-2">
         <Label>Explicit video URLs (optional — skips auto-search)</Label>
