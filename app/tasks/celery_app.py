@@ -48,11 +48,16 @@ celery_app.conf.update(
         "app.tasks.orchestration_tasks.*": {"queue": "orchestration"},
         "app.tasks.filtering_tasks.*": {"queue": "filtering"},
         "app.tasks.export_tasks.*": {"queue": "export"},
-        # Its own queue, consumed by a worker sized to nas_sftp_max_concurrency
-        # (see docker-compose.yml worker-nas) — sharing "standardize" let up to
-        # 8 IO-worker processes busy-poll for 2 connection slots at once, which
-        # is exactly the connection-churn a weak NAS can't survive.
-        "app.tasks.nas_tasks.*": {"queue": "nas_offload"},
+        # Reuses the "standardize" queue (already consumed by every IO worker
+        # deployment, no server-side queue-list change needed). A dedicated
+        # "nas_offload" queue removed the risk of 8 IO-worker processes
+        # busy-polling for the NAS's 1-2 connection slots at once, but every
+        # deployment needs its own worker command updated to consume it — not
+        # worth that operational cost here. The connection-slot wait itself is
+        # now bounded (SLOT_WAIT_TIMEOUT_S in app/connectors/nas/base.py)
+        # instead of hanging forever, so busy-polling fails loudly rather than
+        # silently if it ever becomes a real problem again.
+        "app.tasks.nas_tasks.*": {"queue": "standardize"},
     },
     beat_schedule={
         "watchdog-scan": {
