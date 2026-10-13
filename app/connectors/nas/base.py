@@ -46,6 +46,14 @@ def _is_skipped_dir(name: str) -> bool:
 
 CONNECT_TIMEOUT_S = 15
 IO_TIMEOUT_S = 60
+# The initial SSH protocol banner is cheap for a healthy server and the one
+# phase a slow/overloaded embedded sshd (a weak NAS, mid-restart, or just
+# underpowered) is most likely to blow past CONNECT_TIMEOUT_S on — give it
+# more room than the rest of the handshake costs nothing in the common case.
+BANNER_TIMEOUT_S = 45
+# How long to wait for a free nas_sftp_max_concurrency slot before giving up
+# instead of hanging forever — see app.connectors.base.limited_concurrency.
+SLOT_WAIT_TIMEOUT_S = 60
 _MAX_WALK_DEPTH = 12
 
 
@@ -178,8 +186,41 @@ class NasClient(ABC):
         finally:
             tmp.unlink(missing_ok=True)
 
+    def _rename(self, tmp_rel: str, final_rel: str) -> None:
+        """Atomically move `tmp_rel` onto `final_rel` on the server, overwriting
+        any existing file there. Override with the protocol's native atomic
+        primitive (SFTP posix-rename, SMB replace, WebDAV MOVE, ...); the
+        default means the protocol has none, and upload() falls back to a
+        non-atomic write."""
+        raise NotImplementedError
+
     def upload(self, local: Path, rel: str) -> None:
-        self._upload(Path(local), normalize_relpath(rel))
+        """Upload via a temp name + server-side rename, so an interrupted
+        transfer never leaves a partial or missing file at the final path —
+        mirrors download()'s .part-file safety, on the remote end instead of
+        the local one (a weak NAS that drops mid-transfer would otherwise
+        leave `_mkdirs`' empty directory in place but no — or a truncated —
+        file at `rel`)."""
+        rel = normalize_relpath(rel)
+        local = Path(local)
+        # Unique per call: two workers uploading the same file must not share a temp name.
+        tmp_rel = f"{rel}.{uuid.uuid4().hex[:8]}.part"
+        try:
+            self._upload(local, tmp_rel)
+            self._rename(tmp_rel, rel)
+        except NotImplementedError:
+            # No atomic primitive on this protocol: no worse than the old
+            # unconditional direct-write behavior, just routed through the
+            # temp name for a consistent code path.
+            self.delete(rel)
+            self._upload(local, rel)
+            self.delete(tmp_rel)
+        except BaseException:
+            try:
+                self.delete(tmp_rel)
+            except Exception:
+                pass
+            raise
 
     def walk(
         self,

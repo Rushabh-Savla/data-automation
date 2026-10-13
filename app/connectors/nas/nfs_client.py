@@ -95,6 +95,13 @@ class NfsClient(NasClient):
         except Exception as exc:
             raise NasConnectionError(f"Could not write '{rel}': {exc}") from exc
 
+    # No _rename override: libnfs's rename support isn't confirmed (this
+    # optional dependency isn't installed anywhere this has been checked, and
+    # this module is already not exercised by the automated tests). upload()
+    # in base.py falls back to a non-atomic direct write for this protocol —
+    # same exposure NFS already had, not a regression. Add a real _rename
+    # here if libnfs turns out to expose one.
+
     def delete(self, rel: str) -> None:
         try:
             if self.exists(rel):

@@ -147,6 +147,21 @@ class FtpClient(NasClient):
         except Exception as exc:
             raise self._translate(exc) from exc
 
+    def _rename(self, tmp_rel: str, final_rel: str) -> None:
+        # FTP's RNFR/RNTO has no atomic-overwrite guarantee — best effort:
+        # clear the destination first, then rename. A crash between the two
+        # could leave nothing at final_rel, same exposure as a crash during a
+        # direct write would have had; it cannot leave a *partial* file there,
+        # which is the failure this whole temp-name scheme exists to prevent.
+        try:
+            try:
+                self._ftp.delete(self._abs(final_rel))
+            except ftplib.error_perm:
+                pass  # didn't exist
+            self._ftp.rename(self._abs(tmp_rel), self._abs(final_rel))
+        except Exception as exc:
+            raise self._translate(exc) from exc
+
     def delete(self, rel: str) -> None:
         try:
             self._ftp.delete(self._abs(rel))

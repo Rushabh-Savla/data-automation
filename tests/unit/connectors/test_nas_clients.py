@@ -110,6 +110,42 @@ class TestTransfers:
             assert c.size("data_automation/job1/coco/images/x.jpg") == 5
             assert c.exists("data_automation/job1/coco/images/x.jpg")
 
+    def test_upload_leaves_no_part_file_behind_on_success(self, share, tmp_path):
+        src = tmp_path / "src.jpg"
+        src.write_bytes(b"12345")
+        with _client(share) as c:
+            c.upload(src, "data_automation/job1/coco/images/x.jpg")
+        assert not list((share / "data_automation/job1/coco/images").glob("*.part"))
+
+    def test_upload_overwrites_an_existing_file_atomically(self, share, tmp_path):
+        src = tmp_path / "src.jpg"
+        src.write_bytes(b"newbytes")
+        with _client(share) as c:
+            c.upload(src, "top.jpeg")  # already exists in the fixture as b"cccccc"
+            assert c.size("top.jpeg") == len(b"newbytes")
+
+    def test_a_transfer_that_dies_mid_write_leaves_nothing_at_the_final_path(self, share, tmp_path, monkeypatch):
+        # Simulate a weak NAS dropping the connection partway through the data
+        # transfer (after _mkdirs/the directory already exists, before the
+        # file is ever fully written) — this is the exact bug reported: a
+        # directory left behind with no (or a corrupt) file in it.
+        src = tmp_path / "src.jpg"
+        src.write_bytes(b"12345")
+        import app.connectors.nas.local_client as local_client_module
+
+        real_upload = local_client_module.LocalClient._upload
+
+        def dying_upload(self, local, rel):
+            real_upload(self, local, rel)  # the temp file gets written...
+            raise ConnectionError("NAS dropped the connection")  # ...but we never get to rename it into place
+
+        monkeypatch.setattr(local_client_module.LocalClient, "_upload", dying_upload)
+        with _client(share) as c, pytest.raises(ConnectionError):
+            c.upload(src, "data_automation/job1/coco/images/x.jpg")
+        final = share / "data_automation/job1/coco/images/x.jpg"
+        assert not final.exists(), "a failed transfer must never leave a file at the final path"
+        assert not list(final.parent.glob("*.part")), "the temp file must be cleaned up too"
+
     def test_delete_is_idempotent(self, share):
         with _client(share) as c:
             c.delete("top.jpeg")

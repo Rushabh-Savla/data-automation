@@ -73,6 +73,12 @@ class LocalClient(NasClient):
         except OSError as exc:
             raise NasConnectionError(f"Could not write '{rel}': {exc}") from exc
 
+    def _rename(self, tmp_rel: str, final_rel: str) -> None:
+        try:
+            os.replace(self._abs(tmp_rel), self._abs(final_rel))
+        except OSError as exc:
+            raise NasConnectionError(f"Could not finalize '{final_rel}': {exc}") from exc
+
     def delete(self, rel: str) -> None:
         try:
             self._abs(rel).unlink(missing_ok=True)

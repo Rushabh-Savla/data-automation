@@ -35,9 +35,9 @@ from app.tasks.celery_app import celery_app
 
 logger = logging.getLogger(__name__)
 
-_LOCK_TTL_S = 100
-_SWEEP_BATCH = 50
-_SWEEP_DISPATCH_CHUNK = 10
+_LOCK_TTL_S = 900
+_SWEEP_BATCH = 20
+_SWEEP_DISPATCH_CHUNK = 20
 
 # Set for nas_offload_cooldown_s after a connect/transient failure, so a NAS
 # that just crashed and came back isn't immediately hit by every worker's
@@ -72,9 +72,29 @@ def _remote_rel_for(storage_path: str, local_file: Path, job_folder: str | None 
     return join_relpath(storage_path, rel)
 
 
-def _job_folder_for_asset(db, job_id: uuid.UUID) -> str:
+def _job_folder_for_asset(db, job_id: uuid.UUID, cache: dict[uuid.UUID, str] | None = None) -> str:
+    if cache is not None and job_id in cache:
+        return cache[job_id]
     job_name = db.execute(select(Job.name).where(Job.id == job_id)).scalar_one_or_none()
-    return job_folder_name(job_name, job_id)
+    folder = job_folder_name(job_name, job_id)
+    if cache is not None:
+        cache[job_id] = folder
+    return folder
+
+
+def _prefetch_job_folders(db, asset_ids: list[uuid.UUID]) -> dict[uuid.UUID, str]:
+    """One query for every job touched by this batch instead of one per asset
+    — most of a batch comes from the same filter pass on the same job."""
+    if not asset_ids:
+        return {}
+    job_ids = {
+        row[0]
+        for row in db.execute(select(Asset.job_id).where(Asset.id.in_(asset_ids)).distinct()).all()
+    }
+    if not job_ids:
+        return {}
+    names = dict(db.execute(select(Job.id, Job.name).where(Job.id.in_(job_ids))).all())
+    return {job_id: job_folder_name(names.get(job_id), job_id) for job_id in job_ids}
 
 
 def _upload_verified(client: NasClient, local_file: Path, rel: str) -> None:
@@ -134,21 +154,40 @@ def offload_asset_batch(self, asset_ids: list[str]) -> dict:
     if params is None:
         return {"no_nas_storage": len(asset_ids)}
 
+    # Bulk-prefetch everything needed before opening the connection: the job
+    # folder name is looked up once per *job*, not once per asset (a batch is
+    # usually one filter chunk from one job), and the Celery/filter-sided
+    # locks are all acquired in one Redis round-trip instead of one per asset
+    # while the SFTP connection sits open and idle for each.
+    with session_scope() as db:
+        job_folder_cache = _prefetch_job_folders(db, [uuid.UUID(a) for a in asset_ids])
+
+    pipe = redis.pipeline()
+    for asset_id in asset_ids:
+        pipe.set(f"nas_offload:{asset_id}", "1", nx=True, ex=_LOCK_TTL_S)
+    lock_acquired = pipe.execute()
+
     settings = get_settings()
     results: dict[str, str] = {}
+    runnable = [
+        asset_id for asset_id, got in zip(asset_ids, lock_acquired, strict=True) if got
+    ]
+    for asset_id, got in zip(asset_ids, lock_acquired, strict=True):
+        if not got:
+            results[asset_id] = "in_flight"
+    if not runnable:
+        return results
+
     try:
         with open_client(params) as client:
-            for i, asset_id in enumerate(asset_ids):
-                lock_key = f"nas_offload:{asset_id}"
-                # The sweeper and the filter can both ask for the same asset; one uploader at a time.
-                if not redis.set(lock_key, "1", nx=True, ex=_LOCK_TTL_S):
-                    results[asset_id] = "in_flight"
-                    continue
+            for i, asset_id in enumerate(runnable):
                 try:
-                    results[asset_id] = _offload(uuid.UUID(asset_id), client=client)
+                    results[asset_id] = _offload(
+                        uuid.UUID(asset_id), client=client, params=params, job_folder_cache=job_folder_cache
+                    )
                 finally:
-                    redis.delete(lock_key)
-                if settings.nas_sftp_upload_pacing_s and i < len(asset_ids) - 1:
+                    redis.delete(f"nas_offload:{asset_id}")
+                if settings.nas_sftp_upload_pacing_s and i < len(runnable) - 1:
                     time.sleep(settings.nas_sftp_upload_pacing_s)
     except TransientConnectorError:
         # Keeps every not-yet-processed asset local; Celery retries the whole
@@ -164,13 +203,22 @@ def offload_asset_batch(self, asset_ids: list[str]) -> dict:
     return results
 
 
-def _offload(asset_uuid: uuid.UUID, client: NasClient | None = None) -> str:
+def _offload(
+    asset_uuid: uuid.UUID,
+    client: NasClient | None = None,
+    params=None,
+    job_folder_cache: dict[uuid.UUID, str] | None = None,
+) -> str:
     """Offloads one asset. Pass an already-open `client` to reuse a connection
     across a batch (see offload_asset_batch); omit it to open and close a
-    connection for just this one asset (used directly by the sweeper/tests)."""
-    params = get_active_storage_params()
+    connection for just this one asset (used directly by the sweeper/tests).
+    `params` and `job_folder_cache` let a caller that already looked these up
+    for the whole batch skip repeating that work per asset; both are re-fetched
+    here when omitted."""
     if params is None:
-        return "no_nas_storage"
+        params = get_active_storage_params()
+        if params is None:
+            return "no_nas_storage"
 
     with session_scope() as db:
         asset = AssetRepository(db).get(asset_uuid)
@@ -187,7 +235,7 @@ def _offload(asset_uuid: uuid.UUID, client: NasClient | None = None) -> str:
             if asset.annotation_nas_path and not asset_files.is_remote(asset.annotation_nas_path)
             else None
         )
-        job_folder = _job_folder_for_asset(db, asset.job_id)
+        job_folder = _job_folder_for_asset(db, asset.job_id, cache=job_folder_cache)
 
     if not image_local.exists():
         # Silent before: the asset is now unrecoverable (no local file, never

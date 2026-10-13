@@ -160,6 +160,28 @@ class TestLimitedConcurrency:
             pass
         assert (tmp_path / "new" / "dir").is_dir()
 
+    def test_max_wait_s_gives_up_instead_of_blocking_forever(self, tmp_path):
+        with limited_concurrency(tmp_path, "srv", 1):  # the only slot stays held
+            with pytest.raises(TimeoutError):
+                with limited_concurrency(tmp_path, "srv", 1, poll_s=0.01, max_wait_s=0.05):
+                    pytest.fail("must not acquire a slot that is already held")
+
+    def test_no_max_wait_s_waits_indefinitely_as_before(self, tmp_path):
+        # Default behavior is unchanged for every other caller of this function.
+        acquired = threading.Event()
+
+        def again():
+            with limited_concurrency(tmp_path, "srv", 1):
+                acquired.set()
+
+        with limited_concurrency(tmp_path, "srv", 1):
+            t = threading.Thread(target=again)
+            t.start()
+            t.join(timeout=0.2)
+            assert not acquired.is_set()  # still waiting, not timed out
+        t.join(timeout=2)
+        assert acquired.is_set()
+
 
 class TestExtractIntoCache:
     def test_extracts_zip_and_leaves_no_staging_dir(self, tmp_path):

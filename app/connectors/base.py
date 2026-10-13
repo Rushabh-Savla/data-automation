@@ -142,7 +142,9 @@ def exclusive_cache_lock(lock_path: Path) -> Iterator[None]:
 
 
 @contextmanager
-def limited_concurrency(lock_dir: Path, name: str, slots: int, *, poll_s: float = 0.05) -> Iterator[None]:
+def limited_concurrency(
+    lock_dir: Path, name: str, slots: int, *, poll_s: float = 0.05, max_wait_s: float | None = None
+) -> Iterator[None]:
     """At most `slots` holders at once, across every process and thread on this host.
 
     A counting semaphore built from `slots` lock files. The workers all mount
@@ -154,9 +156,15 @@ def limited_concurrency(lock_dir: Path, name: str, slots: int, *, poll_s: float 
     dropping them (RemoteDisconnected on ~110 requests in 15 minutes) and then
     refused this machine altogether for a while. Hold it only for the duration
     of one request.
+
+    `max_wait_s` bounds the wait itself (default: wait forever, the original
+    behavior) — without it, a slot leaked by a wedged holder (a connection
+    stuck mid-handshake, say) can block every future caller with no visible
+    error at all. Raises `TimeoutError` if no slot opens up in time.
     """
     lock_dir.mkdir(parents=True, exist_ok=True)
     handle = None
+    started = time.monotonic()
     while handle is None:
         for slot in random.sample(range(slots), slots):  # random order spreads contention
             candidate = open(lock_dir / f".{name}.slot{slot}", "a")  # noqa: SIM115 - held for the slot's lifetime
@@ -168,6 +176,8 @@ def limited_concurrency(lock_dir: Path, name: str, slots: int, *, poll_s: float 
             handle = candidate
             break
         else:
+            if max_wait_s is not None and time.monotonic() - started >= max_wait_s:
+                raise TimeoutError(f"Timed out after {max_wait_s:.0f}s waiting for a free '{name}' connection slot")
             time.sleep(poll_s * (1 + random.random()))
     try:
         yield

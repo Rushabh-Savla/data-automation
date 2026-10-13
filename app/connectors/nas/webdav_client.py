@@ -163,6 +163,13 @@ class WebDavClient(NasClient):
         if resp.status_code not in (200, 201, 204):
             raise NasConnectionError(f"The NAS refused the upload of '{rel}' (HTTP {resp.status_code})")
 
+    def _rename(self, tmp_rel: str, final_rel: str) -> None:
+        dest_url = self._origin + self._path(final_rel)
+        resp = self._request("MOVE", tmp_rel, headers={"Destination": dest_url, "Overwrite": "T"})
+        resp.close()
+        if resp.status_code not in (200, 201, 204):
+            raise NasConnectionError(f"The NAS refused to finalize the upload of '{final_rel}' (HTTP {resp.status_code})")
+
     def delete(self, rel: str) -> None:
         try:
             resp = self._request("DELETE", rel)

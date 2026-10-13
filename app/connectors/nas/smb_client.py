@@ -180,6 +180,13 @@ class SmbClient(NasClient):
         except Exception as exc:
             raise self._translate(exc) from exc
 
+    def _rename(self, tmp_rel: str, final_rel: str) -> None:
+        try:
+            # Atomic overwrite, like os.replace.
+            smbclient.replace(self._unc(tmp_rel), self._unc(final_rel), **self._kw)
+        except Exception as exc:
+            raise self._translate(exc) from exc
+
     def delete(self, rel: str) -> None:
         try:
             smbclient.remove(self._unc(rel), **self._kw)

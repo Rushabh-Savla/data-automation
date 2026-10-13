@@ -14,8 +14,10 @@ import paramiko
 
 from app.connectors.base import limited_concurrency
 from app.connectors.nas.base import (
+    BANNER_TIMEOUT_S,
     CONNECT_TIMEOUT_S,
     IO_TIMEOUT_S,
+    SLOT_WAIT_TIMEOUT_S,
     NasAuthError,
     NasClient,
     NasConnectionError,
@@ -35,6 +37,7 @@ class SftpClient(NasClient):
             settings.work_root / "_shared_cache" / "nas_sftp",
             "nas_sftp_session",
             settings.nas_sftp_max_concurrency,
+            max_wait_s=SLOT_WAIT_TIMEOUT_S,
         )
         self._slot.__enter__()
         # Everything below must go through this one try/except: the slot is only
@@ -52,17 +55,7 @@ class SftpClient(NasClient):
             # travel encrypted; the trade-off is no protection against an active
             # man-in-the-middle on the first connection.
             self._ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            self._ssh.connect(
-                p.host,
-                port=p.port or 22,
-                username=p.username,
-                password=p.password,
-                timeout=CONNECT_TIMEOUT_S,
-                banner_timeout=CONNECT_TIMEOUT_S,
-                auth_timeout=CONNECT_TIMEOUT_S,
-                look_for_keys=False,
-                allow_agent=False,
-            )
+            self._connect_with_banner_retry(p)
             self._sftp = self._ssh.open_sftp()
             self._sftp.get_channel().settimeout(IO_TIMEOUT_S)
             self._root = p.share.strip().rstrip("/")
@@ -70,6 +63,27 @@ class SftpClient(NasClient):
         except Exception as exc:
             self.close()
             raise self._translate(exc) from exc
+
+    def _connect_with_banner_retry(self, p) -> None:
+        kwargs = dict(
+            port=p.port or 22,
+            username=p.username,
+            password=p.password,
+            timeout=CONNECT_TIMEOUT_S,
+            banner_timeout=BANNER_TIMEOUT_S,
+            auth_timeout=CONNECT_TIMEOUT_S,
+            look_for_keys=False,
+            allow_agent=False,
+        )
+        try:
+            self._ssh.connect(p.host, **kwargs)
+        except paramiko.SSHException as exc:
+            if "banner" not in str(exc).lower():
+                raise
+            # A weak/overloaded embedded sshd can transiently fail to answer
+            # the banner handshake in time even though it's basically fine a
+            # moment later — one retry before treating it as a real failure.
+            self._ssh.connect(p.host, **kwargs)
 
     def close(self) -> None:
         for attr in ("_sftp", "_ssh"):
@@ -96,6 +110,13 @@ class SftpClient(NasClient):
             return NasNotFoundError("Path not found on the NAS")
         if isinstance(exc, PermissionError):
             return NasAuthError("Access denied on the NAS — check the account's permissions")
+        if isinstance(exc, paramiko.SSHException) and "banner" in str(exc).lower():
+            return NasConnectionError(
+                f"The NAS accepted the connection but did not respond like an SSH server — "
+                f"check that {self.params.host}:{self.params.port or 22} is fully powered on "
+                "(not still restarting), that nothing else is using that port, and that no "
+                "firewall is interfering."
+            )
         if isinstance(exc, (paramiko.SSHException, socket.timeout, TimeoutError, OSError, EOFError)):
             return NasConnectionError(f"Could not reach {self.params.host}: {self.params.redact(str(exc))}")
         return exc
@@ -131,6 +152,25 @@ class SftpClient(NasClient):
             if parent:
                 self._mkdirs(parent)
             self._sftp.put(str(local), self._abs(rel))
+        except Exception as exc:
+            raise self._translate(exc) from exc
+
+    def _rename(self, tmp_rel: str, final_rel: str) -> None:
+        tmp_abs, final_abs = self._abs(tmp_rel), self._abs(final_rel)
+        try:
+            try:
+                # posix-rename@openssh.com: atomic, overwrites the destination.
+                self._sftp.posix_rename(tmp_abs, final_abs)
+            except AttributeError:
+                # Server/paramiko lacks the extension — plain SFTP RENAME fails
+                # if the destination exists, so clear it first. Not atomic, but
+                # nothing else ever creates a file at final_abs except a fully
+                # verified prior upload.
+                try:
+                    self._sftp.remove(final_abs)
+                except FileNotFoundError:
+                    pass
+                self._sftp.rename(tmp_abs, final_abs)
         except Exception as exc:
             raise self._translate(exc) from exc
 

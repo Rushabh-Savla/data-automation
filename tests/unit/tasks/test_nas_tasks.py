@@ -261,6 +261,24 @@ class TestOffloadTaskLock:
     def test_a_second_concurrent_offload_of_the_same_asset_is_refused(self, monkeypatch):
         held = set()
 
+        class FakePipeline:
+            def __init__(self):
+                self._ops: list[str] = []
+
+            def set(self, key, val, nx=False, ex=None):
+                self._ops.append(key)
+                return self
+
+            def execute(self):
+                results = []
+                for key in self._ops:
+                    if key in held:
+                        results.append(None)
+                    else:
+                        held.add(key)
+                        results.append(True)
+                return results
+
         class R:
             def get(self, key):
                 return None
@@ -274,11 +292,18 @@ class TestOffloadTaskLock:
             def delete(self, key):
                 held.discard(key)
 
+            def pipeline(self):
+                return FakePipeline()
+
         monkeypatch.setattr(nt, "get_redis", lambda: R())
         monkeypatch.setattr(nt, "get_active_storage_params", lambda: object())
         monkeypatch.setattr(nt, "open_client", lambda params: contextlib.nullcontext(object()))
+        monkeypatch.setattr(nt, "_prefetch_job_folders", lambda db, ids: {})
+        monkeypatch.setattr(nt, "session_scope", lambda: contextlib.nullcontext(object()))
         calls = []
-        monkeypatch.setattr(nt, "_offload", lambda a, client=None: calls.append(a) or "offloaded")
+        monkeypatch.setattr(
+            nt, "_offload", lambda a, client=None, params=None, job_folder_cache=None: calls.append(a) or "offloaded"
+        )
         aid = str(uuid.uuid4())
         held.add(f"nas_offload:{aid}")
         assert nt.offload_asset_batch.run([aid]) == {aid: "in_flight"} and calls == []
