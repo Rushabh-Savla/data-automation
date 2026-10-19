@@ -165,12 +165,47 @@ class RoboflowConnector:
             return None
         return SourceItem(
             source_type=SourceType.ROBOFLOW,
-            external_ref={"workspace": owner, "project": slug, "version": 1},
+            # No "version" here: Universe search doesn't tell us which
+            # version number is actually published for this project (it's
+            # frequently not 1 — older/renumbered/pruned datasets), so
+            # guessing 1 made every such project fail identically forever.
+            # The real version is resolved lazily in fetch() instead.
+            external_ref={"workspace": owner, "project": slug},
             license_hint=item.get("license", "Unknown"),
             dataset_identifier=f"{owner}/{slug}",
         )
 
     # -- Download --------------------------------------------------------------
+
+    def _resolve_latest_version(self, workspace: str, project: str) -> int | None:
+        """Looks up the project's actual latest version number instead of
+        guessing — Universe search results don't carry this, and assuming 1
+        fails permanently (not transiently) whenever a project's real
+        version differs. Returns None if the lookup itself fails, so the
+        caller can fall back to its own default rather than raising here."""
+        try:
+            key = self._next_key()
+            resp = requests.get(f"{RF_API_BASE}/{workspace}/{project}", params={"api_key": key}, timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            logger.debug(f"Could not resolve latest version for {workspace}/{project}: {e}")
+            return None
+
+        project_info = data.get("project", data)
+        versions = project_info.get("versions") or data.get("versions") or []
+        version_ids = []
+        for v in versions:
+            vid = v.get("id") if isinstance(v, dict) else v
+            if not vid:
+                continue
+            # Version "id" comes back as "workspace/project/<number>".
+            tail = str(vid).rsplit("/", 1)[-1]
+            if tail.isdigit():
+                version_ids.append(int(tail))
+        if version_ids:
+            return max(version_ids)
+        return None
 
     def fetch(
         self,
@@ -194,7 +229,13 @@ class RoboflowConnector:
 
         workspace = item.external_ref["workspace"]
         project = item.external_ref["project"]
-        version = item.external_ref.get("version", 1)
+        version = item.external_ref.get("version")
+        if version is None:
+            version = self._resolve_latest_version(workspace, project) or 1
+            # Cache the resolved version back onto the item so a retry of
+            # this same fetch (checkpoint resume, re-queue, etc.) doesn't
+            # re-resolve it and risk picking a different number mid-job.
+            item.external_ref["version"] = version
         license_name = item.license_hint or "Unknown"
         dataset_url = f"{RF_UNIVERSE_BASE}/{workspace}/{project}"
 
@@ -431,9 +472,17 @@ def _looks_inaccessible(e: Exception) -> bool:
     """True for the SDK's raw RoboflowError({"error": {"message": "...does
     not exist or cannot be loaded due to missing permissions", "type":
     "GraphMethodException", ...}}) — a project Universe search returned that
-    the API itself refuses to serve."""
+    the API itself refuses to serve. Also true for "Version number N is not
+    found" — a resolved/guessed version that doesn't actually exist, which
+    (unlike a real transient failure) will never succeed on retry, so it's
+    skipped the same way rather than endlessly retried as transient."""
     msg = str(e).lower()
-    return "does not exist" in msg or "missing permission" in msg or "graphmethodexception" in msg
+    return (
+        "does not exist" in msg
+        or "missing permission" in msg
+        or "graphmethodexception" in msg
+        or ("version number" in msg and "not found" in msg)
+    )
 
 
 def _bounded_source_item_id(source_item_id: str) -> str:
