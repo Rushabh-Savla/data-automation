@@ -330,7 +330,24 @@ def download_youtube_video(self, job_id: str, job_source_task_id: str, item_dict
         dataset_identifier=item_dict.get("dataset_identifier"),
     )
     checkpoint_key = item.external_ref.get("video_id", item.external_ref["url"])
-    workdir = settings.work_root / job_source_task_id
+    # Per-video, not just per-job_source_task_id: a job with several manually
+    # entered URLs fans out one download_youtube_video task per URL, all
+    # sharing one JobSourceTask row, and Celery runs chord members
+    # concurrently. A shared workdir meant every URL's download wrote into
+    # the same videos/ directory, and yt-dlp's MaxDownloadsReached fallback
+    # (YouTubeConnector.fetch) matches "any media file in video_dir" on that
+    # path — which could pick up a sibling task's video for a different URL,
+    # tagging its frames with this task's URL/video_id while the pixel
+    # content was actually the other video's. Isolating each task's workdir
+    # makes that match unambiguous again. video_id (not checkpoint_key's URL
+    # fallback) is used for the directory name — a raw URL contains "/" and
+    # "?" and isn't a safe path segment; both dispatch paths in
+    # discovery_tasks.py always set video_id before this task ever runs, so
+    # the hash fallback below is only a defensive backstop.
+    video_dir_name = item.external_ref.get("video_id") or hashlib.sha1(
+        item.external_ref["url"].encode()
+    ).hexdigest()[:16]
+    workdir = settings.work_root / job_source_task_id / video_dir_name
     workdir.mkdir(parents=True, exist_ok=True)
 
     with session_scope() as db:
