@@ -402,3 +402,64 @@ def schedule_offload(asset_ids: list[str]) -> None:
         offload_asset_batch.delay(asset_ids)
     except Exception:
         logger.exception("Could not schedule NAS offload; the sweeper will pick these up")
+
+
+def schedule_offload_for_job(job_id: str) -> None:
+    """Called by finalize_relevance_filter once ALL batches for a job are done.
+
+    Drains the Redis list of accumulated RELEVANCE_PASSED asset IDs that
+    relevance_filter_batch collected during the pass, then dispatches them to
+    offload_asset_batch in chunks of _SWEEP_DISPATCH_CHUNK (default 20).
+
+    Uploading here — after all verdicts are committed — rather than mid-pass
+    prevents a wave of concurrent filter workers from hitting the NAS in
+    parallel bursts. The existing pacing (nas_sftp_upload_pacing_s) and the
+    single-session semaphore (nas_sftp_max_concurrency) still throttle every
+    write, so the NAS receives a slow, steady drip instead of a flood.
+
+    If the NAS is in cooldown or unavailable the IDs are simply abandoned here;
+    sweep_unoffloaded_assets (the Beat sweeper) will catch them once the NAS
+    recovers, because they are already RELEVANCE_PASSED in the DB. Never raises.
+    """
+    try:
+        if not is_storage_active():
+            return
+        redis = get_redis()
+        raw = redis.lrange(f"job:{job_id}:offload_pending", 0, -1)
+        redis.delete(f"job:{job_id}:offload_pending")
+        if not raw:
+            return
+        # Decode bytes and deduplicate while preserving insertion order.
+        # A watchdog re-drive can push duplicate IDs into the list if a batch
+        # was redelivered after the worker restarted.
+        seen: set[str] = set()
+        asset_ids: list[str] = []
+        for item in raw:
+            s = item.decode() if isinstance(item, bytes) else item
+            if s not in seen:
+                seen.add(s)
+                asset_ids.append(s)
+        if not asset_ids:
+            return
+        if _cooldown_active(redis):
+            # Already RELEVANCE_PASSED in DB — the sweeper picks them up.
+            logger.info(
+                "NAS offload for job %s deferred (cooldown active); sweeper will retry %d asset(s)",
+                job_id,
+                len(asset_ids),
+            )
+            return
+        dispatched = 0
+        for i in range(0, len(asset_ids), _SWEEP_DISPATCH_CHUNK):
+            offload_asset_batch.delay(asset_ids[i : i + _SWEEP_DISPATCH_CHUNK])
+            dispatched += _SWEEP_DISPATCH_CHUNK
+        logger.info(
+            "NAS offload for job %s: dispatched %d asset(s) in %d chunk(s)",
+            job_id,
+            len(asset_ids),
+            -(-len(asset_ids) // _SWEEP_DISPATCH_CHUNK),
+        )
+    except Exception:
+        logger.exception(
+            "Could not schedule NAS offload for job %s; sweeper will pick these up", job_id
+        )

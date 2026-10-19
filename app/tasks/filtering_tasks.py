@@ -95,7 +95,6 @@ from app.services.job_counters import reconcile
 from app.services.progress_service import ProgressPublisher
 from app.services.standardization_service import delete_asset_files
 from app.storage import asset_files
-from app.tasks.nas_tasks import schedule_offload
 from app.core.config import get_settings
 from app.core.redis_client import get_redis
 from app.tasks.celery_app import celery_app
@@ -424,9 +423,14 @@ def relevance_filter_batch(self, job_id: str, asset_ids: list[str]) -> dict:
                         job_repo.increment_counts(job_uuid, accepted=-1, rejected=1)
                         rejected += 1
 
-            # The chunk's verdicts are committed now. If a NAS is connected, the kept
-            # images move onto it (and off local disk); a no-op otherwise. Never raises.
-            schedule_offload(chunk_passed)
+            # Accumulate passed IDs in Redis; the upload fires once ALL batches for
+            # this job are done (see finalize_relevance_filter / schedule_offload_for_job).
+            # Uploading mid-pass would hit the NAS in bursts from many concurrent
+            # filter workers — deferring lets us send everything in one slow drip.
+            if chunk_passed:
+                _redis = get_redis()
+                _redis.rpush(f"job:{job_id}:offload_pending", *chunk_passed)
+                _redis.expire(f"job:{job_id}:offload_pending", 86400)  # 24 h safety TTL
 
         # A batch can still land PASSED verdicts after the job has already
         # gone terminal: trim_excess_assets (filtering_tasks.py) only ever
@@ -524,6 +528,13 @@ def finalize_relevance_filter(self, job_id: str):
     ProgressPublisher(redis_client).publish(
         job_id, {"type": "relevance_filter_complete", "passed": passed, "rejected": rejected}
     )
+
+    # All relevance verdicts are now committed. Upload every RELEVANCE_PASSED asset
+    # to NAS in one slow drip — deferred from filter_batch so the NAS is not hit by
+    # concurrent burst writes from many parallel filter workers mid-pass.
+    from app.tasks.nas_tasks import schedule_offload_for_job
+    schedule_offload_for_job(job_id)
+
     run_deduplication.delay(job_id)
 
 

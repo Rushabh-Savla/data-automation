@@ -42,10 +42,12 @@ class TestSelectTrimCandidates:
 
 
 class _FakeRedis:
-    """set/decr/delete/publish surface used by the fan-out + finalize guard."""
+    """set/decr/delete/publish surface used by the fan-out + finalize guard.
+    Also supports rpush/expire/lrange for the deferred-offload accumulation."""
 
     def __init__(self):
         self.store: dict[str, int | str] = {}
+        self.lists: dict[str, list[str]] = {}
 
     def set(self, key, value, ex=None, nx=False):
         if nx and key in self.store:
@@ -59,9 +61,21 @@ class _FakeRedis:
 
     def delete(self, key):
         self.store.pop(key, None)
+        self.lists.pop(key, None)
 
     def publish(self, *args, **kwargs):
         pass
+
+    def rpush(self, key, *values):
+        self.lists.setdefault(key, []).extend(values)
+        return len(self.lists[key])
+
+    def expire(self, key, seconds):
+        pass  # TTL bookkeeping not needed in unit tests
+
+    def lrange(self, key, start, end):
+        items = self.lists.get(key, [])
+        return [v.encode() if isinstance(v, str) else v for v in items]
 
 
 class TestBatchFailureDoesNotStrandTheJob:
@@ -400,3 +414,179 @@ class TestFilteringIdleThreshold:
         from app.core.config import Settings
 
         assert Settings().filtering_stall_threshold_s <= 600
+
+
+class TestDeferredNasOffloadAccumulation:
+    """relevance_filter_batch must accumulate passed IDs in Redis instead of
+    dispatching uploads immediately — the upload fires once from finalize."""
+
+    @staticmethod
+    def _run_batch(monkeypatch, fake_redis, job_id, asset_ids, outcome=None):
+        import app.tasks.filtering_tasks as ft
+        from contextlib import contextmanager
+        from types import SimpleNamespace
+
+        if outcome is None:
+            outcome = ft._ACCEPT
+
+        asset = SimpleNamespace(status=ft.AssetStatus.PROMOTED, nas_path="/nas/x.jpg")
+        job = SimpleNamespace(status=None, query="cars")
+
+        class _FakeAssetRepo:
+            def __init__(self, db):
+                pass
+
+            def get(self, asset_id):
+                return asset
+
+            def set_status(self, asset_id, status, relevance_score=None, is_duplicate_of=None):
+                asset.status = status
+
+            def count_for_job(self, *a, **kw):
+                return 0
+
+        class _FakeJobRepo:
+            def __init__(self, db):
+                pass
+
+            def get(self, job_id):
+                return job
+
+            def increment_counts(self, *args, **kwargs):
+                pass
+
+        @contextmanager
+        def fake_scope():
+            yield object()
+
+        monkeypatch.setattr(ft, "session_scope", fake_scope)
+        monkeypatch.setattr(ft, "AssetRepository", _FakeAssetRepo)
+        monkeypatch.setattr(ft, "JobRepository", _FakeJobRepo)
+        monkeypatch.setattr(ft, "_classify_batch", lambda q, items: [(i[0], outcome, 1.0) for i in items])
+        monkeypatch.setattr(ft, "get_redis", lambda: fake_redis)
+        monkeypatch.setattr(ft, "finalize_relevance_filter", SimpleNamespace(delay=lambda jid: None))
+        monkeypatch.setattr(ft, "delete_asset_files", lambda a: None)
+        monkeypatch.setattr(ft, "trim_excess_assets", lambda jid: None)
+
+        ft.FanIn(fake_redis).start(job_id, ft._FANIN_NAME, 1)
+        return ft.relevance_filter_batch.run(job_id, asset_ids)
+
+    def test_passed_ids_accumulate_in_redis_not_dispatched_immediately(self, monkeypatch):
+        import uuid
+        import app.tasks.nas_tasks as nt
+
+        fake = _FakeRedis()
+        job_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        aid1 = str(uuid.uuid4())
+        aid2 = str(uuid.uuid4())
+
+        # Ensure no direct dispatch happens
+        monkeypatch.setattr(nt.offload_asset_batch, "delay", lambda ids: pytest.fail("must not dispatch mid-pass"))
+
+        self._run_batch(monkeypatch, fake, job_id, [aid1, aid2])
+
+        pending = fake.lists.get(f"job:{job_id}:offload_pending", [])
+        assert len(pending) == 2
+        decoded = {v.decode() if isinstance(v, bytes) else v for v in pending}
+        assert decoded == {aid1, aid2}
+
+    def test_rejected_assets_are_not_accumulated(self, monkeypatch):
+        import uuid
+        import app.tasks.filtering_tasks as ft
+
+        fake = _FakeRedis()
+        job_id = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+
+        self._run_batch(monkeypatch, fake, job_id, [str(uuid.uuid4())], outcome=ft._REJECT)
+
+        assert fake.lists.get(f"job:{job_id}:offload_pending", []) == []
+
+    def test_multiple_batches_accumulate_ids_into_the_same_list(self, monkeypatch):
+        import uuid
+        import app.tasks.filtering_tasks as ft
+
+        fake = _FakeRedis()
+        job_id = "cccccccc-cccc-cccc-cccc-cccccccccccc"
+        aid1, aid2, aid3 = str(uuid.uuid4()), str(uuid.uuid4()), str(uuid.uuid4())
+
+        # First batch passes 2 assets
+        self._run_batch(monkeypatch, fake, job_id, [aid1, aid2])
+        # FanIn was consumed by first run; arm it again for the second batch
+        ft.FanIn(fake).start(job_id, ft._FANIN_NAME, 1)
+        self._run_batch(monkeypatch, fake, job_id, [aid3])
+
+        pending = fake.lists.get(f"job:{job_id}:offload_pending", [])
+        decoded = {v.decode() if isinstance(v, bytes) else v for v in pending}
+        assert decoded == {aid1, aid2, aid3}
+
+
+class TestFinalizeTriggersOffload:
+    """finalize_relevance_filter must call schedule_offload_for_job once, after
+    all verdicts are committed — not before, not per-batch."""
+
+    def test_finalize_calls_schedule_offload_for_job(self, monkeypatch):
+        import app.tasks.filtering_tasks as ft
+        import app.tasks.nas_tasks as nt
+        from contextlib import contextmanager
+        from types import SimpleNamespace
+
+        job_id = "dddddddd-dddd-dddd-dddd-dddddddddddd"
+        offload_calls: list[str] = []
+
+        # The function does `from app.tasks.nas_tasks import schedule_offload_for_job`
+        # inside its body, so patching the attribute on the nas_tasks module is enough.
+        monkeypatch.setattr(nt, "schedule_offload_for_job", lambda jid: offload_calls.append(jid))
+
+        class _FakeAssetRepo:
+            def __init__(self, db):
+                pass
+
+            def count_for_job(self, *a, status=None, **kw):
+                return 0
+
+        class _FakeJobRepo:
+            def __init__(self, db):
+                pass
+
+        @contextmanager
+        def fake_scope():
+            yield object()
+
+        fake_redis = _FakeRedis()
+        monkeypatch.setattr(ft, "get_redis", lambda: fake_redis)
+        monkeypatch.setattr(ft, "session_scope", fake_scope)
+        monkeypatch.setattr(ft, "AssetRepository", _FakeAssetRepo)
+        monkeypatch.setattr(ft, "JobRepository", _FakeJobRepo)
+        monkeypatch.setattr(ft, "reconcile", lambda db, job_uuid: None)
+
+        class _FakePublisher:
+            def __init__(self, redis):
+                pass
+
+            def publish(self, *a, **kw):
+                pass
+
+        monkeypatch.setattr(ft, "ProgressPublisher", _FakePublisher)
+        monkeypatch.setattr(ft, "run_deduplication", SimpleNamespace(delay=lambda jid: None))
+
+        ft.finalize_relevance_filter.run(job_id)
+
+        assert offload_calls == [job_id], "schedule_offload_for_job must be called exactly once with the job id"
+
+    def test_finalize_does_not_call_offload_when_suppressed_by_guard(self, monkeypatch):
+        import app.tasks.filtering_tasks as ft
+        import app.tasks.nas_tasks as nt
+
+        offload_calls: list[str] = []
+        monkeypatch.setattr(nt, "schedule_offload_for_job", lambda jid: offload_calls.append(jid))
+
+        fake_redis = _FakeRedis()
+        job_id = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"
+        # Pre-set the idempotency guard — this run should be suppressed entirely
+        fake_redis.set(ft._FINALIZE_GUARD_KEY.format(job_id=job_id), "1")
+
+        monkeypatch.setattr(ft, "get_redis", lambda: fake_redis)
+
+        ft.finalize_relevance_filter.run(job_id)
+
+        assert offload_calls == [], "suppressed finalize must not trigger offload"

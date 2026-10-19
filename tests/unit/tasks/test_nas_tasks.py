@@ -212,6 +212,99 @@ class TestRemotePathLayout:
         assert nt._remote_rel_for("out", odd) == "out/job9/coco/images/y.jpg"
 
 
+class TestScheduleOffloadForJob:
+    """schedule_offload_for_job: drains Redis list → dispatches chunks after all
+    relevance batches are done. Reuses all existing cooldown / NAS-active guards."""
+
+    def _make_redis(self, stored: list[str]):
+        """Minimal fake Redis that backs lrange / delete with a list."""
+        class FakeRedis:
+            def __init__(self, data):
+                self._data = {f"job:j1:offload_pending": list(data)}
+
+            def lrange(self, key, start, end):
+                return [v.encode() for v in self._data.get(key, [])]
+
+            def delete(self, key):
+                self._data.pop(key, None)
+
+            def get(self, key):
+                return None  # no cooldown
+
+        return FakeRedis(stored)
+
+    def test_dispatches_all_ids_in_chunks(self, monkeypatch):
+        sent = []
+        monkeypatch.setattr(nt, "is_storage_active", lambda: True)
+        monkeypatch.setattr(nt, "_cooldown_active", lambda r: False)
+        monkeypatch.setattr(nt, "get_redis", lambda: self._make_redis([str(i) for i in range(25)]))
+        monkeypatch.setattr(nt.offload_asset_batch, "delay", lambda ids: sent.append(list(ids)))
+        nt.schedule_offload_for_job("j1")
+        # 25 IDs with chunk size 20 → 2 batches
+        assert len(sent) == 2
+        assert len(sent[0]) == 20
+        assert len(sent[1]) == 5
+        # All IDs covered, no repeats
+        flat = [x for chunk in sent for x in chunk]
+        assert sorted(flat, key=int) == [str(i) for i in range(25)]
+
+    def test_deduplicates_ids_pushed_by_redelivered_batches(self, monkeypatch):
+        sent = []
+        ids = ["a", "b", "a", "c", "b"]  # duplicates from redelivery
+        monkeypatch.setattr(nt, "is_storage_active", lambda: True)
+        monkeypatch.setattr(nt, "_cooldown_active", lambda r: False)
+        monkeypatch.setattr(nt, "get_redis", lambda: self._make_redis(ids))
+        monkeypatch.setattr(nt.offload_asset_batch, "delay", lambda x: sent.extend(x))
+        nt.schedule_offload_for_job("j1")
+        assert sorted(sent) == ["a", "b", "c"]
+
+    def test_is_noop_when_no_ids_are_pending(self, monkeypatch):
+        monkeypatch.setattr(nt, "is_storage_active", lambda: True)
+        monkeypatch.setattr(nt, "_cooldown_active", lambda r: False)
+        monkeypatch.setattr(nt, "get_redis", lambda: self._make_redis([]))
+        monkeypatch.setattr(nt.offload_asset_batch, "delay", lambda ids: pytest.fail("must not dispatch"))
+        nt.schedule_offload_for_job("j1")  # must not raise or dispatch
+
+    def test_is_noop_when_no_nas_is_active(self, monkeypatch):
+        monkeypatch.setattr(nt, "is_storage_active", lambda: False)
+        monkeypatch.setattr(nt.offload_asset_batch, "delay", lambda ids: pytest.fail("must not dispatch"))
+        nt.schedule_offload_for_job("j1")
+
+    def test_skips_dispatch_during_cooldown_without_raising(self, monkeypatch):
+        monkeypatch.setattr(nt, "is_storage_active", lambda: True)
+        monkeypatch.setattr(nt, "_cooldown_active", lambda r: True)
+        monkeypatch.setattr(nt, "get_redis", lambda: self._make_redis(["x", "y"]))
+        monkeypatch.setattr(nt.offload_asset_batch, "delay", lambda ids: pytest.fail("must not dispatch"))
+        nt.schedule_offload_for_job("j1")  # IDs stay RELEVANCE_PASSED; sweeper retries
+
+    def test_never_raises_into_the_caller(self, monkeypatch):
+        def boom():
+            raise RuntimeError("redis down")
+
+        monkeypatch.setattr(nt, "is_storage_active", boom)
+        nt.schedule_offload_for_job("j1")  # must swallow
+
+    def test_redis_key_is_deleted_after_drain(self, monkeypatch):
+        deleted = []
+
+        class TrackingRedis:
+            def lrange(self, key, *_):
+                return [b"a", b"b"]
+
+            def delete(self, key):
+                deleted.append(key)
+
+            def get(self, key):
+                return None
+
+        monkeypatch.setattr(nt, "is_storage_active", lambda: True)
+        monkeypatch.setattr(nt, "_cooldown_active", lambda r: False)
+        monkeypatch.setattr(nt, "get_redis", lambda: TrackingRedis())
+        monkeypatch.setattr(nt.offload_asset_batch, "delay", lambda ids: None)
+        nt.schedule_offload_for_job("myjob")
+        assert "job:myjob:offload_pending" in deleted
+
+
 class TestScheduling:
     def test_schedule_offload_dispatches_one_batch_task(self, monkeypatch):
         sent = []
