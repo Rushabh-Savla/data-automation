@@ -40,6 +40,10 @@ class Settings(BaseSettings):
     # (and reconnect) on its own schedule — a wave of simultaneous reconnects
     # right as a crashed NAS comes back up can retrigger the crash.
     nas_offload_cooldown_s: int = 180
+    # File NAS activity (uploads, retries, cooldowns, sweeps) is logged to,
+    # in addition to the normal stdout stream — kept separate so NAS issues
+    # can be grepped/tailed without wading through the rest of the worker log.
+    nas_log_file: Path = Path("./logs/nas.log")
 
     # -- Auth --------------------------------------------------------------------
     # Comma-separated list of valid API keys. Any one of them is accepted.

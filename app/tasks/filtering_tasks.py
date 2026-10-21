@@ -529,12 +529,6 @@ def finalize_relevance_filter(self, job_id: str):
         job_id, {"type": "relevance_filter_complete", "passed": passed, "rejected": rejected}
     )
 
-    # All relevance verdicts are now committed. Upload every RELEVANCE_PASSED asset
-    # to NAS in one slow drip — deferred from filter_batch so the NAS is not hit by
-    # concurrent burst writes from many parallel filter workers mid-pass.
-    from app.tasks.nas_tasks import schedule_offload_for_job
-    schedule_offload_for_job(job_id)
-
     run_deduplication.delay(job_id)
 
 

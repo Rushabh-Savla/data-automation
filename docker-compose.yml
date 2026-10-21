@@ -75,6 +75,9 @@ services:
       REDIS_URL: redis://redis:6379/0
       NAS_ROOT: /nas
       WORK_ROOT: /work
+      # NAS offload runs on this worker (standardize queue) — its own
+      # rotating log file, separate from the rest of the worker's stdout.
+      NAS_LOG_FILE: /srv/logs/nas.log
       # Without this each of the 8 children defaults its intra-op pool to the
       # host's core count (64 here), so the box runs ~512 compute threads and
       # spends its time context switching. See _cap_torch_threads in
@@ -90,6 +93,7 @@ services:
       # become invisible/404 the other way).
       - ./nas_data:/nas
       - ./work_data:/work
+      - ./logs:/srv/logs
     depends_on:
       postgres:
         condition: service_healthy

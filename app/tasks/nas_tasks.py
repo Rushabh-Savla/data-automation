@@ -2,10 +2,15 @@
 
 Pipeline position: downloads and filtering still work on local staging files (the
 relevance model and CLIP need real files, and rejected images should never cost
-NAS traffic). The moment an image is judged relevant, offload_asset_batch uploads
-it to the NAS, verifies the copy, repoints Asset.nas_path at "nas://...", and only
-then removes the local file. Nothing here can fail a job: if the NAS is
-unreachable the image simply stays local and is retried, later, by the sweeper.
+NAS traffic). Offload is triggered once per job, from plan_topup_round once the
+job's kept set is final — every top-up round has run, dedup has settled, and any
+surplus past target_count has been trimmed — rather than per relevance-filter pass,
+so an asset that a later round would have deduped or trimmed away never makes a
+round trip to NAS first. At that point offload_asset_batch uploads each
+RELEVANCE_PASSED asset to the NAS, verifies the copy, repoints Asset.nas_path at
+"nas://...", and only then removes the local file. Nothing here can fail a job: if
+the NAS is unreachable the image simply stays local and is retried, later, by the
+sweeper.
 
 Assets are offloaded in batches over one shared SFTP/SSH connection rather than
 one task + one fresh connection per asset — a weak NAS can crash under a storm

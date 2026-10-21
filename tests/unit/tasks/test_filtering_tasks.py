@@ -520,11 +520,12 @@ class TestDeferredNasOffloadAccumulation:
         assert decoded == {aid1, aid2, aid3}
 
 
-class TestFinalizeTriggersOffload:
-    """finalize_relevance_filter must call schedule_offload_for_job once, after
-    all verdicts are committed — not before, not per-batch."""
+class TestFinalizeDoesNotTriggerOffload:
+    """NAS offload is now triggered once per job, at the true end of it (from
+    plan_topup_round's final round — see test_topup_flow.py), not per
+    relevance-filter pass. finalize_relevance_filter must not call it."""
 
-    def test_finalize_calls_schedule_offload_for_job(self, monkeypatch):
+    def test_finalize_does_not_call_schedule_offload_for_job(self, monkeypatch):
         import app.tasks.filtering_tasks as ft
         import app.tasks.nas_tasks as nt
         from contextlib import contextmanager
@@ -533,8 +534,6 @@ class TestFinalizeTriggersOffload:
         job_id = "dddddddd-dddd-dddd-dddd-dddddddddddd"
         offload_calls: list[str] = []
 
-        # The function does `from app.tasks.nas_tasks import schedule_offload_for_job`
-        # inside its body, so patching the attribute on the nas_tasks module is enough.
         monkeypatch.setattr(nt, "schedule_offload_for_job", lambda jid: offload_calls.append(jid))
 
         class _FakeAssetRepo:
@@ -571,22 +570,4 @@ class TestFinalizeTriggersOffload:
 
         ft.finalize_relevance_filter.run(job_id)
 
-        assert offload_calls == [job_id], "schedule_offload_for_job must be called exactly once with the job id"
-
-    def test_finalize_does_not_call_offload_when_suppressed_by_guard(self, monkeypatch):
-        import app.tasks.filtering_tasks as ft
-        import app.tasks.nas_tasks as nt
-
-        offload_calls: list[str] = []
-        monkeypatch.setattr(nt, "schedule_offload_for_job", lambda jid: offload_calls.append(jid))
-
-        fake_redis = _FakeRedis()
-        job_id = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"
-        # Pre-set the idempotency guard — this run should be suppressed entirely
-        fake_redis.set(ft._FINALIZE_GUARD_KEY.format(job_id=job_id), "1")
-
-        monkeypatch.setattr(ft, "get_redis", lambda: fake_redis)
-
-        ft.finalize_relevance_filter.run(job_id)
-
-        assert offload_calls == [], "suppressed finalize must not trigger offload"
+        assert offload_calls == [], "finalize_relevance_filter must not trigger per-round offload"

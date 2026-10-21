@@ -3,6 +3,8 @@
 import logging
 import sys
 from contextvars import ContextVar
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
 
 _job_id_ctx: ContextVar[str] = ContextVar("job_id", default="-")
 _job_source_task_id_ctx: ContextVar[str] = ContextVar("job_source_task_id", default="-")
@@ -55,6 +57,31 @@ def configure_logging(level: int = logging.INFO) -> None:
     # errors still come through.
     for noisy in ("smbprotocol", "smbclient", "spnego", "paramiko"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
+
+    configure_nas_file_logging()
+
+
+def configure_nas_file_logging() -> None:
+    """NAS activity also goes to its own rotating log file, on top of the
+    normal stdout stream, so offload/upload/cooldown/sweep issues can be
+    tailed in isolation from the rest of the worker's output."""
+    from app.core.config import get_settings
+
+    log_path = Path(get_settings().nas_log_file)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    handler = RotatingFileHandler(log_path, maxBytes=10 * 1024 * 1024, backupCount=5)
+    handler.setFormatter(
+        logging.Formatter(
+            "%(asctime)s  %(levelname)-8s  [job=%(job_id)s task=%(job_source_task_id)s]  "
+            "%(name)s  %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+    )
+    handler.addFilter(ContextFilter())
+
+    nas_logger = logging.getLogger("app.tasks.nas_tasks")
+    nas_logger.addHandler(handler)
 
 
 def bind_job_context(job_id: str | None = None, job_source_task_id: str | None = None) -> None:

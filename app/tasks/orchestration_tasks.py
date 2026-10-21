@@ -474,6 +474,21 @@ def evaluate_job_completion(self, job_id: str):
             job_id, {"type": "job_status", "status": new_status.value, "completion_reason": reason.value}
         )
 
+    # Only after the job is actually marked COMPLETED/COMPLETED_PARTIAL in the
+    # DB (i.e. the transaction above has committed) do we start moving its kept
+    # assets to NAS — never while the job is still RUNNING/DISCOVERING. A
+    # FAILED job (accepted_count == 0) has nothing RELEVANCE_PASSED to offload,
+    # so it's excluded rather than special-cased. This is still a single
+    # dispatch per job, not per relevance-filter batch, so the NAS is not hit
+    # with a concurrent burst of writes from many parallel filter workers —
+    # schedule_offload_for_job/offload_asset_batch then drip the actual
+    # uploads slowly (paced batches over one shared connection, see
+    # nas_tasks.py).
+    if new_status in (JobStatus.COMPLETED, JobStatus.COMPLETED_PARTIAL):
+        from app.tasks.nas_tasks import schedule_offload_for_job
+
+        schedule_offload_for_job(job_id)
+
     clear_job_context()
 
 

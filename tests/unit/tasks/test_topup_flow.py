@@ -85,6 +85,73 @@ class TestPlanTopupRoundControlFlow:
         assert "clear_target_reached" in src
         assert "clear_source_cap_reached" in src
 
+    def test_plan_topup_round_no_longer_triggers_offload_itself(self):
+        """NAS offload must not be dispatched from plan_topup_round any more --
+        it now only fires from evaluate_job_completion, once the job's status
+        has actually committed to COMPLETED/COMPLETED_PARTIAL (see
+        TestEvaluateJobCompletionTriggersOffload below)."""
+        src = _function_source("plan_topup_round")
+        assert "schedule_offload_for_job" not in src
+
+
+class TestEvaluateJobCompletionTriggersOffload:
+    """NAS offload must only start once the job is actually marked
+    COMPLETED/COMPLETED_PARTIAL -- never while it's still RUNNING/DISCOVERING,
+    and never from inside the open transaction (it must race the commit the
+    same way the other post-transaction dispatches in this module do)."""
+
+    def test_offload_call_is_gated_on_completed_statuses(self):
+        src = _function_source("evaluate_job_completion")
+        fn = ast.parse(src).body[0]
+
+        calls = [
+            n for n in ast.walk(fn)
+            if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Name)
+            and n.func.id == "schedule_offload_for_job"
+        ]
+        assert calls, "expected schedule_offload_for_job to be called"
+        assert len(calls) == 1, "offload must be dispatched exactly once per evaluation"
+
+        # It must sit inside an `if new_status in (...COMPLETED...):` guard,
+        # not unconditionally.
+        guard = None
+        for node in ast.walk(fn):
+            if isinstance(node, ast.If) and any(
+                id(n) == id(calls[0]) for n in ast.walk(node)
+            ):
+                guard = node
+                break
+        assert guard is not None, "offload call must be inside an if-guard"
+        test_src = ast.unparse(guard.test)
+        assert "new_status" in test_src
+        assert "COMPLETED" in test_src
+
+    def test_offload_call_is_outside_the_open_transaction(self):
+        """Dispatched after `with session_scope()` exits, i.e. after the status
+        transition has committed -- not from inside the transaction, which
+        would race the commit the same way plan_topup_round's redispatch does."""
+        src = _function_source("evaluate_job_completion")
+        fn = ast.parse(src).body[0]
+
+        session_with = [
+            n for n in ast.walk(fn)
+            if isinstance(n, ast.With)
+            and any("session_scope" in ast.dump(i.context_expr) for i in n.items)
+        ]
+        assert session_with, "expected a session_scope block"
+        inside = {id(n) for n in ast.walk(session_with[0])}
+
+        calls = [
+            n for n in ast.walk(fn)
+            if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Name)
+            and n.func.id == "schedule_offload_for_job"
+        ]
+        assert calls
+        for call in calls:
+            assert id(call) not in inside, "offload must run after the transaction commits"
+
 
 class _FakeRedis:
     def __init__(self):
