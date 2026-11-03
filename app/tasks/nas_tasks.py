@@ -17,6 +17,7 @@ one task + one fresh connection per asset — a weak NAS can crash under a storm
 of back-to-back connection churn even though each one individually honors the
 nas_sftp_max_concurrency cap (see base.limited_concurrency)."""
 
+import inspect
 import logging
 import time
 import uuid
@@ -40,9 +41,10 @@ from app.tasks.celery_app import celery_app
 
 logger = logging.getLogger(__name__)
 
-_LOCK_TTL_S = 900
-_SWEEP_BATCH = 20
-_SWEEP_DISPATCH_CHUNK = 20
+# Extended lock TTL to ensure batches up to 2000 images have ample time without lock expiration.
+_LOCK_TTL_S = 3600
+_SWEEP_BATCH = 2000
+MAX_NAS_OFFLOAD_BATCH_SIZE = 2000
 
 # Set for nas_offload_cooldown_s after a connect/transient failure, so a NAS
 # that just crashed and came back isn't immediately hit by every worker's
@@ -100,6 +102,26 @@ def _prefetch_job_folders(db, asset_ids: list[uuid.UUID]) -> dict[uuid.UUID, str
         return {}
     names = dict(db.execute(select(Job.id, Job.name).where(Job.id.in_(job_ids))).all())
     return {job_id: job_folder_name(names.get(job_id), job_id) for job_id in job_ids}
+
+
+def _prefetch_job_storage_paths(db, asset_ids: list[uuid.UUID]) -> dict[uuid.UUID, str | None]:
+    if not asset_ids or not hasattr(db, "execute"):
+        return {}
+    job_ids = {
+        row[0]
+        for row in db.execute(select(Asset.job_id).where(Asset.id.in_(asset_ids)).distinct()).all()
+    }
+    if not job_ids:
+        return {}
+    rows = db.execute(select(Job.id, Job.config).where(Job.id.in_(job_ids))).all()
+    res: dict[uuid.UUID, str | None] = {}
+    for jid, cfg in rows:
+        if isinstance(cfg, dict):
+            val = (cfg.get("nas_storage_path") or cfg.get("nas_folder") or "").strip()
+            res[jid] = val if val else ""
+        else:
+            res[jid] = ""
+    return res
 
 
 def _upload_verified(client: NasClient, local_file: Path, rel: str) -> None:
@@ -166,6 +188,7 @@ def offload_asset_batch(self, asset_ids: list[str]) -> dict:
     # while the SFTP connection sits open and idle for each.
     with session_scope() as db:
         job_folder_cache = _prefetch_job_folders(db, [uuid.UUID(a) for a in asset_ids])
+        storage_path_cache = _prefetch_job_storage_paths(db, [uuid.UUID(a) for a in asset_ids])
 
     pipe = redis.pipeline()
     for asset_id in asset_ids:
@@ -183,17 +206,29 @@ def offload_asset_batch(self, asset_ids: list[str]) -> dict:
     if not runnable:
         return results
 
+    logger.info(f"[NAS OFFLOAD] Starting batch upload for {len(runnable)} asset(s) over single connection...")
+    offload_params = inspect.signature(_offload).parameters
     try:
         with open_client(params) as client:
             for i, asset_id in enumerate(runnable):
                 try:
+                    kwargs = {}
+                    if "storage_path_cache" in offload_params:
+                        kwargs["storage_path_cache"] = storage_path_cache
                     results[asset_id] = _offload(
-                        uuid.UUID(asset_id), client=client, params=params, job_folder_cache=job_folder_cache
+                        uuid.UUID(asset_id),
+                        client=client,
+                        params=params,
+                        job_folder_cache=job_folder_cache,
+                        **kwargs,
                     )
                 finally:
                     redis.delete(f"nas_offload:{asset_id}")
                 if settings.nas_sftp_upload_pacing_s and i < len(runnable) - 1:
                     time.sleep(settings.nas_sftp_upload_pacing_s)
+        logger.info(
+            f"[NAS OFFLOAD] Completed batch upload: {len(results)} asset(s) transferred over single connection."
+        )
     except TransientConnectorError:
         # Keeps every not-yet-processed asset local; Celery retries the whole
         # batch with backoff, and the cooldown stops other batches piling on
@@ -213,13 +248,15 @@ def _offload(
     client: NasClient | None = None,
     params=None,
     job_folder_cache: dict[uuid.UUID, str] | None = None,
+    storage_path_cache: dict[uuid.UUID, str | None] | None = None,
+    **kwargs,
 ) -> str:
     """Offloads one asset. Pass an already-open `client` to reuse a connection
     across a batch (see offload_asset_batch); omit it to open and close a
     connection for just this one asset (used directly by the sweeper/tests).
-    `params` and `job_folder_cache` let a caller that already looked these up
-    for the whole batch skip repeating that work per asset; both are re-fetched
-    here when omitted."""
+    `params`, `job_folder_cache` and `storage_path_cache` let a caller that
+    already looked these up for the whole batch skip repeating that work per
+    asset; all are re-fetched here when omitted."""
     if params is None:
         params = get_active_storage_params()
         if params is None:
@@ -242,13 +279,30 @@ def _offload(
         )
         job_folder = _job_folder_for_asset(db, asset.job_id, cache=job_folder_cache)
 
+        custom_storage = (storage_path_cache or {}).get(asset.job_id)
+        if custom_storage is None and hasattr(db, "execute"):
+            cfg = db.execute(select(Job.config).where(Job.id == asset.job_id)).scalar_one_or_none()
+            if isinstance(cfg, dict):
+                custom_storage = (cfg.get("nas_storage_path") or cfg.get("nas_folder") or "").strip()
+            else:
+                custom_storage = None
+
+        # If custom_storage was explicitly found to be empty (""), the job has NO NAS path configured.
+        # Images must not be stored to NAS; they stay local only and are exported locally.
+        if custom_storage == "":
+            logger.info(
+                f"NAS offload skipped for asset {asset_uuid}: job {asset.job_id} has no NAS storage destination path configured. Image stays local."
+            )
+            return "skipped_no_nas_destination"
+
     if not image_local.exists():
         # Silent before: the asset is now unrecoverable (no local file, never
         # offloaded) and nothing else will ever flag it, so this must be loud.
         logger.warning(f"NAS offload of asset {asset_uuid} skipped: local file {image_local} is gone")
         return "local_missing"
-    image_rel = _remote_rel_for(params.storage_path, image_local, job_folder)
-    ann_rel = _remote_rel_for(params.storage_path, ann_local, job_folder) if ann_local and ann_local.exists() else None
+    target_base = custom_storage.strip().strip("/") if custom_storage and custom_storage.strip() else params.storage_path
+    image_rel = _remote_rel_for(target_base, image_local, job_folder)
+    ann_rel = _remote_rel_for(target_base, ann_local, job_folder) if ann_local and ann_local.exists() else None
 
     attempted: list[str] = []
 
@@ -344,8 +398,8 @@ def sweep_unoffloaded_assets() -> int:
                 .limit(_SWEEP_BATCH)
             ).scalars()
         ]
-    for i in range(0, len(ids), _SWEEP_DISPATCH_CHUNK):
-        offload_asset_batch.delay(ids[i : i + _SWEEP_DISPATCH_CHUNK])
+    for i in range(0, len(ids), MAX_NAS_OFFLOAD_BATCH_SIZE):
+        offload_asset_batch.delay(ids[i : i + MAX_NAS_OFFLOAD_BATCH_SIZE])
     return len(ids)
 
 
@@ -404,7 +458,8 @@ def schedule_offload(asset_ids: list[str]) -> None:
             return
         if _cooldown_active(get_redis()):
             return
-        offload_asset_batch.delay(asset_ids)
+        for i in range(0, len(asset_ids), MAX_NAS_OFFLOAD_BATCH_SIZE):
+            offload_asset_batch.delay(asset_ids[i : i + MAX_NAS_OFFLOAD_BATCH_SIZE])
     except Exception:
         logger.exception("Could not schedule NAS offload; the sweeper will pick these up")
 
@@ -413,30 +468,43 @@ def schedule_offload_for_job(job_id: str) -> None:
     """Called by finalize_relevance_filter once ALL batches for a job are done.
 
     Drains the Redis list of accumulated RELEVANCE_PASSED asset IDs that
-    relevance_filter_batch collected during the pass, then dispatches them to
-    offload_asset_batch in chunks of _SWEEP_DISPATCH_CHUNK (default 20).
+    relevance_filter_batch collected during the pass.
 
-    Uploading here — after all verdicts are committed — rather than mid-pass
-    prevents a wave of concurrent filter workers from hitting the NAS in
-    parallel bursts. The existing pacing (nas_sftp_upload_pacing_s) and the
-    single-session semaphore (nas_sftp_max_concurrency) still throttle every
-    write, so the NAS receives a slow, steady drip instead of a flood.
-
-    If the NAS is in cooldown or unavailable the IDs are simply abandoned here;
-    sweep_unoffloaded_assets (the Beat sweeper) will catch them once the NAS
-    recovers, because they are already RELEVANCE_PASSED in the DB. Never raises.
+    Upload strategy requested:
+    - If total relevant assets <= 2000 (e.g. 1000 assets): upload all in 1 single batch
+      over 1 connection request.
+    - If total relevant assets > 2000: divide into batches of 2000 images per connection
+      request for smooth transaction.
     """
     try:
         if not is_storage_active():
             return
+
+        # If the job has no NAS storage destination path configured, do not offload to NAS.
+        # Images stay in local storage for local export.
+        with session_scope() as db:
+            if hasattr(db, "execute"):
+                try:
+                    job_uuid = uuid.UUID(str(job_id))
+                    job = db.execute(select(Job).where(Job.id == job_uuid)).scalar_one_or_none()
+                    if job is not None and isinstance(job.config, dict):
+                        nas_path = (job.config.get("nas_storage_path") or job.config.get("nas_folder") or "").strip()
+                        if not nas_path:
+                            logger.info(
+                                "Job %s has no NAS storage destination path configured; skipping NAS offload (files remain local for export).",
+                                job_id,
+                            )
+                            redis = get_redis()
+                            redis.delete(f"job:{job_id}:offload_pending")
+                            return
+                except (ValueError, TypeError):
+                    pass
         redis = get_redis()
         raw = redis.lrange(f"job:{job_id}:offload_pending", 0, -1)
         redis.delete(f"job:{job_id}:offload_pending")
         if not raw:
             return
         # Decode bytes and deduplicate while preserving insertion order.
-        # A watchdog re-drive can push duplicate IDs into the list if a batch
-        # was redelivered after the worker restarted.
         seen: set[str] = set()
         asset_ids: list[str] = []
         for item in raw:
@@ -447,22 +515,27 @@ def schedule_offload_for_job(job_id: str) -> None:
         if not asset_ids:
             return
         if _cooldown_active(redis):
-            # Already RELEVANCE_PASSED in DB — the sweeper picks them up.
             logger.info(
                 "NAS offload for job %s deferred (cooldown active); sweeper will retry %d asset(s)",
                 job_id,
                 len(asset_ids),
             )
             return
-        dispatched = 0
-        for i in range(0, len(asset_ids), _SWEEP_DISPATCH_CHUNK):
-            offload_asset_batch.delay(asset_ids[i : i + _SWEEP_DISPATCH_CHUNK])
-            dispatched += _SWEEP_DISPATCH_CHUNK
+
+        total_assets = len(asset_ids)
+        num_chunks = -(-total_assets // MAX_NAS_OFFLOAD_BATCH_SIZE)
         logger.info(
-            "NAS offload for job %s: dispatched %d asset(s) in %d chunk(s)",
-            job_id,
-            len(asset_ids),
-            -(-len(asset_ids) // _SWEEP_DISPATCH_CHUNK),
+            f"[NAS OFFLOAD] Job {job_id}: Scheduling {total_assets} relevant image(s) for NAS offload. "
+            f"Strategy: batches of up to {MAX_NAS_OFFLOAD_BATCH_SIZE} per connection request -> {num_chunks} batch(es)."
+        )
+
+        dispatched = 0
+        for i in range(0, total_assets, MAX_NAS_OFFLOAD_BATCH_SIZE):
+            batch = asset_ids[i : i + MAX_NAS_OFFLOAD_BATCH_SIZE]
+            offload_asset_batch.delay(batch)
+            dispatched += len(batch)
+        logger.info(
+            f"[NAS OFFLOAD] Job {job_id}: Dispatched all {dispatched} asset(s) across {num_chunks} connection request batch(es)."
         )
     except Exception:
         logger.exception(

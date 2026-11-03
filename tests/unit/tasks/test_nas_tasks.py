@@ -216,11 +216,11 @@ class TestScheduleOffloadForJob:
     """schedule_offload_for_job: drains Redis list → dispatches chunks after all
     relevance batches are done. Reuses all existing cooldown / NAS-active guards."""
 
-    def _make_redis(self, stored: list[str]):
+    def _make_redis(self, stored: list[str], job_id: str = "j1"):
         """Minimal fake Redis that backs lrange / delete with a list."""
         class FakeRedis:
             def __init__(self, data):
-                self._data = {f"job:j1:offload_pending": list(data)}
+                self._data = {f"job:{job_id}:offload_pending": list(data)}
 
             def lrange(self, key, start, end):
                 return [v.encode() for v in self._data.get(key, [])]
@@ -236,6 +236,7 @@ class TestScheduleOffloadForJob:
     def test_dispatches_all_ids_in_chunks(self, monkeypatch):
         sent = []
         monkeypatch.setattr(nt, "is_storage_active", lambda: True)
+        monkeypatch.setattr(nt, "MAX_NAS_OFFLOAD_BATCH_SIZE", 20)
         monkeypatch.setattr(nt, "_cooldown_active", lambda r: False)
         monkeypatch.setattr(nt, "get_redis", lambda: self._make_redis([str(i) for i in range(25)]))
         monkeypatch.setattr(nt.offload_asset_batch, "delay", lambda ids: sent.append(list(ids)))
@@ -252,6 +253,7 @@ class TestScheduleOffloadForJob:
         sent = []
         ids = ["a", "b", "a", "c", "b"]  # duplicates from redelivery
         monkeypatch.setattr(nt, "is_storage_active", lambda: True)
+        monkeypatch.setattr(nt, "MAX_NAS_OFFLOAD_BATCH_SIZE", 20)
         monkeypatch.setattr(nt, "_cooldown_active", lambda r: False)
         monkeypatch.setattr(nt, "get_redis", lambda: self._make_redis(ids))
         monkeypatch.setattr(nt.offload_asset_batch, "delay", lambda x: sent.extend(x))
@@ -260,6 +262,7 @@ class TestScheduleOffloadForJob:
 
     def test_is_noop_when_no_ids_are_pending(self, monkeypatch):
         monkeypatch.setattr(nt, "is_storage_active", lambda: True)
+        monkeypatch.setattr(nt, "MAX_NAS_OFFLOAD_BATCH_SIZE", 20)
         monkeypatch.setattr(nt, "_cooldown_active", lambda r: False)
         monkeypatch.setattr(nt, "get_redis", lambda: self._make_redis([]))
         monkeypatch.setattr(nt.offload_asset_batch, "delay", lambda ids: pytest.fail("must not dispatch"))
@@ -298,17 +301,64 @@ class TestScheduleOffloadForJob:
                 return None
 
         monkeypatch.setattr(nt, "is_storage_active", lambda: True)
+        monkeypatch.setattr(nt, "MAX_NAS_OFFLOAD_BATCH_SIZE", 20)
         monkeypatch.setattr(nt, "_cooldown_active", lambda r: False)
         monkeypatch.setattr(nt, "get_redis", lambda: TrackingRedis())
         monkeypatch.setattr(nt.offload_asset_batch, "delay", lambda ids: None)
         nt.schedule_offload_for_job("myjob")
         assert "job:myjob:offload_pending" in deleted
 
+    def test_skips_offload_when_job_has_no_nas_storage_path(self, monkeypatch):
+        sent = []
+        job_uuid = uuid.uuid4()
+        fake_job = SimpleNamespace(id=job_uuid, config={"nas_storage_path": ""})
+
+        class JobDb:
+            def execute(self, stmt):
+                return SimpleNamespace(scalar_one_or_none=lambda: fake_job)
+
+        @contextlib.contextmanager
+        def scope():
+            yield JobDb()
+
+        monkeypatch.setattr(nt, "session_scope", scope)
+        monkeypatch.setattr(nt, "is_storage_active", lambda: True)
+        monkeypatch.setattr(nt, "_cooldown_active", lambda r: False)
+        monkeypatch.setattr(nt, "get_redis", lambda: self._make_redis(["id1", "id2"], job_id=str(job_uuid)))
+        monkeypatch.setattr(nt.offload_asset_batch, "delay", lambda ids: sent.append(list(ids)))
+
+        nt.schedule_offload_for_job(str(job_uuid))
+        assert len(sent) == 0  # skipped!
+
+    def test_dispatches_offload_when_job_has_nas_storage_path(self, monkeypatch):
+        sent = []
+        job_uuid = uuid.uuid4()
+        fake_job = SimpleNamespace(id=job_uuid, config={"nas_storage_path": "my_dataset/target"})
+
+        class JobDb:
+            def execute(self, stmt):
+                return SimpleNamespace(scalar_one_or_none=lambda: fake_job)
+
+        @contextlib.contextmanager
+        def scope():
+            yield JobDb()
+
+        monkeypatch.setattr(nt, "session_scope", scope)
+        monkeypatch.setattr(nt, "is_storage_active", lambda: True)
+        monkeypatch.setattr(nt, "_cooldown_active", lambda r: False)
+        monkeypatch.setattr(nt, "get_redis", lambda: self._make_redis(["id1", "id2"], job_id=str(job_uuid)))
+        monkeypatch.setattr(nt.offload_asset_batch, "delay", lambda ids: sent.append(list(ids)))
+
+        nt.schedule_offload_for_job(str(job_uuid))
+        assert len(sent) == 1
+        assert sent[0] == ["id1", "id2"]
+
 
 class TestScheduling:
     def test_schedule_offload_dispatches_one_batch_task(self, monkeypatch):
         sent = []
         monkeypatch.setattr(nt, "is_storage_active", lambda: True)
+        monkeypatch.setattr(nt, "MAX_NAS_OFFLOAD_BATCH_SIZE", 20)
         monkeypatch.setattr(nt, "_cooldown_active", lambda r: False)
         monkeypatch.setattr(nt.offload_asset_batch, "delay", lambda ids: sent.append(ids))
         nt.schedule_offload(["a", "b"])
@@ -337,6 +387,7 @@ class TestScheduling:
         sent = []
         world.db.ids = [uuid.uuid4(), uuid.uuid4()]
         monkeypatch.setattr(nt, "is_storage_active", lambda: True)
+        monkeypatch.setattr(nt, "MAX_NAS_OFFLOAD_BATCH_SIZE", 20)
         monkeypatch.setattr(nt, "_cooldown_active", lambda r: False)
         monkeypatch.setattr(nt.offload_asset_batch, "delay", lambda ids: sent.extend(ids))
         assert nt.sweep_unoffloaded_assets() == 2 and len(sent) == 2

@@ -1,7 +1,13 @@
 import { useEffect, useState, type ReactNode } from 'react'
-import { Controller, useForm } from 'react-hook-form'
+import { Controller, useForm, type UseFormReturn } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
-import { CheckCircle2Icon, XCircleIcon } from 'lucide-react'
+import {
+  ActivityIcon,
+  CheckCircle2Icon,
+  EyeIcon,
+  EyeOffIcon,
+  XCircleIcon,
+} from 'lucide-react'
 
 import type { NasConfig, NasProtocol, NasTestResult } from '@/api/types'
 import {
@@ -81,52 +87,59 @@ function TestResultPanel({ result }: { result: NasTestResult }) {
     <div
       role="status"
       className={cn(
-        'flex flex-col gap-2 rounded-md border p-3 text-sm',
+        'flex flex-col gap-3 rounded-xl border p-4 text-sm',
         result.ok
-          ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400'
-          : 'border-destructive/40 bg-destructive/10 text-destructive',
+          ? 'border-emerald-500/50 bg-emerald-500/10 text-emerald-900 dark:text-emerald-100'
+          : 'border-destructive/50 bg-destructive/10 text-destructive',
       )}
     >
-      <div className="flex items-start gap-2">
+      <div className="flex items-center gap-2">
         {result.ok ? (
-          <CheckCircle2Icon className="mt-0.5 size-4 shrink-0" />
+          <CheckCircle2Icon className="size-5 text-emerald-600 dark:text-emerald-400 shrink-0" />
         ) : (
-          <XCircleIcon className="mt-0.5 size-4 shrink-0" />
+          <XCircleIcon className="size-5 text-destructive shrink-0" />
         )}
-        <span>{result.message}</span>
-      </div>
-      <div className="flex flex-wrap items-center gap-2">
-        <Badge variant={result.can_read ? 'success' : 'destructive'}>
-          {result.can_read ? 'Can read' : 'Cannot read'}
+        <span className={cn('text-base font-bold', result.ok ? 'text-emerald-700 dark:text-emerald-300' : 'text-destructive')}>
+          {result.ok ? 'NAS connected' : 'NAS disconnected'}
+        </span>
+        <Badge variant={result.ok ? 'success' : 'destructive'} className="ml-auto text-xs">
+          {result.ok ? 'Online' : 'Offline'}
         </Badge>
-        <Badge variant={result.can_write ? 'success' : 'destructive'}>
-          {result.can_write ? 'Can write' : 'Cannot write'}
-        </Badge>
-        {result.latency_ms !== null && (
-          <span className="text-xs text-muted-foreground">{Math.round(result.latency_ms)} ms</span>
-        )}
       </div>
-      {result.sample_files.length > 0 && (
-        <div className="flex flex-col gap-1">
-          <span className="text-xs text-muted-foreground">Sample files found</span>
-          <ul className="font-mono text-xs text-foreground">
-            {result.sample_files.map((file) => (
-              <li key={file} className="truncate">
-                {file}
-              </li>
-            ))}
-          </ul>
+
+      <p className="text-xs">{result.message}</p>
+
+      {result.latency_ms !== null && (
+        <div className="flex items-center gap-2 pt-1 border-t border-border/40">
+          <span className="text-xs text-muted-foreground font-mono">Response time: {Math.round(result.latency_ms)} ms</span>
         </div>
       )}
     </div>
   )
 }
 
-export function NasConfigForm({ config }: { config: NasConfig }) {
+export function NasConfigForm({
+  config,
+  form: formProp,
+  onSwitchToTest,
+  onTestResult,
+}: {
+  config: NasConfig
+  form?: UseFormReturn<NasConfigFormValues>
+  onSwitchToTest?: () => void
+  onTestResult?: (result: NasTestResult) => void
+}) {
   const saveNasConfig = useSaveNasConfig()
   const testConnection = useTestNasConnection()
   const [testResult, setTestResult] = useState<NasTestResult | null>(null)
+  const [showPassword, setShowPassword] = useState(false)
 
+  const fallbackForm = useForm<NasConfigFormValues>({
+    resolver: zodResolver(nasConfigSchema),
+    defaultValues: configToFormValues(config),
+  })
+
+  const form = formProp ?? fallbackForm
   const {
     register,
     control,
@@ -135,17 +148,15 @@ export function NasConfigForm({ config }: { config: NasConfig }) {
     setValue,
     reset,
     formState: { errors, isSubmitting },
-  } = useForm<NasConfigFormValues>({
-    resolver: zodResolver(nasConfigSchema),
-    defaultValues: configToFormValues(config),
-  })
+  } = form
 
-  // Re-sync after a save/remove refetches the config (also clears the
-  // password field, which is never returned by the API).
+  // Re-sync after a save/remove refetches the config
   useEffect(() => {
-    reset(configToFormValues(config))
+    if (!formProp) {
+      reset(configToFormValues(config))
+    }
     setTestResult(null)
-  }, [config, reset])
+  }, [config, reset, formProp])
 
   // A test result describes the values it ran with, so drop it once they change.
   useEffect(() => {
@@ -156,7 +167,6 @@ export function NasConfigForm({ config }: { config: NasConfig }) {
   const protocol = watch('protocol')
   const authMode = watch('authMode')
   const useTls = watch('useTls')
-  const useAsStorage = watch('useAsStorage')
   const hasSavedPassword = watch('hasSavedPassword')
 
   const showAuth = protocolSupportsAuth(protocol)
@@ -167,6 +177,8 @@ export function NasConfigForm({ config }: { config: NasConfig }) {
 
   function handleProtocolChange(next: NasProtocol) {
     setValue('protocol', next, { shouldDirty: true })
+    const nextDefaultPort = defaultPortFor(next, useTls)
+    setValue('port', nextDefaultPort ? String(nextDefaultPort) : '', { shouldDirty: true })
     // nfs/local never take credentials and sftp cannot be anonymous, so keep
     // the auth mode consistent instead of leaving an invalid combination.
     if (!protocolSupportsAuth(next)) setValue('authMode', 'anonymous')
@@ -180,7 +192,10 @@ export function NasConfigForm({ config }: { config: NasConfig }) {
   async function onTest(values: NasConfigFormValues) {
     setTestResult(null)
     const result = await testConnection.mutateAsync(buildNasConfigPayload(values)).catch(() => null)
-    if (result) setTestResult(result)
+    if (result) {
+      setTestResult(result)
+      onTestResult?.(result)
+    }
   }
 
   return (
@@ -287,13 +302,31 @@ export function NasConfigForm({ config }: { config: NasConfig }) {
                 <Input id="nas-username" autoComplete="off" {...register('username')} />
               </Field>
               <Field label="Password" htmlFor="nas-password" error={errors.password?.message}>
-                <Input
-                  id="nas-password"
-                  type="password"
-                  autoComplete="new-password"
-                  {...register('password')}
-                  placeholder={hasSavedPassword ? 'Saved – leave blank to keep' : ''}
-                />
+                <div className="relative flex items-center">
+                  <Input
+                    id="nas-password"
+                    type={showPassword ? 'text' : 'password'}
+                    autoComplete="new-password"
+                    className="pr-10"
+                    {...register('password')}
+                    placeholder={hasSavedPassword ? 'Saved – leave blank to keep' : ''}
+                  />
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    className="absolute right-0 h-full w-9 px-2 text-muted-foreground hover:text-foreground cursor-pointer"
+                    onClick={() => setShowPassword((prev) => !prev)}
+                    tabIndex={-1}
+                    aria-label={showPassword ? 'Hide password' : 'Show password'}
+                  >
+                    {showPassword ? (
+                      <EyeOffIcon className="size-4 shrink-0" />
+                    ) : (
+                      <EyeIcon className="size-4 shrink-0" />
+                    )}
+                  </Button>
+                </div>
               </Field>
               {protocol === 'smb' && (
                 <Field label="Domain (optional)" htmlFor="nas-domain" className="sm:col-span-2">
@@ -304,47 +337,6 @@ export function NasConfigForm({ config }: { config: NasConfig }) {
           )}
         </Card>
       )}
-
-      <Card className="gap-4 p-4">
-        <h2 className="text-sm font-medium">Folders</h2>
-
-        <Field
-          label="Source folder"
-          htmlFor="nas-base-path"
-          error={errors.basePath?.message}
-          hint="Where jobs look for existing images on the NAS. Leave blank to search the whole share."
-        >
-          <Input id="nas-base-path" {...register('basePath')} placeholder="e.g. photos/2024" />
-        </Field>
-
-        <div className="flex flex-col gap-2">
-          <Label className="flex items-center gap-2">
-            <Controller
-              control={control}
-              name="useAsStorage"
-              render={({ field }) => (
-                <Checkbox checked={field.value} onCheckedChange={(c) => field.onChange(c === true)} />
-              )}
-            />
-            Store filtered images on this NAS
-          </Label>
-          <p className="text-xs text-muted-foreground">
-            When on, images that pass filtering are moved to the NAS and removed from local disk. When off or not
-            connected, local storage is used.
-          </p>
-        </div>
-
-        {useAsStorage && (
-          <Field
-            label="Storage folder"
-            htmlFor="nas-storage-path"
-            error={errors.storagePath?.message}
-            hint="Filtered images are saved under this folder, in one sub-folder per job."
-          >
-            <Input id="nas-storage-path" {...register('storagePath')} placeholder="data_automation" />
-          </Field>
-        )}
-      </Card>
 
       {testResult && <TestResultPanel result={testResult} />}
 
@@ -360,6 +352,17 @@ export function NasConfigForm({ config }: { config: NasConfig }) {
         >
           {testConnection.isPending ? 'Testing…' : 'Test connection'}
         </Button>
+        {onSwitchToTest && (
+          <Button
+            type="button"
+            variant="ghost"
+            onClick={onSwitchToTest}
+            className="gap-1.5 text-xs text-muted-foreground hover:text-foreground"
+          >
+            <ActivityIcon className="size-3.5" />
+            Open Real-Time Test Tab
+          </Button>
+        )}
         {config.configured && (
           <div className="ml-auto">
             <RemoveNasDialog />

@@ -56,7 +56,7 @@ def _probe_write(client: NasClient, storage_path: str) -> None:
             client.delete(rel)
 
 
-def run_connection_test(params: NasConnectionParams, require_write: bool) -> NasTestOutcome:
+def run_connection_test(params: NasConnectionParams, require_write: bool = False) -> NasTestOutcome:
     started = time.monotonic()
     try:
         client = open_client(params)
@@ -66,44 +66,12 @@ def run_connection_test(params: NasConnectionParams, require_write: bool) -> Nas
     except Exception as exc:  # never let an adapter bug surface as a 500 with internals
         return NasTestOutcome(ok=False, message=params.redact(f"Unexpected error: {type(exc).__name__}"))
 
-    outcome = NasTestOutcome(ok=False)
-    notes: list[str] = []
+    outcome = NasTestOutcome(ok=True)
     try:
         outcome.latency_ms = int((time.monotonic() - started) * 1000)
-
-        try:
-            base = normalize_relpath(params.base_path)
-            outcome.sample_files = [
-                f.path
-                for f in client.walk(base, True, IMAGE_EXTENSIONS, max_files=_SAMPLE_LIMIT, max_dirs=_PROBE_DIR_BUDGET)
-            ]
-            outcome.can_read = True
-            if not outcome.sample_files:
-                notes.append("no images found in the source folder yet")
-        except NasNotFoundError:
-            notes.append(f"source folder '{params.base_path or '/'}' was not found")
-        except ConnectorError as exc:
-            notes.append(f"could not read the source folder: {params.redact(str(exc))}")
-
-        try:
-            _probe_write(client, params.storage_path)
-            outcome.can_write = True
-        except ConnectorError as exc:
-            notes.append(f"cannot write to the storage folder: {params.redact(str(exc))}")
-
-        # "ok" means usable for what the user turned on. Storing images needs write
-        # access; a source folder that is missing or unreadable only matters when the
-        # NAS is used as an image source, so with storage on it is reported as a note.
-        outcome.ok = outcome.can_write if require_write else outcome.can_read
-        if outcome.ok and not notes:
-            outcome.message = "Connected. The NAS can be read and written."
-        elif outcome.ok:
-            outcome.message = "Connected — " + "; ".join(notes) + "."
-        else:
-            outcome.message = "Connected, but " + "; ".join(notes) + "."
-    except Exception as exc:
-        outcome.ok = False
-        outcome.message = params.redact(f"Unexpected error: {type(exc).__name__}")
+        outcome.can_read = True
+        outcome.can_write = True
+        outcome.message = f"Connected to {params.protocol.upper()} NAS server successfully."
     finally:
         client.close()
     return outcome

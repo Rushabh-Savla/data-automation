@@ -61,7 +61,6 @@ export const nasConfigSchema = z
       if (!data.password && !data.hasSavedPassword) fail('password', 'Enter a password')
     }
 
-    if (data.useAsStorage && !data.storagePath.trim()) fail('storagePath', 'Enter a storage folder')
     if (hasParentSegment(data.basePath)) fail('basePath', 'Folder cannot contain ".."')
     if (hasParentSegment(data.storagePath)) fail('storagePath', 'Folder cannot contain ".."')
   })

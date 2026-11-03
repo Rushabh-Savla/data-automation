@@ -183,6 +183,7 @@ export interface JobConfig {
   yolo_world_conf_threshold?: number
   dedup_hamming_threshold?: number
   dedup_cosine_threshold?: number
+  nas_storage_path?: string
   relevance?: RelevanceConfig
   /**
    * Written by the backend's top-up planner, not by the UI. Underscore-
@@ -427,6 +428,37 @@ export interface NasTestResult {
   latency_ms: number | null
   sample_files: string[]
 }
+
+export interface NasTransferInput {
+  direction: 'local_to_nas' | 'nas_to_local'
+  source_folder?: string
+  destination_folder?: string
+  max_images?: number
+}
+
+export interface NasTransferResult {
+  ok: boolean
+  direction: string
+  transferred_count: number
+  total_bytes: number
+  duration_s: number
+  message: string
+  sample_files: string[]
+}
+
+export interface NasFoldersResponse {
+  current_path: string
+  parent_path: string | null
+  folders: string[]
+}
+
+export interface NasVerifyFolderResponse {
+  exists: boolean
+  path: string
+  message: string
+}
+
+
 
 // -- WebSocket event payloads (app/services/progress_service.py publishers)
 

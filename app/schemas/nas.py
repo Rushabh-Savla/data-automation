@@ -66,8 +66,6 @@ class NasConfigInput(BaseModel):
             )
         if self.protocol == "local" and not self.share.startswith("/"):
             raise ValueError("Mounted folder path must be an absolute path, e.g. /mnt/nas")
-        if self.use_as_storage and not self.storage_path:
-            raise ValueError("Storage folder is required when images are stored on the NAS")
 
         # NFS and mounted paths have no login; the fields that do not apply are
         # cleared rather than rejected so a protocol switch in the form stays easy.
@@ -118,3 +116,38 @@ class NasTestResponse(BaseModel):
     message: str
     latency_ms: int | None = None
     sample_files: list[str] = []
+
+
+class NasTransferInput(BaseModel):
+    direction: Literal["local_to_nas", "nas_to_local"] = "local_to_nas"
+    source_folder: str = ""
+    destination_folder: str = ""
+    max_images: int = Field(default=1000, ge=1, le=5000)
+
+
+class NasTransferResponse(BaseModel):
+    ok: bool
+    direction: str
+    transferred_count: int = 0
+    total_bytes: int = 0
+    duration_s: float = 0.0
+    message: str = ""
+    sample_files: list[str] = []
+
+
+class NasFoldersResponse(BaseModel):
+    current_path: str = ""
+    parent_path: str | None = None
+    folders: list[str] = Field(default_factory=list)
+
+
+class NasVerifyFolderRequest(BaseModel):
+    folder_path: str = ""
+
+
+class NasVerifyFolderResponse(BaseModel):
+    exists: bool
+    path: str
+    message: str = ""
+
+

@@ -21,7 +21,6 @@ import { DavisConfigFields } from '@/components/jobs/DavisConfigFields'
 import { SunRgbdConfigFields } from '@/components/jobs/SunRgbdConfigFields'
 import { NuscenesConfigFields } from '@/components/jobs/NuscenesConfigFields'
 import { KittiConfigFields } from '@/components/jobs/KittiConfigFields'
-import { NasStorageConfigFields } from '@/components/jobs/NasStorageConfigFields'
 
 interface JobConfigAdvancedSectionProps {
   control: Control<JobCreateFormValues>
@@ -35,7 +34,6 @@ export function JobConfigAdvancedSection({
   control,
   register,
   activeSources,
-  jobName,
   targetCount,
 }: JobConfigAdvancedSectionProps) {
   const [open, setOpen] = useState(false)
@@ -48,8 +46,6 @@ export function JobConfigAdvancedSection({
       </CollapsibleTrigger>
 
       <CollapsibleContent className="flex flex-col gap-3 pt-3">
-        <NasStorageConfigFields jobName={jobName} />
-
         {activeSources.includes('roboflow') && (
           <Card className="gap-2 p-4">
             <CardHeader className="p-0">

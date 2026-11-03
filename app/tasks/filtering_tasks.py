@@ -233,11 +233,14 @@ def _classify_batch(
 
     try:
         verifier = VisualVerifier()
+        logger.info(
+            f"[VLM RELEVANCY] Using model '{verifier.model_id}' to evaluate {len(items)} asset(s) for subjects: {subjects!r}"
+        )
     except Exception:
         # The gate itself is unusable. Every asset becomes _ERROR so it stays
         # PROMOTED for a later pass, rather than being deleted because a model
         # failed to load.
-        logger.exception(f"Relevance model unavailable; deferring {len(items)} asset(s)")
+        logger.exception(f"[VLM RELEVANCY] Relevance model unavailable; deferring {len(items)} asset(s)")
         return [(asset_id, _ERROR, None) for asset_id, _ in items]
 
     verdicts = verifier.verify_batch_any([path for _, path in items], subjects)
@@ -253,7 +256,7 @@ def _classify_batch(
 
     accepted = sum(1 for _, o, _ in decisions if o == _ACCEPT)
     logger.info(
-        f"Relevance ({subjects!r}): {accepted}/{len(decisions)} accepted"
+        f"[VLM RELEVANCY] Model '{verifier.model_id}' completed evaluation ({subjects!r}): {accepted}/{len(decisions)} accepted"
     )
     return decisions
 

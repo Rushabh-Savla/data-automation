@@ -101,15 +101,17 @@ class SftpClient(NasClient):
     def _abs(self, rel: str) -> str:
         if self._root:
             return posixpath.join(self._root, rel) if rel else self._root
-        return rel or "."
+        if not rel or rel == ".":
+            return "/"
+        return f"/{rel.lstrip('/')}"
 
     def _translate(self, exc: Exception) -> Exception:
         if isinstance(exc, paramiko.AuthenticationException):
             return NasAuthError("The NAS rejected the user name or password")
         if isinstance(exc, FileNotFoundError):
             return NasNotFoundError("Path not found on the NAS")
-        if isinstance(exc, PermissionError):
-            return NasAuthError("Access denied on the NAS — check the account's permissions")
+        if isinstance(exc, PermissionError) or (isinstance(exc, (IOError, OSError)) and getattr(exc, "errno", None) in (13, 1)):
+            return NasAuthError(f"Access denied on the NAS — check account permissions ({exc})")
         if isinstance(exc, paramiko.SSHException) and "banner" in str(exc).lower():
             return NasConnectionError(
                 f"The NAS accepted the connection but did not respond like an SSH server — "
@@ -143,8 +145,11 @@ class SftpClient(NasClient):
             target = self._abs(built)
             try:
                 self._sftp.stat(target)
-            except FileNotFoundError:
-                self._sftp.mkdir(target)
+            except (FileNotFoundError, OSError):
+                try:
+                    self._sftp.mkdir(target)
+                except Exception as exc:
+                    raise self._translate(exc) from exc
 
     def _upload(self, local: Path, rel: str) -> None:
         try:

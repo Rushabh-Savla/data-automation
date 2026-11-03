@@ -141,6 +141,7 @@ export const jobCreateSchema = z
     yoloWorldConfThreshold: optionalNumberString,
     dedupHammingThreshold: optionalNumberString,
     dedupCosineThreshold: optionalNumberString,
+    nasStoragePath: z.string().optional(),
   })
   .superRefine((data, ctx) => {
     if (!data.targetCountEnabled && !data.deadlineEnabled) {
@@ -242,6 +243,7 @@ export const jobCreateDefaultValues: JobCreateFormValues = {
   yoloWorldConfThreshold: undefined,
   dedupHammingThreshold: undefined,
   dedupCosineThreshold: undefined,
+  nasStoragePath: '',
 }
 
 function toNumber(value: string | undefined): number | undefined {
@@ -367,6 +369,10 @@ export function buildConfigPayload(values: JobCreateFormValues): JobConfig {
 
   const dedupCosineThreshold = toNumber(values.dedupCosineThreshold)
   if (dedupCosineThreshold !== undefined) config.dedup_cosine_threshold = dedupCosineThreshold
+
+  if (values.nasStoragePath?.trim()) {
+    config.nas_storage_path = values.nasStoragePath.trim()
+  }
 
   return config
 }

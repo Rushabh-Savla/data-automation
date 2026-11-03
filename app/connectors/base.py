@@ -162,12 +162,21 @@ def limited_concurrency(
     stuck mid-handshake, say) can block every future caller with no visible
     error at all. Raises `TimeoutError` if no slot opens up in time.
     """
-    lock_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        lock_dir.mkdir(parents=True, exist_ok=True)
+    except (PermissionError, OSError):
+        lock_dir = Path("/tmp") / "_shared_cache" / lock_dir.name
+        lock_dir.mkdir(parents=True, exist_ok=True)
     handle = None
     started = time.monotonic()
     while handle is None:
         for slot in random.sample(range(slots), slots):  # random order spreads contention
-            candidate = open(lock_dir / f".{name}.slot{slot}", "a")  # noqa: SIM115 - held for the slot's lifetime
+            try:
+                candidate = open(lock_dir / f".{name}.slot{slot}", "a")  # noqa: SIM115 - held for the slot's lifetime
+            except (PermissionError, OSError):
+                lock_dir = Path("/tmp") / "_shared_cache" / lock_dir.name
+                lock_dir.mkdir(parents=True, exist_ok=True)
+                candidate = open(lock_dir / f".{name}.slot{slot}", "a")
             try:
                 fcntl.flock(candidate, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:

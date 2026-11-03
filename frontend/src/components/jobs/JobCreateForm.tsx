@@ -19,6 +19,7 @@ import { Card, CardContent } from '@/components/ui/card'
 import { Checkbox } from '@/components/ui/checkbox'
 import { SourcePicker } from '@/components/jobs/SourcePicker'
 import { TargetDeadlinePicker } from '@/components/jobs/TargetDeadlinePicker'
+import { NasStorageConfigFields } from '@/components/jobs/NasStorageConfigFields'
 import { JobConfigAdvancedSection } from '@/components/jobs/JobConfigAdvancedSection'
 
 export function JobCreateForm() {
@@ -174,11 +175,18 @@ export function JobCreateForm() {
         </Card>
       </section>
 
+      <section className="flex flex-col gap-2">
+        <NasStorageConfigFields
+          jobName={watch('name')}
+          control={control}
+          register={register}
+        />
+      </section>
+
       <JobConfigAdvancedSection
         control={control}
         register={register}
         activeSources={[...activeSources]}
-        jobName={watch('name')}
         targetCount={watch('targetCountEnabled') ? watch('targetCount') : undefined}
       />
 

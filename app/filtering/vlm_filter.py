@@ -44,15 +44,13 @@ from PIL import Image
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MODEL_ID = "Qwen/Qwen2-VL-2B-Instruct"
+DEFAULT_MODEL_ID = "HuggingFaceTB/SmolVLM-256M-Instruct"
 
-# Large enough that a small object survives the downscale -- the failure mode
-# of the previous 384px gate -- and still well inside the model's budget.
-_MAX_DIMENSION = 512
+# SmolVLM runs on 384px without tiling, keeping inference quick and deterministic.
+_MAX_DIMENSION = 384
 
-# The answer is one token. Anything longer is the model ignoring the
-# instruction, which _is_affirmative treats as "not a yes".
-_MAX_NEW_TOKENS = 4
+# The answer is a short token sequence (e.g. " Yes.", " No.").
+_MAX_NEW_TOKENS = 5
 
 _AFFIRMATIVE_PREFIXES = ("yes",)
 
@@ -63,13 +61,7 @@ def _is_affirmative(text: str) -> bool:
 
 
 def _select_device() -> str:
-    """CUDA when the container was actually granted a GPU, else CPU.
-
-    Guarded rather than assumed: the same image runs on the CPU-only IO
-    worker, and torch.cuda.is_available() is also False when the installed
-    wheel's CUDA build outruns the host driver. Falling back keeps the filter
-    working rather than crashing the worker at import.
-    """
+    """CUDA when the container was actually granted a GPU, else CPU."""
     try:
         import torch
 
@@ -84,6 +76,7 @@ def _load_model(model_id: str = DEFAULT_MODEL_ID):
     from transformers import AutoModelForImageTextToText, AutoProcessor
 
     device = _select_device()
+    logger.info(f"[VLM RELEVANCY] Initializing relevance model '{model_id}' on device: {device}")
     processor = AutoProcessor.from_pretrained(model_id)
     # fp16 on GPU halves the weight footprint and the matmul cost; on CPU it
     # is slower than fp32 (no native half path), so dtype follows the device.
@@ -92,51 +85,26 @@ def _load_model(model_id: str = DEFAULT_MODEL_ID):
     )
     model.to(device)
     model.eval()
-    logger.info(f"Loaded relevance VLM {model_id} on {device}")
+    logger.info(f"[VLM RELEVANCY] Successfully loaded relevance model '{model_id}' on device: {device}")
     return processor, model, device
 
 
 def build_question(query: str) -> str:
-    """The yes/no question put to the model.
-
-    Two things matter here. "clearly visible" is deliberate: without it the
-    model answers about what the scene is *about* rather than what is in the
-    frame, and a conversation scene from an action film counts as a weapon
-    scene. And the query arrives already normalised by
-    query_expansion.normalize_query, so a raw job string like
-    "weapon on movies scence" is asked as "a weapon" -- the previous gate
-    passed the typo through verbatim.
-    """
+    """The yes/no question put to the model."""
     return f"Is {query} clearly visible in this image? Answer only yes or no."
 
 
 class VisualVerifier:
     def __init__(self, model_id: str = DEFAULT_MODEL_ID):
+        self.model_id = model_id
         self._processor, self._model, self._device = _load_model(model_id)
 
     def verify(self, image_path: Path, query: str, box: tuple[float, float, float, float] | None = None) -> bool:
-        """True when the image clearly shows `query`.
-
-        `box` is accepted for call-site compatibility and ignored: it came
-        from YOLO-World, whose detections measured 0.0 on every asset of a
-        real job, so cropping to it was cropping to noise. The model is given
-        the whole frame.
-        """
+        """True when the image clearly shows `query`."""
         return self.verify_batch([image_path], query)[0] is True
 
     def verify_batch_any(self, image_paths: list[Path], subjects: list[str]) -> list[bool | None]:
-        """Per-image verdicts for a query with several subjects: True when ANY is clearly visible.
-
-        A query like "car and person" asks for either class, so each subject is
-        put to the model as its own question -- the single-subject question is
-        what was measured to work. An image stops being asked about once one
-        subject is a yes, so the extra cost falls only on images that fail the
-        first.
-
-        The None/False distinction is preserved: an image is None (undecided,
-        file kept) unless some subject said yes, or every subject was decided as
-        no, because a rejection deletes the file.
-        """
+        """Per-image verdicts for a query with several subjects: True when ANY is clearly visible."""
         verdicts: list[bool] = [False] * len(image_paths)
         undecided: set[int] = set()
         pending = list(range(len(image_paths)))
@@ -158,14 +126,7 @@ class VisualVerifier:
         return [True if verdicts[i] else (None if i in undecided else False) for i in range(len(image_paths))]
 
     def verify_batch(self, image_paths: list[Path], query: str) -> list[bool | None]:
-        """Per-image verdicts: True, False, or None when it could not be decided.
-
-        None is a distinct third outcome, never collapsed into False, because
-        the caller deletes the file on a rejection. An unreadable image or a
-        model failure is an absence of evidence, not evidence of
-        irrelevance -- the old gate conflated the two and destroyed images
-        whenever a model merely failed to load.
-        """
+        """Per-image verdicts: True, False, or None when it could not be decided."""
         if not image_paths:
             return []
 
@@ -174,7 +135,11 @@ class VisualVerifier:
         question = build_question(query)
         results: list[bool | None] = []
 
-        for image_path in image_paths:
+        logger.info(
+            f"[VLM RELEVANCY] Evaluating batch of {len(image_paths)} asset(s) with model '{self.model_id}' for query: '{query}'"
+        )
+
+        for idx, image_path in enumerate(image_paths, 1):
             try:
                 image = Image.open(image_path).convert("RGB")
                 image.thumbnail((_MAX_DIMENSION, _MAX_DIMENSION))
@@ -185,7 +150,10 @@ class VisualVerifier:
                     }
                 ]
                 text = self._processor.apply_chat_template(messages, add_generation_prompt=True)
-                inputs = self._processor(text=[text], images=[image], return_tensors="pt").to(self._device)
+                proc_kwargs = {"text": [text], "images": [image], "return_tensors": "pt"}
+                if "smolvlm" in self.model_id.lower():
+                    proc_kwargs["do_image_splitting"] = False
+                inputs = self._processor(**proc_kwargs).to(self._device)
                 with torch.inference_mode():
                     generated = self._model.generate(
                         **inputs, max_new_tokens=_MAX_NEW_TOKENS, do_sample=False
@@ -193,9 +161,18 @@ class VisualVerifier:
                 answer = self._processor.batch_decode(
                     generated[:, inputs["input_ids"].shape[1] :], skip_special_tokens=True
                 )[0]
-                results.append(_is_affirmative(answer))
+                verdict = _is_affirmative(answer)
+                p = Path(image_path)
+                logger.info(
+                    f"[VLM RELEVANCY] ({idx}/{len(image_paths)}) Model: {self.model_id} | Asset: {p.name} | "
+                    f"Question: \"{question}\" | Model Output: {repr(answer.strip())} -> Verdict: {'RELEVANT (PASS)' if verdict else 'REJECTED'}"
+                )
+                results.append(verdict)
             except Exception as e:
-                logger.warning(f"Relevance check failed for {image_path}: {e}")
+                p = Path(image_path)
+                logger.warning(
+                    f"[VLM RELEVANCY] ({idx}/{len(image_paths)}) Model: {self.model_id} | Check failed for {p.name}: {e}"
+                )
                 results.append(None)
 
         return results

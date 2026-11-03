@@ -49,7 +49,6 @@ class TestInvalidNas:
             (dict(auth_mode="password"), "User name is required"),
             (dict(base_path="../x"), "'..'"),
             (dict(storage_path="a/../../b"), "'..'"),
-            (dict(storage_path=""), "Storage folder is required"),
             (dict(port=0), "greater than or equal to 1"),
             (dict(port=70000), "less than or equal to 65535"),
         ],

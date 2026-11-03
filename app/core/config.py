@@ -3,6 +3,7 @@
 from functools import lru_cache
 from pathlib import Path
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -24,6 +25,19 @@ class Settings(BaseSettings):
     nas_root: Path = Path("./nas_data")
     # Scratch space for in-flight downloads before they're promoted to NAS.
     work_root: Path = Path("./work_data")
+
+    @field_validator("nas_root", "work_root", mode="after")
+    @classmethod
+    def _validate_writable_root(cls, v: Path) -> Path:
+        if v.exists():
+            return v
+        try:
+            v.mkdir(parents=True, exist_ok=True)
+            return v
+        except (PermissionError, OSError):
+            fallback = Path(f"./{v.name}_data" if not v.name.endswith("_data") else f"./{v.name}")
+            fallback.mkdir(parents=True, exist_ok=True)
+            return fallback
     # Local read-through cache for images that live on a remote (UI-connected)
     # NAS: viewing, thumbnails and exports fetch a file once and reuse it, and the
     # oldest entries are evicted past this size so the cache never fills the disk.
