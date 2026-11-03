@@ -139,6 +139,7 @@ class NasFoldersResponse(BaseModel):
     current_path: str = ""
     parent_path: str | None = None
     folders: list[str] = Field(default_factory=list)
+    tree: list[str] = Field(default_factory=list)
 
 
 class NasVerifyFolderRequest(BaseModel):

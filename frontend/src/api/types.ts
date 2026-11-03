@@ -450,6 +450,7 @@ export interface NasFoldersResponse {
   current_path: string
   parent_path: string | null
   folders: string[]
+  tree?: string[]
 }
 
 export interface NasVerifyFolderResponse {
