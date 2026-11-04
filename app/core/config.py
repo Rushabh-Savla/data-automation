@@ -3,13 +3,16 @@
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+_DEFAULT_ENV_FILE = _PROJECT_ROOT / ".env"
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=(_DEFAULT_ENV_FILE, ".env"),
         env_file_encoding="utf-8",
         extra="ignore",
     )
@@ -25,19 +28,6 @@ class Settings(BaseSettings):
     nas_root: Path = Path("./nas_data")
     # Scratch space for in-flight downloads before they're promoted to NAS.
     work_root: Path = Path("./work_data")
-
-    @field_validator("nas_root", "work_root", mode="after")
-    @classmethod
-    def _validate_writable_root(cls, v: Path) -> Path:
-        if v.exists():
-            return v
-        try:
-            v.mkdir(parents=True, exist_ok=True)
-            return v
-        except (PermissionError, OSError):
-            fallback = Path(f"./{v.name}_data" if not v.name.endswith("_data") else f"./{v.name}")
-            fallback.mkdir(parents=True, exist_ok=True)
-            return fallback
     # Local read-through cache for images that live on a remote (UI-connected)
     # NAS: viewing, thumbnails and exports fetch a file once and reuse it, and the
     # oldest entries are evicted past this size so the cache never fills the disk.
@@ -160,6 +150,41 @@ class Settings(BaseSettings):
     kaggle_username: str = ""
     kaggle_key: str = ""
     youtube_api_key: str = ""
+
+    # -- Batch Processing & Bounded Staging Architecture -------------------------
+    # Target number of accepted, unique and relevant images per batch.
+    batch_accepted_target: int = 600
+    # Initial working candidate window size requested from connectors per round.
+    download_candidate_window: int = 600
+
+    # Global RAM buffer budget for candidate image bytes held in memory.
+    # Default: 1 GB (1024 * 1024 * 1024 bytes).
+    ram_buffer_max_bytes: int = 1024 * 1024 * 1024
+
+    # Local SSD durable fallback staging directory when NAS is offline/pending.
+    local_staging_path: Path = Path("./staging")
+    # Storage quota cap on local staging SSD bytes. Default: 50 GB.
+    local_staging_max_bytes: int = 50 * 1024 * 1024 * 1024
+    # High watermark: pause new downloads when local staging hits 80% quota.
+    local_staging_high_watermark: float = 0.80
+    # Resume watermark: resume downloads once space is released to <= 65% quota.
+    local_staging_resume_watermark: float = 0.65
+    # Whether discovery/download pauses automatically when staging hits high watermark.
+    download_pause_when_storage_full: bool = True
+
+    # Centralized NAS upload queue configuration
+    nas_max_concurrency: int = 1
+    nas_upload_max_batch_files: int = 600
+    nas_upload_retry_limit: int = 5
+    nas_upload_cooldown_seconds: int = 180
+
+    # -- Intelligent Deduplication Configuration ------------------------------
+    dedup_scope: str = "job"  # "job" (within job batches) or "global" (cross-job)
+    dedup_phash_hamming_threshold: int = 5
+    dedup_clip_cosine_threshold: float = 0.95
+    dedup_ssim_threshold: float = 0.85
+    dedup_orb_inlier_threshold: float = 0.60
+    dedup_orb_min_inliers: int = 15
 
     @property
     def api_key_set(self) -> set[str]:

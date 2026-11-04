@@ -35,7 +35,7 @@ from app.connectors.base import (
 from app.connectors.open_vocab import scan_candidates
 from app.connectors.query_terms import match_labels
 from app.core.config import get_settings
-from app.core.exceptions import JobStopped, TransientConnectorError
+from app.core.exceptions import CandidateWindowFull, FatalConnectorError, JobStopped, TransientConnectorError
 from app.domain.enums import SourceType
 from app.services.format_conversion import BBox, ClassRegistry, boxes_to_yolo_lines
 
@@ -198,6 +198,7 @@ class OpenImagesConnector:
         checkpoint: dict,
         should_stop: ShouldStopFn,
         on_progress: OnProgressFn,
+        admit_candidate=None,
     ) -> Iterator[RawAssetDraft]:
         from PIL import Image
 
@@ -243,6 +244,27 @@ class OpenImagesConnector:
                 on_progress({"checkpoint": {"index": i}})
                 raise JobStopped("should_stop() signalled during Open Images shard walk")
 
+            source_item_id = f"oi_{split}_{image_id}"
+            admission = None
+            if admit_candidate is not None:
+                admission = admit_candidate(source_item_id)
+                raw_status = getattr(admission, "status", "")
+                status = str(getattr(raw_status, "value", raw_status)).upper()
+                if status == "DUPLICATE":
+                    on_progress({"checkpoint": {"index": i + 1}})
+                    continue
+                if status == "WINDOW_FULL":
+                    on_progress({"checkpoint": {"index": i}})
+                    raise CandidateWindowFull(
+                        getattr(admission, "window_id", None),
+                        getattr(admission, "window_index", None),
+                        i,
+                    )
+                if status != "ADMITTED":
+                    raise FatalConnectorError(
+                        f"Candidate admission failed for {source_item_id}: {status}"
+                    )
+
             url = f"{_IMAGE_BASE_URL}/{split}/{image_id}.jpg"
             dest = workdir / f"{image_id}.jpg"
             try:
@@ -256,9 +278,15 @@ class OpenImagesConnector:
                 with Image.open(dest) as img:
                     w, h = img.size
                 if w < self.min_w or h < self.min_h:
+                    if admission is not None and getattr(admission, "reservation_id", None):
+                        from app.services.candidate_reservation_service import mark_candidate_failed
+                        mark_candidate_failed(admission.reservation_id)
                     on_progress({"rejected": 1})
                     continue
             except Exception as e:
+                if admission is not None and getattr(admission, "reservation_id", None):
+                    from app.services.candidate_reservation_service import mark_candidate_failed
+                    mark_candidate_failed(admission.reservation_id)
                 logger.warning(f"Open Images image {image_id} download/validation failed: {e}")
                 on_progress({"rejected": 1})
                 continue
@@ -276,8 +304,19 @@ class OpenImagesConnector:
                 ann_path.write_text("\n".join(lines))
                 annotation_format = "yolo_txt"
 
+            metadata = {
+                "open_images_image_id": image_id,
+                "split": split,
+                # "vlm": picked by the relevance model among images not labelled for this query.
+                "matched_by": "vlm" if item.external_ref.get("unlabelled") else "label",
+            }
+            if admission is not None:
+                metadata["candidate_reservation_id"] = str(admission.reservation_id)
+                metadata["candidate_window_id"] = str(admission.window_id)
+                metadata["candidate_window_index"] = int(admission.window_index)
+
             draft = RawAssetDraft(
-                source_item_id=f"oi_{split}_{image_id}",
+                source_item_id=source_item_id,
                 source_url=url,
                 dataset_identifier=item.dataset_identifier,
                 license=item.license_hint,
@@ -288,12 +327,7 @@ class OpenImagesConnector:
                 width=w,
                 height=h,
                 classes=registry.names,
-                metadata={
-                    "open_images_image_id": image_id,
-                    "split": split,
-                    # "vlm": picked by the relevance model among images not labelled for this query.
-                    "matched_by": "vlm" if item.external_ref.get("unlabelled") else "label",
-                },
+                metadata=metadata,
             )
             on_progress({"checkpoint": {"index": i + 1}, "downloaded": 1})
             yield draft

@@ -26,6 +26,7 @@ celery_app = Celery(
         "app.tasks.filtering_tasks",
         "app.tasks.export_tasks",
         "app.tasks.nas_tasks",
+        "app.tasks.batch_orchestration",
     ],
 )
 
@@ -48,6 +49,7 @@ celery_app.conf.update(
         "app.tasks.orchestration_tasks.*": {"queue": "orchestration"},
         "app.tasks.filtering_tasks.*": {"queue": "filtering"},
         "app.tasks.export_tasks.*": {"queue": "export"},
+        "app.tasks.batch_orchestration.*": {"queue": "orchestration"},
         # Reuses the "standardize" queue (already consumed by every IO worker
         # deployment, no server-side queue-list change needed). A dedicated
         # "nas_offload" queue removed the risk of 8 IO-worker processes
@@ -80,15 +82,21 @@ celery_app.conf.update(
             "task": "app.tasks.cleanup_tasks.purge_orphan_work_dirs",
             "schedule": 6 * 3600.0,
         },
-        # Moves kept images that are still on local disk onto the NAS (NAS was
-        # down when they passed, or they predate the NAS being connected).
-        "nas-offload-sweep": {
-            "task": "app.tasks.nas_tasks.sweep_unoffloaded_assets",
-            "schedule": 300.0,
-        },
         # Removes the NAS copy of images that stopped being kept (see nas_tasks).
         "nas-leak-sweep": {
             "task": "app.tasks.nas_tasks.sweep_leaked_nas_files",
+            "schedule": 60.0,
+        },
+        # Centralized NAS upload queue reconciliation: sweeps actionable transfers
+        # (pending, stale uploading, retryable failed) and pending staging cleanups.
+        "nas-reconcile-transfers": {
+            "task": "app.tasks.nas_tasks.reconcile_nas_transfers",
+            "schedule": 60.0,
+        },
+        # End-to-end batch lifecycle reconciliation: sweeps counter drift, resumes paused batches,
+        # and re-enqueues orphan ready batches.
+        "batch-lifecycle-reconcile": {
+            "task": "app.tasks.batch_orchestration.reconcile_batch_lifecycle",
             "schedule": 60.0,
         },
     },

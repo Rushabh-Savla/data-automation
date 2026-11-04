@@ -571,3 +571,73 @@ class TestFinalizeDoesNotTriggerOffload:
         ft.finalize_relevance_filter.run(job_id)
 
         assert offload_calls == [], "finalize_relevance_filter must not trigger per-round offload"
+
+    def test_relevance_filter_batch_records_review_and_retry_pending(self, monkeypatch):
+        """Verifies that UNCERTAIN and ERROR outcomes transition assets to REVIEW_PENDING and RETRY_PENDING."""
+        import uuid
+        from types import SimpleNamespace
+        from contextlib import contextmanager
+        from app.domain.enums import AssetStatus
+        import app.tasks.filtering_tasks as ft
+
+        job_id = str(uuid.uuid4())
+        asset_1 = str(uuid.uuid4())
+        asset_2 = str(uuid.uuid4())
+        asset_3 = str(uuid.uuid4())
+        asset_4 = str(uuid.uuid4())
+
+        status_updates = {}
+
+        class _MockAssetRepo:
+            def __init__(self, db):
+                pass
+
+            def get(self, aid):
+                return SimpleNamespace(id=aid, nas_path=f"/fake/{aid}.jpg", status=AssetStatus.PROMOTED)
+
+            def set_status(self, aid, status, relevance_score=None):
+                status_updates[aid] = (status, relevance_score)
+
+        class _MockJobRepo:
+            def __init__(self, db):
+                pass
+
+            def get(self, jid):
+                return SimpleNamespace(id=jid, query="car", config={}, status="running")
+
+            def increment_counts(self, *a, **kw):
+                pass
+
+        @contextmanager
+        def fake_scope():
+            yield object()
+
+        fake_redis = _FakeRedis()
+        monkeypatch.setattr(ft, "get_redis", lambda: fake_redis)
+        monkeypatch.setattr(ft, "session_scope", fake_scope)
+        monkeypatch.setattr(ft, "AssetRepository", _MockAssetRepo)
+        monkeypatch.setattr(ft, "JobRepository", _MockJobRepo)
+        monkeypatch.setattr(ft.asset_files, "local_path_for_read", lambda p: p)
+
+        # Mock classify decisions: 1 accept, 1 reject, 1 review, 1 error
+        mock_decisions = [
+            (asset_1, ft._ACCEPT, 1.0),
+            (asset_2, ft._REJECT, 0.0),
+            (asset_3, ft._REVIEW, 0.5),
+            (asset_4, ft._ERROR, None),
+        ]
+        monkeypatch.setattr(ft, "_classify_batch", lambda q, items: mock_decisions)
+        monkeypatch.setattr(ft, "delete_asset_files", lambda a: None)
+        monkeypatch.setattr(ft, "finalize_relevance_filter", SimpleNamespace(delay=lambda jid: None))
+
+        res = ft.relevance_filter_batch.run(job_id, [asset_1, asset_2, asset_3, asset_4])
+
+        assert res["passed"] == 1
+        assert res["rejected"] == 1
+        assert res["review_pending"] == 1
+        assert res["errored"] == 1
+
+        assert status_updates[uuid.UUID(asset_1)][0] == AssetStatus.RELEVANCE_PASSED
+        assert status_updates[uuid.UUID(asset_2)][0] == AssetStatus.RELEVANCE_REJECTED
+        assert status_updates[uuid.UUID(asset_3)][0] == AssetStatus.REVIEW_PENDING
+        assert status_updates[uuid.UUID(asset_4)][0] == AssetStatus.RETRY_PENDING

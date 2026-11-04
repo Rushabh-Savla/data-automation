@@ -7,7 +7,7 @@ services:
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: data_automation
     ports:
-      - "5435:5432"
+      - "5436:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -32,6 +32,7 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile.api
+    command: ["uv", "run", "--no-sync", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
     env_file: .env
     environment:
       DATABASE_URL: postgresql+psycopg://postgres:postgres@postgres:5432/data_automation
@@ -39,7 +40,7 @@ services:
       NAS_ROOT: /nas
       WORK_ROOT: /work
     ports:
-      - "8000:8000"
+      - "8010:8000"
     volumes:
       # Bind mounts (not named volumes): NAS_ROOT/WORK_ROOT stay the same
       # host folder whether the API/worker run natively (uv run uvicorn,
@@ -67,7 +68,7 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile.worker
-    command: ["uv", "run", "celery", "-A", "app.tasks.celery_app", "worker", "--loglevel=info", "--concurrency=8",
+    command: ["uv", "run", "--no-sync", "celery", "-A", "app.tasks.celery_app", "worker", "--loglevel=info", "--concurrency=8",
               "-Q", "celery,discovery,download,standardize,cleanup,orchestration,export"]
     env_file: .env
     environment:
@@ -119,7 +120,7 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile.worker
-    command: ["uv", "run", "celery", "-A", "app.tasks.celery_app", "worker", "--loglevel=info", "--concurrency=2",
+    command: ["uv", "run", "--no-sync", "celery", "-A", "app.tasks.celery_app", "worker", "--loglevel=info", "--concurrency=2",
               "-Q", "filtering"]
     env_file: .env
     environment:
@@ -162,7 +163,7 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile.worker
-    command: ["uv", "run", "celery", "-A", "app.tasks.celery_app", "beat", "--loglevel=info"]
+    command: ["uv", "run", "--no-sync", "celery", "-A", "app.tasks.celery_app", "beat", "--loglevel=info"]
     env_file: .env
     environment:
       DATABASE_URL: postgresql+psycopg://postgres:postgres@postgres:5432/data_automation
@@ -190,7 +191,7 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile.worker
-    command: ["uv", "run", "celery", "-A", "app.tasks.celery_app", "flower", "--port=5555"]
+    command: ["uv", "run", "--no-sync", "celery", "-A", "app.tasks.celery_app", "flower", "--port=5555"]
     env_file: .env
     environment:
       REDIS_URL: redis://redis:6379/0
@@ -206,7 +207,7 @@ services:
       context: .
       dockerfile: docker/Dockerfile.frontend
     ports:
-      - "3000:80"
+      - "3001:80"
     depends_on:
       - api
 

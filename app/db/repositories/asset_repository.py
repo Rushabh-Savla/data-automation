@@ -1,4 +1,5 @@
 import uuid
+from datetime import datetime, timezone
 
 from sqlalchemy import func, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -26,6 +27,8 @@ class AssetRepository:
                 id=asset.id,
                 job_id=asset.job_id,
                 job_source_task_id=asset.job_source_task_id,
+                batch_id=asset.batch_id,
+                window_id=asset.window_id,
                 source_type=asset.source_type,
                 source_item_id=asset.source_item_id,
                 source_url=asset.source_url,
@@ -155,11 +158,33 @@ class AssetRepository:
         )
         return list(self.db.execute(stmt).scalars().all())
 
-    def set_status(self, asset_id: uuid.UUID, status: AssetStatus, **extra) -> None:
+    def counts_by_status_for_job(self, job_id: uuid.UUID) -> dict[str, int]:
+        """Returns exact counts grouped by asset status for a job."""
+        rows = self.db.execute(
+            select(Asset.status, func.count()).where(Asset.job_id == job_id).group_by(Asset.status)
+        ).all()
+        return {str(getattr(st, "value", st)): count for st, count in rows}
+
+    def set_status(
+        self,
+        asset_id: uuid.UUID,
+        status: AssetStatus,
+        *,
+        enforce_transition: bool = False,
+        reason: str = "",
+        **extra,
+    ) -> None:
         asset = self.db.get(Asset, asset_id)
         if asset is None:
             return
+        if enforce_transition:
+            from app.domain.asset_state_machine import AssetStateMachine
+            AssetStateMachine.transition(asset.status, status, reason=reason)
         asset.status = status
+        now_iso = datetime.now(timezone.utc).isoformat()
+        md = dict(asset.asset_metadata or {})
+        md["status_entered_at"] = now_iso
+        asset.asset_metadata = md
         for k, v in extra.items():
             setattr(asset, k, v)
 

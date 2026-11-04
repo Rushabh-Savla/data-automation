@@ -81,6 +81,8 @@ class NasConfigInput(BaseModel):
             raise ValueError("SFTP always needs a user name and password")
         if self.auth_mode == "password" and self.protocol in _NEEDS_USERNAME and not self.username:
             raise ValueError("User name is required for a password-protected NAS")
+        if self.use_as_storage and not self.storage_path:
+            raise ValueError("Storage folder is required")
         return self
 
     def password_text(self) -> str | None:
@@ -139,6 +141,7 @@ class NasFoldersResponse(BaseModel):
     current_path: str = ""
     parent_path: str | None = None
     folders: list[str] = Field(default_factory=list)
+    tree: list[str] = Field(default_factory=list)
 
 
 class NasVerifyFolderRequest(BaseModel):

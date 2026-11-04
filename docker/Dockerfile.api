@@ -5,7 +5,9 @@ WORKDIR /srv
 # git is needed at `uv sync` time below: the shared pyproject.toml pins the
 # YOLO-World CLIP dependency as a git URL (see app/filtering/
 # yolo_world_filter.py) even though this API image never imports it.
-RUN apt-get update && apt-get install -y --no-install-recommends git \
+# libgl1, libglib2.0-0, libxcb1, libx11-xcb1 are runtime dependencies for opencv/cv2
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git libgl1 libglib2.0-0 libxcb1 libx11-xcb1 \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --no-cache-dir uv
@@ -26,4 +28,4 @@ COPY alembic ./alembic
 
 EXPOSE 8000
 
-CMD ["uv", "run", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uv", "run", "--no-sync", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

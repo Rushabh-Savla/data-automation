@@ -6,7 +6,7 @@
 FROM python:3.13-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ffmpeg curl unzip ca-certificates git \
+        ffmpeg curl unzip ca-certificates git libgl1 libglib2.0-0 libxcb1 libx11-xcb1 \
     && rm -rf /var/lib/apt/lists/*
 
 RUN curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh
@@ -37,5 +37,5 @@ COPY app ./app
 # GPU filtering worker, which consume different queue sets at different
 # concurrencies. This default is the all-in-one fallback for running the image
 # directly (no compose) and keeps every queue covered so that case still works.
-CMD ["uv", "run", "celery", "-A", "app.tasks.celery_app", "worker", "--loglevel=info", "--concurrency=4", \
+CMD ["uv", "run", "--no-sync", "celery", "-A", "app.tasks.celery_app", "worker", "--loglevel=info", "--concurrency=4", \
      "-Q", "celery,discovery,download,standardize,cleanup,orchestration,filtering,export"]

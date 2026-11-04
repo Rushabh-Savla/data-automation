@@ -23,11 +23,13 @@ from app.connectors.sun_rgbd_connector import SunRgbdConnector
 from app.connectors.visual_genome_connector import VisualGenomeConnector
 from app.connectors.web_connector import WebScrapeConnector
 from app.connectors.youtube_connector import YouTubeConnector
+from app.core.redis_client import get_redis
 from app.db.repositories.asset_repository import AssetRepository
 from app.db.repositories.credential_repository import CredentialRepository
 from app.db.repositories.job_source_task_repository import JobSourceTaskRepository
 from app.db.session import session_scope
 from app.domain.enums import JobSourceTaskStatus, SourceType
+from app.services.cancellation_service import CancellationService
 from app.services.credential_service import CredentialService
 from app.services.job_service import register_source_discovery_task
 from app.tasks._helpers import bind_context, heartbeat_during, unbind_context
@@ -50,6 +52,19 @@ from app.tasks.ingest_tasks import (
 from app.tasks.orchestration_tasks import check_and_advance_job, on_source_finished
 
 logger = logging.getLogger(__name__)
+
+
+def _should_skip_discovery(task_repo: JobSourceTaskRepository, job_uuid: uuid.UUID, task_uuid: uuid.UUID, source_type: str) -> bool:
+    cancellation = CancellationService(get_redis())
+    if cancellation.should_stop(str(job_uuid), str(task_uuid)):
+        logger.info(f"Job {job_uuid} should_stop active; skipping discovery for {source_type}")
+        task_repo.set_status(
+            task_uuid,
+            JobSourceTaskStatus.COMPLETED_PARTIAL,
+            error_message="Candidate window target reached; discovery skipped",
+        )
+        return True
+    return False
 
 
 def _default_container_limit(target_count: int | None, *, min_n: int = 5, max_n: int = 30, divisor: int = 30) -> int:
@@ -134,6 +149,12 @@ def discover_kaggle(self, job_id: str, job_source_task_id: str):
         task_repo = JobSourceTaskRepository(db)
         task = task_repo.get(task_uuid)
         if task is None:
+            unbind_context()
+            return
+
+        if _should_skip_discovery(task_repo, job_uuid, task_uuid, str(task.source_type)):
+            db.commit()
+            check_and_advance_job(job_id)
             unbind_context()
             return
 
@@ -224,6 +245,12 @@ def discover_roboflow(self, job_id: str, job_source_task_id: str):
             unbind_context()
             return
 
+        if _should_skip_discovery(task_repo, job_uuid, task_uuid, str(task.source_type)):
+            db.commit()
+            check_and_advance_job(job_id)
+            unbind_context()
+            return
+
         job = task.job
         task_repo.set_status(task_uuid, JobSourceTaskStatus.DISCOVERING)
         # Reset the stall clock to discovery-start — several sources
@@ -308,6 +335,12 @@ def discover_youtube(self, job_id: str, job_source_task_id: str):
         task_repo = JobSourceTaskRepository(db)
         task = task_repo.get(task_uuid)
         if task is None:
+            unbind_context()
+            return
+
+        if _should_skip_discovery(task_repo, job_uuid, task_uuid, str(task.source_type)):
+            db.commit()
+            check_and_advance_job(job_id)
             unbind_context()
             return
 
@@ -441,6 +474,12 @@ def discover_web(self, job_id: str, job_source_task_id: str):
             unbind_context()
             return
 
+        if _should_skip_discovery(task_repo, job_uuid, task_uuid, str(task.source_type)):
+            db.commit()
+            check_and_advance_job(job_id)
+            unbind_context()
+            return
+
         job = task.job
         task_repo.set_status(task_uuid, JobSourceTaskStatus.DISCOVERING)
         # Reset the stall clock to discovery-start — several sources
@@ -513,6 +552,12 @@ def discover_coco(self, job_id: str, job_source_task_id: str):
         task_repo = JobSourceTaskRepository(db)
         task = task_repo.get(task_uuid)
         if task is None:
+            unbind_context()
+            return
+
+        if _should_skip_discovery(task_repo, job_uuid, task_uuid, str(task.source_type)):
+            db.commit()
+            check_and_advance_job(job_id)
             unbind_context()
             return
 
@@ -604,6 +649,12 @@ def discover_open_images(self, job_id: str, job_source_task_id: str):
             unbind_context()
             return
 
+        if _should_skip_discovery(task_repo, job_uuid, task_uuid, str(task.source_type)):
+            db.commit()
+            check_and_advance_job(job_id)
+            unbind_context()
+            return
+
         job = task.job
         task_repo.set_status(task_uuid, JobSourceTaskStatus.DISCOVERING)
         # Reset the stall clock to discovery-start — several sources
@@ -673,6 +724,12 @@ def discover_pascal_voc(self, job_id: str, job_source_task_id: str):
         task_repo = JobSourceTaskRepository(db)
         task = task_repo.get(task_uuid)
         if task is None:
+            unbind_context()
+            return
+
+        if _should_skip_discovery(task_repo, job_uuid, task_uuid, str(task.source_type)):
+            db.commit()
+            check_and_advance_job(job_id)
             unbind_context()
             return
 
@@ -748,6 +805,12 @@ def discover_visual_genome(self, job_id: str, job_source_task_id: str):
             unbind_context()
             return
 
+        if _should_skip_discovery(task_repo, job_uuid, task_uuid, str(task.source_type)):
+            db.commit()
+            check_and_advance_job(job_id)
+            unbind_context()
+            return
+
         job = task.job
         task_repo.set_status(task_uuid, JobSourceTaskStatus.DISCOVERING)
         # Reset the stall clock to discovery-start — several sources
@@ -820,6 +883,12 @@ def discover_davis(self, job_id: str, job_source_task_id: str):
             unbind_context()
             return
 
+        if _should_skip_discovery(task_repo, job_uuid, task_uuid, str(task.source_type)):
+            db.commit()
+            check_and_advance_job(job_id)
+            unbind_context()
+            return
+
         job = task.job
         task_repo.set_status(task_uuid, JobSourceTaskStatus.DISCOVERING)
         # Reset the stall clock to discovery-start — several sources
@@ -889,6 +958,12 @@ def discover_sun_rgbd(self, job_id: str, job_source_task_id: str):
         task_repo = JobSourceTaskRepository(db)
         task = task_repo.get(task_uuid)
         if task is None:
+            unbind_context()
+            return
+
+        if _should_skip_discovery(task_repo, job_uuid, task_uuid, str(task.source_type)):
+            db.commit()
+            check_and_advance_job(job_id)
             unbind_context()
             return
 
@@ -973,6 +1048,12 @@ def discover_nuscenes(self, job_id: str, job_source_task_id: str):
             unbind_context()
             return
 
+        if _should_skip_discovery(task_repo, job_uuid, task_uuid, str(task.source_type)):
+            db.commit()
+            check_and_advance_job(job_id)
+            unbind_context()
+            return
+
         job = task.job
         task_repo.set_status(task_uuid, JobSourceTaskStatus.DISCOVERING)
         # Reset the stall clock to discovery-start — several sources
@@ -1043,6 +1124,12 @@ def discover_kitti(self, job_id: str, job_source_task_id: str):
         task_repo = JobSourceTaskRepository(db)
         task = task_repo.get(task_uuid)
         if task is None:
+            unbind_context()
+            return
+
+        if _should_skip_discovery(task_repo, job_uuid, task_uuid, str(task.source_type)):
+            db.commit()
+            check_and_advance_job(job_id)
             unbind_context()
             return
 
@@ -1118,6 +1205,12 @@ def discover_nas_share(self, job_id: str, job_source_task_id: str):
         task_repo = JobSourceTaskRepository(db)
         task = task_repo.get(task_uuid)
         if task is None:
+            unbind_context()
+            return
+
+        if _should_skip_discovery(task_repo, job_uuid, task_uuid, str(task.source_type)):
+            db.commit()
+            check_and_advance_job(job_id)
             unbind_context()
             return
 

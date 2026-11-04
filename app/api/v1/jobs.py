@@ -11,7 +11,7 @@ from app.db.models.job import Job
 from app.db.repositories.asset_repository import AssetRepository
 from app.db.repositories.job_repository import JobRepository
 from app.db.repositories.job_source_task_repository import JobSourceTaskRepository
-from app.domain.enums import JOB_TERMINAL_STATUSES, JobStatus
+from app.domain.enums import JOB_TERMINAL_STATUSES, AssetStatus, JobStatus
 from app.domain.state_machine import IllegalTransitionError
 from app.schemas.common import PageResponse
 from app.schemas.job import (
@@ -33,6 +33,7 @@ def create_job(payload: JobCreateRequest, db: Session = Depends(get_db)):
     job = service.create(
         query=payload.query,
         sources=payload.sources,
+        source_selection_mode=payload.source_selection_mode,
         name=payload.name,
         target_count=payload.target_count,
         deadline_at=payload.deadline_at,
@@ -43,7 +44,7 @@ def create_job(payload: JobCreateRequest, db: Session = Depends(get_db)):
     )
     db.commit()
     db.refresh(job)
-    return _to_detail(job, JobSourceTaskRepository(db).list_for_job(job.id))
+    return _to_detail(job, JobSourceTaskRepository(db).list_for_job(job.id), db=db)
 
 
 @router.get("", response_model=PageResponse[JobResponse])
@@ -64,7 +65,7 @@ def list_jobs(
 @router.get("/{job_id}", response_model=JobDetailResponse)
 def get_job(job_id: uuid.UUID, db: Session = Depends(get_db)):
     job = _get_job_or_404(db, job_id)
-    return _to_detail(job, JobSourceTaskRepository(db).list_for_job(job_id))
+    return _to_detail(job, JobSourceTaskRepository(db).list_for_job(job_id), db=db)
 
 
 @router.patch("/{job_id}", response_model=JobDetailResponse)
@@ -76,7 +77,7 @@ def update_job(job_id: uuid.UUID, payload: JobUpdateRequest, db: Session = Depen
         setattr(job, field, value)
     db.commit()
     db.refresh(job)
-    return _to_detail(job, JobSourceTaskRepository(db).list_for_job(job_id))
+    return _to_detail(job, JobSourceTaskRepository(db).list_for_job(job_id), db=db)
 
 
 @router.delete("/{job_id}", status_code=204)
@@ -99,25 +100,25 @@ def delete_job(job_id: uuid.UUID, db: Session = Depends(get_db)):
 @router.post("/{job_id}/start", response_model=JobDetailResponse)
 def start_job(job_id: uuid.UUID, db: Session = Depends(get_db)):
     job = _apply_control(db, job_id, lambda svc: svc.start(job_id))
-    return _to_detail(job, JobSourceTaskRepository(db).list_for_job(job_id))
+    return _to_detail(job, JobSourceTaskRepository(db).list_for_job(job_id), db=db)
 
 
 @router.post("/{job_id}/pause", response_model=JobDetailResponse)
 def pause_job(job_id: uuid.UUID, db: Session = Depends(get_db)):
     job = _apply_control(db, job_id, lambda svc: svc.pause(job_id))
-    return _to_detail(job, JobSourceTaskRepository(db).list_for_job(job_id))
+    return _to_detail(job, JobSourceTaskRepository(db).list_for_job(job_id), db=db)
 
 
 @router.post("/{job_id}/resume", response_model=JobDetailResponse)
 def resume_job(job_id: uuid.UUID, db: Session = Depends(get_db)):
     job = _apply_control(db, job_id, lambda svc: svc.resume(job_id))
-    return _to_detail(job, JobSourceTaskRepository(db).list_for_job(job_id))
+    return _to_detail(job, JobSourceTaskRepository(db).list_for_job(job_id), db=db)
 
 
 @router.post("/{job_id}/cancel", response_model=JobDetailResponse)
 def cancel_job(job_id: uuid.UUID, db: Session = Depends(get_db)):
     job = _apply_control(db, job_id, lambda svc: svc.cancel(job_id))
-    return _to_detail(job, JobSourceTaskRepository(db).list_for_job(job_id))
+    return _to_detail(job, JobSourceTaskRepository(db).list_for_job(job_id), db=db)
 
 
 @router.post("/{job_id}/reopen", response_model=JobDetailResponse)
@@ -126,22 +127,30 @@ def reopen_job(job_id: uuid.UUID, db: Session = Depends(get_db)):
     its original target_count, appending to the same job_id rather than
     requiring a disconnected new job."""
     job = _apply_control(db, job_id, lambda svc: svc.reopen(job_id))
-    return _to_detail(job, JobSourceTaskRepository(db).list_for_job(job_id))
+    return _to_detail(job, JobSourceTaskRepository(db).list_for_job(job_id), db=db)
 
 
 @router.get("/{job_id}/progress", response_model=JobProgressResponse)
 def get_job_progress(job_id: uuid.UUID, db: Session = Depends(get_db)):
     job = _get_job_or_404(db, job_id)
     tasks = JobSourceTaskRepository(db).list_for_job(job_id)
+    counts = AssetRepository(db).counts_by_status_for_job(job_id)
     return JobProgressResponse(
         job_id=job.id,
         status=job.status,
         target_count=job.target_count,
         accepted_count=job.accepted_count,
+        relevance_accepted_count=counts.get(AssetStatus.RELEVANCE_PASSED.value, 0),
         rejected_count=job.rejected_count,
         duplicate_count=job.duplicate_count,
         discovered_count=job.discovered_count,
         downloaded_count=job.downloaded_count,
+        review_pending_count=counts.get(AssetStatus.REVIEW_PENDING.value, 0),
+        retry_pending_count=counts.get(AssetStatus.RETRY_PENDING.value, 0),
+        upload_pending_count=counts.get(AssetStatus.READY_FOR_UPLOAD.value, 0),
+        uploading_count=counts.get(AssetStatus.UPLOADING.value, 0),
+        nas_verified_count=counts.get(AssetStatus.NAS_VERIFIED.value, 0),
+        completed_count=counts.get(AssetStatus.COMPLETED.value, 0),
         source_tasks=tasks,
     )
 
@@ -174,7 +183,16 @@ def _get_job_or_404(db: Session, job_id: uuid.UUID) -> Job:
     return job
 
 
-def _to_detail(job: Job, tasks) -> JobDetailResponse:
+def _to_detail(job: Job, tasks, db: Session | None = None) -> JobDetailResponse:
     data = JobResponse.model_validate(job).model_dump()
     data["source_tasks"] = tasks
+    if db is not None:
+        counts = AssetRepository(db).counts_by_status_for_job(job.id)
+        data["relevance_accepted_count"] = counts.get(AssetStatus.RELEVANCE_PASSED.value, 0)
+        data["review_pending_count"] = counts.get(AssetStatus.REVIEW_PENDING.value, 0)
+        data["retry_pending_count"] = counts.get(AssetStatus.RETRY_PENDING.value, 0)
+        data["upload_pending_count"] = counts.get(AssetStatus.READY_FOR_UPLOAD.value, 0)
+        data["uploading_count"] = counts.get(AssetStatus.UPLOADING.value, 0)
+        data["nas_verified_count"] = counts.get(AssetStatus.NAS_VERIFIED.value, 0)
+        data["completed_count"] = counts.get(AssetStatus.COMPLETED.value, 0)
     return JobDetailResponse(**data)

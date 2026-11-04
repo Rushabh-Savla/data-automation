@@ -44,6 +44,52 @@ app.include_router(nas.router, prefix="/api/v1")
 app.include_router(job_progress_ws.router)
 
 
+@app.get("/")
+def root():
+    return {
+        "service": "Data Automation Platform API",
+        "status": "running",
+        "docs": "/docs",
+        "openapi": "/openapi.json",
+    }
+
+
+@app.get("/healthz")
 @app.get("/api/v1/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/readyz")
+def readyz():
+    db_ok = False
+    redis_ok = False
+    try:
+        from app.db.session import session_scope
+        from sqlalchemy import text
+
+        with session_scope() as session:
+            session.execute(text("SELECT 1"))
+        db_ok = True
+    except Exception:
+        db_ok = False
+
+    try:
+        from app.core.redis_client import get_redis
+
+        redis_client = get_redis()
+        redis_ok = redis_client.ping() is True
+    except Exception:
+        redis_ok = False
+
+    from fastapi.responses import JSONResponse
+
+    status_code = 200 if (db_ok and redis_ok) else 503
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "status": "ready" if (db_ok and redis_ok) else "not_ready",
+            "database": "ok" if db_ok else "unreachable",
+            "redis": "ok" if redis_ok else "unreachable",
+        },
+    )

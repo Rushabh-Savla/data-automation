@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 import { Controller, type Control, type UseFormRegister } from 'react-hook-form'
 import {
   CheckCircle2Icon,
@@ -8,11 +8,12 @@ import {
   FolderSearchIcon,
   HardDriveIcon,
   Loader2Icon,
+  RefreshCwIcon,
+  SearchIcon,
   XCircleIcon,
 } from 'lucide-react'
 
 import { listNasFolders, verifyNasFolder } from '@/api/nas'
-import type { NasFoldersResponse } from '@/api/types'
 import type { JobCreateFormValues } from '@/components/jobs/jobCreateSchema'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -55,9 +56,10 @@ export function NasStorageConfigFields({
   // Explorer dialog state
   const [explorerOpen, setExplorerOpen] = useState(false)
   const [currentBrowsePath, setCurrentBrowsePath] = useState<string>('')
-  const [folderData, setFolderData] = useState<NasFoldersResponse | null>(null)
+  const [allFolderPaths, setAllFolderPaths] = useState<string[] | null>(null)
   const [isLoadingFolders, setIsLoadingFolders] = useState(false)
   const [browseError, setBrowseError] = useState<string | null>(null)
+  const [searchFilter, setSearchFilter] = useState('')
 
   // Direct path verification state
   const [isVerifying, setIsVerifying] = useState(false)
@@ -70,19 +72,15 @@ export function NasStorageConfigFields({
   const isConfigured = Boolean(config?.configured)
   const jobFolder = previewSlug(jobName)
 
-  async function openExplorer(initialPath: string = '') {
-    setExplorerOpen(true)
-    setBrowseError(null)
-    await loadPath(initialPath)
-  }
-
-  async function loadPath(path: string) {
+  // Single-request loader: fetches all NAS folders once over one connection
+  async function fetchAllFolders() {
     setIsLoadingFolders(true)
     setBrowseError(null)
     try {
-      const data = await listNasFolders(path)
-      setFolderData(data)
-      setCurrentBrowsePath(data.current_path)
+      const data = await listNasFolders('')
+      // Prefer the full tree of all folders if present, fallback to folders list
+      const paths = data.tree && data.tree.length > 0 ? data.tree : data.folders
+      setAllFolderPaths(paths)
     } catch (err: unknown) {
       setBrowseError(err instanceof Error ? err.message : 'Could not browse NAS folders')
     } finally {
@@ -90,8 +88,49 @@ export function NasStorageConfigFields({
     }
   }
 
+  async function openExplorer(initialPath: string = '') {
+    setExplorerOpen(true)
+    setBrowseError(null)
+    setSearchFilter('')
+    setCurrentBrowsePath(initialPath.trim().replace(/^\/+|\/+$/g, ''))
+
+    // Send request ONLY if not already fetched
+    if (allFolderPaths === null) {
+      await fetchAllFolders()
+    }
+  }
+
+  // Compute immediate subfolders for the current browse path completely offline (in-memory)
+  const visibleSubfolders = useMemo(() => {
+    if (!allFolderPaths) return []
+    const prefix = currentBrowsePath ? `${currentBrowsePath}/` : ''
+    const childNames = new Set<string>()
+
+    for (const p of allFolderPaths) {
+      if (prefix ? p.startsWith(prefix) : true) {
+        const remainder = prefix ? p.slice(prefix.length) : p
+        const [segment] = remainder.split('/')
+        if (segment) {
+          if (!searchFilter.trim() || segment.toLowerCase().includes(searchFilter.trim().toLowerCase())) {
+            childNames.add(segment)
+          }
+        }
+      }
+    }
+    return Array.from(childNames).sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }))
+  }, [allFolderPaths, currentBrowsePath, searchFilter])
+
+  // Compute parent path completely offline
+  const parentBrowsePath = useMemo(() => {
+    if (!currentBrowsePath) return null
+    return currentBrowsePath.includes('/')
+      ? currentBrowsePath.slice(0, currentBrowsePath.lastIndexOf('/'))
+      : ''
+  }, [currentBrowsePath])
+
   async function handleVerifyPath(path: string) {
-    if (!path.trim()) {
+    const clean = path.trim().replace(/^\/+|\/+$/g, '')
+    if (!clean) {
       setVerificationResult({
         tested: true,
         exists: true,
@@ -100,9 +139,19 @@ export function NasStorageConfigFields({
       return
     }
 
+    // Verify completely in-memory if tree is already loaded
+    if (allFolderPaths && allFolderPaths.includes(clean)) {
+      setVerificationResult({
+        tested: true,
+        exists: true,
+        message: 'Folder exists on NAS (verified offline)',
+      })
+      return
+    }
+
     setIsVerifying(true)
     try {
-      const res = await verifyNasFolder(path.trim())
+      const res = await verifyNasFolder(clean)
       setVerificationResult({
         tested: true,
         exists: res.exists,
@@ -156,7 +205,7 @@ export function NasStorageConfigFields({
               return (
                 <div className="flex flex-col gap-3">
                   <div className="flex flex-col sm:flex-row gap-2">
-                    <div className="relative flex-1">
+                    <div className="relative flex-1 min-w-0">
                       <Input
                         id="nas-storage-path-input"
                         placeholder="Leave empty to store locally only, or enter NAS path (e.g. ai_data_collection/test)"
@@ -267,16 +316,46 @@ export function NasStorageConfigFields({
 
                   {/* Folder Explorer Dialog */}
                   <Dialog open={explorerOpen} onOpenChange={setExplorerOpen}>
-                    <DialogContent className="max-w-xl max-h-[85vh] flex flex-col gap-4">
-                      <DialogHeader>
-                        <DialogTitle className="flex items-center gap-2 text-base">
-                          <FolderOpenIcon className="size-5 text-primary" />
-                          NAS Folder Explorer
-                        </DialogTitle>
+                    <DialogContent className="max-w-xl max-h-[85vh] flex flex-col gap-3">
+                      <DialogHeader className="space-y-1">
+                        <div className="flex items-center justify-between">
+                          <DialogTitle className="flex items-center gap-2 text-base">
+                            <FolderOpenIcon className="size-5 text-primary" />
+                            NAS Folder Explorer
+                          </DialogTitle>
+                          <div className="flex items-center gap-2">
+                            <Badge variant="outline" className="text-[10px] text-muted-foreground gap-1 font-normal">
+                              <CheckCircle2Icon className="size-3 text-emerald-600" />
+                              Single Request • Offline Browsing
+                            </Badge>
+                            <Button
+                              type="button"
+                              variant="ghost"
+                              size="sm"
+                              className="h-7 w-7 p-0 text-muted-foreground hover:text-foreground"
+                              onClick={fetchAllFolders}
+                              disabled={isLoadingFolders}
+                              title="Refresh folders from NAS (1 request)"
+                            >
+                              <RefreshCwIcon className={cn('size-3.5', isLoadingFolders && 'animate-spin')} />
+                            </Button>
+                          </div>
+                        </div>
                         <DialogDescription className="text-xs">
-                          Browse folders on the connected NAS and select the destination directory.
+                          Browse and select the target folder. All subfolders are loaded once in a single request and browsed offline without repeated calls to the NAS.
                         </DialogDescription>
                       </DialogHeader>
+
+                      {/* Filter subfolders in current view */}
+                      <div className="relative">
+                        <SearchIcon className="absolute left-2.5 top-2.5 size-3.5 text-muted-foreground" />
+                        <Input
+                          placeholder="Filter subfolders in current directory..."
+                          value={searchFilter}
+                          onChange={(e) => setSearchFilter(e.target.value)}
+                          className="h-8 pl-8 text-xs"
+                        />
+                      </div>
 
                       {/* Breadcrumbs Navigation */}
                       <div className="flex items-center gap-1 overflow-x-auto rounded-md bg-muted/40 p-2 text-xs font-mono">
@@ -284,13 +363,17 @@ export function NasStorageConfigFields({
                           type="button"
                           variant="ghost"
                           size="sm"
-                          className="h-6 px-1.5 text-xs"
-                          onClick={() => loadPath('')}
+                          className={cn('h-6 px-1.5 text-xs', !currentBrowsePath && 'font-bold text-foreground bg-accent')}
+                          onClick={() => {
+                            setCurrentBrowsePath('')
+                            setSearchFilter('')
+                          }}
                         >
                           Root
                         </Button>
                         {currentBrowsePath.split('/').filter(Boolean).map((segment, idx, arr) => {
                           const subpath = arr.slice(0, idx + 1).join('/')
+                          const isLast = idx === arr.length - 1
                           return (
                             <span key={subpath} className="flex items-center gap-1">
                               <span className="text-muted-foreground">/</span>
@@ -300,9 +383,12 @@ export function NasStorageConfigFields({
                                 size="sm"
                                 className={cn(
                                   'h-6 px-1.5 text-xs',
-                                  idx === arr.length - 1 && 'font-bold text-foreground bg-accent',
+                                  isLast && 'font-bold text-foreground bg-accent',
                                 )}
-                                onClick={() => loadPath(subpath)}
+                                onClick={() => {
+                                  setCurrentBrowsePath(subpath)
+                                  setSearchFilter('')
+                                }}
                               >
                                 {segment}
                               </Button>
@@ -312,14 +398,17 @@ export function NasStorageConfigFields({
                       </div>
 
                       {/* Parent level up button */}
-                      {folderData?.parent_path !== null && (
+                      {parentBrowsePath !== null && (
                         <Button
                           type="button"
                           variant="outline"
                           size="sm"
-                          className="w-fit gap-1.5 text-xs"
+                          className="w-fit gap-1.5 text-xs h-7"
                           disabled={isLoadingFolders}
-                          onClick={() => loadPath(folderData?.parent_path ?? '')}
+                          onClick={() => {
+                            setCurrentBrowsePath(parentBrowsePath)
+                            setSearchFilter('')
+                          }}
                         >
                           <CornerLeftUpIcon className="size-3.5" />
                           Up to parent folder
@@ -331,21 +420,30 @@ export function NasStorageConfigFields({
                         {isLoadingFolders ? (
                           <div className="flex flex-col items-center justify-center h-48 gap-2 text-muted-foreground text-xs">
                             <Loader2Icon className="size-6 animate-spin text-primary" />
-                            Loading folders from NAS…
+                            Loading folders from NAS (single request)…
                           </div>
                         ) : browseError ? (
                           <div className="flex flex-col items-center justify-center h-48 p-4 text-center text-xs text-destructive">
                             <XCircleIcon className="size-6 mb-1" />
-                            {browseError}
+                            <p>{browseError}</p>
+                            <Button
+                              type="button"
+                              variant="outline"
+                              size="sm"
+                              onClick={fetchAllFolders}
+                              className="mt-2 text-xs"
+                            >
+                              Try Again
+                            </Button>
                           </div>
-                        ) : folderData?.folders.length === 0 ? (
+                        ) : visibleSubfolders.length === 0 ? (
                           <div className="flex flex-col items-center justify-center h-48 text-muted-foreground text-xs">
                             <FolderOpenIcon className="size-8 stroke-1 text-muted-foreground/60 mb-1" />
-                            No subfolders found in this directory.
+                            {searchFilter ? `No folders matching "${searchFilter}"` : 'No subfolders found in this directory.'}
                           </div>
                         ) : (
                           <div className="grid grid-cols-1 sm:grid-cols-2 gap-1">
-                            {folderData?.folders.map((folder) => {
+                            {visibleSubfolders.map((folder) => {
                               const targetSubpath = currentBrowsePath
                                 ? `${currentBrowsePath}/${folder}`
                                 : folder
@@ -354,14 +452,17 @@ export function NasStorageConfigFields({
                                 <button
                                   key={folder}
                                   type="button"
-                                  onClick={() => loadPath(targetSubpath)}
+                                  onClick={() => {
+                                    setCurrentBrowsePath(targetSubpath)
+                                    setSearchFilter('')
+                                  }}
                                   className="flex items-center justify-between rounded-md px-3 py-2 text-left text-xs hover:bg-accent transition-colors border border-transparent hover:border-border cursor-pointer group"
                                 >
                                   <div className="flex items-center gap-2 truncate">
                                     <FolderIcon className="size-4 text-primary shrink-0 group-hover:scale-105 transition-transform" />
                                     <span className="truncate font-medium">{folder}</span>
                                   </div>
-                                  <span className="text-[10px] text-muted-foreground ml-2">Open →</span>
+                                  <span className="text-[10px] text-muted-foreground ml-2 group-hover:text-foreground">Open →</span>
                                 </button>
                               )
                             })}

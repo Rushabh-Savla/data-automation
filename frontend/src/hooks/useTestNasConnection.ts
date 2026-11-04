@@ -8,7 +8,7 @@ import { apiErrorMessage } from '@/lib/apiErrorMessage'
 // that the form renders inline. Only transport/validation errors toast.
 export function useTestNasConnection() {
   return useMutation({
-    mutationFn: (payload?: Parameters<typeof testNasConnection>[0]) => testNasConnection(payload),
+    mutationFn: testNasConnection,
     onError: (error) => {
       toast.error(apiErrorMessage(error, 'Failed to test connection'))
     },

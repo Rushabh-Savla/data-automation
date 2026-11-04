@@ -265,8 +265,10 @@ def transfer_nas_images(body: NasTransferInput, db: Session = Depends(get_db)):
 
 
 @router.get("/folders", response_model=NasFoldersResponse)
-def list_nas_folders(path: str = "", db: Session = Depends(get_db)):
-    """Explores directories on the connected NAS in a single connection session."""
+def list_nas_folders(path: str = "", max_depth: int = 3, db: Session = Depends(get_db)):
+    """Explores directories on the connected NAS in a single connection session.
+    Walks the folder tree over ONE single connection so the client can navigate
+    subfolders entirely offline without sending any further requests to the NAS."""
     service = NasConfigService(db)
     saved = service.get()
     if saved is None:
@@ -279,16 +281,48 @@ def list_nas_folders(path: str = "", db: Session = Depends(get_db)):
     clean_path = path.strip().strip("/")
     try:
         with open_client(params) as client:
-            entries = client.list_dir(clean_path)
-            folders = sorted([
-                e.name for e in entries
-                if e.is_dir and not e.name.startswith(".") and not e.name.startswith("#")
+            direct_entries = client.list_dir(clean_path)
+            direct_folders = sorted([
+                e.name for e in direct_entries
+                if e.is_dir and not e.name.startswith(".") and not e.name.startswith("#") and not e.name.startswith("@")
             ])
+
+            # Discover folder tree in the same single connection session
+            tree_paths: list[str] = []
+            queue: list[str] = [clean_path]
+            depth_map = {clean_path: 0}
+            visited = set()
+            max_folders = 800
+
+            while queue and len(tree_paths) < max_folders:
+                curr = queue.pop(0)
+                if curr in visited:
+                    continue
+                visited.add(curr)
+                curr_depth = depth_map[curr]
+
+                if curr == clean_path:
+                    entries = direct_entries
+                else:
+                    try:
+                        entries = client.list_dir(curr)
+                    except Exception:
+                        continue
+
+                for e in entries:
+                    if e.is_dir and not e.name.startswith(".") and not e.name.startswith("#") and not e.name.startswith("@"):
+                        folder_path = f"{curr}/{e.name}".strip("/") if curr else e.name
+                        tree_paths.append(folder_path)
+                        if curr_depth + 1 < max_depth:
+                            depth_map[folder_path] = curr_depth + 1
+                            queue.append(folder_path)
+
             parent = clean_path.rpartition("/")[0] if "/" in clean_path else ("" if clean_path else None)
             return NasFoldersResponse(
                 current_path=clean_path,
                 parent_path=parent,
-                folders=folders,
+                folders=direct_folders,
+                tree=sorted(list(set(tree_paths))),
             )
     except Exception as exc:
         logger.warning(f"Error exploring NAS folders at '{clean_path}': {exc}")

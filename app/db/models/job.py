@@ -21,6 +21,18 @@ class Job(Base):
     query: Mapped[str] = mapped_column(Text, nullable=False)
     sources: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
 
+    @property
+    def source_selection_mode(self) -> str:
+        if isinstance(self.config, dict):
+            return self.config.get("source_selection_mode", "manual")
+        return "manual"
+
+    @source_selection_mode.setter
+    def source_selection_mode(self, value: str) -> None:
+        if not isinstance(self.config, dict):
+            self.config = {}
+        self.config["source_selection_mode"] = str(getattr(value, "value", value))
+
     target_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     deadline_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     scheduled_start_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -99,6 +111,9 @@ class Job(Base):
         back_populates="job", cascade="all, delete-orphan"
     )
     assets: Mapped[list["Asset"]] = relationship(back_populates="job", cascade="all, delete-orphan")
+    image_batches: Mapped[list["ImageBatch"]] = relationship(
+        "ImageBatch", back_populates="job", cascade="all, delete-orphan"
+    )
     export_jobs: Mapped[list["ExportJob"]] = relationship(
         back_populates="job", cascade="all, delete-orphan"
     )

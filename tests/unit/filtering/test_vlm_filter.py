@@ -105,3 +105,207 @@ class TestVerifyBatchAny:
 
     def test_empty_input(self):
         assert _StubVerifier({}).verify_batch_any([], ["a car"]) == []
+
+
+class TestStage5TinyVlmEnhancements:
+    def test_verdict_parsing_categories(self):
+        from app.filtering.vlm_filter import VlmVerdict, _parse_verdict
+
+        assert _parse_verdict("Yes") == VlmVerdict.YES
+        assert _parse_verdict(" yes, absolutely.") == VlmVerdict.YES
+        assert _parse_verdict("No") == VlmVerdict.NO
+        assert _parse_verdict("no.") == VlmVerdict.NO
+        assert _parse_verdict("maybe, it is blurry") == VlmVerdict.UNCERTAIN
+        assert _parse_verdict("cannot tell from this angle") == VlmVerdict.UNCERTAIN
+        assert _parse_verdict("Random rambling text that ignores instruction") == VlmVerdict.UNCERTAIN
+
+    def test_deterministic_caching_key(self):
+        from app.filtering.vlm_filter import _compute_vlm_cache_key
+
+        k1 = _compute_vlm_cache_key("sha_abc_123", "Red Car")
+        k2 = _compute_vlm_cache_key("sha_abc_123", "red car")
+        assert k1 == k2
+        assert k1.startswith("vlm_cache:")
+
+    def test_cached_verdict_retrieval(self):
+        from unittest.mock import MagicMock, patch
+        from app.filtering.vlm_filter import VisualVerifier, VlmVerdict
+
+        with patch("app.filtering.vlm_filter._load_model") as mock_load:
+            mock_proc = MagicMock()
+            mock_model = MagicMock()
+            mock_load.return_value = (mock_proc, mock_model, "cpu")
+
+            verifier = VisualVerifier()
+            # Mock redis cache hit
+            with patch.object(verifier, "_get_cached_verdict", return_value=VlmVerdict.YES):
+                res = verifier.verify_batch_verdicts(["img_mock_path"], "dog", fingerprints=["sha_123"])
+                assert res == [VlmVerdict.YES]
+                # Model inference should not have been called!
+                assert mock_model.generate.call_count == 0
+
+    def test_and_query_requires_all_subjects(self):
+        from unittest.mock import MagicMock, patch
+        from app.filtering.vlm_filter import VisualVerifier, VlmVerdict
+
+        with patch("app.filtering.vlm_filter._load_model") as mock_load:
+            mock_load.return_value = (MagicMock(), MagicMock(), "cpu")
+            v = VisualVerifier()
+
+            with patch.object(v, "verify_batch_verdicts") as mock_batch:
+                # Query: "person AND helmet"
+                # Call 1 (person): [YES, YES]
+                # Call 2 (helmet): [YES, NO]
+                mock_batch.side_effect = [
+                    [VlmVerdict.YES, VlmVerdict.YES],
+                    [VlmVerdict.YES, VlmVerdict.NO],
+                ]
+
+                results = v.verify_query_complex(["img1", "img2"], "person AND helmet")
+                assert results == [VlmVerdict.YES, VlmVerdict.NO]
+
+    def test_or_query_accepts_if_any_subject_visible(self):
+        from unittest.mock import MagicMock, patch
+        from app.filtering.vlm_filter import VisualVerifier, VlmVerdict
+
+        with patch("app.filtering.vlm_filter._load_model") as mock_load:
+            mock_load.return_value = (MagicMock(), MagicMock(), "cpu")
+            v = VisualVerifier()
+
+            with patch.object(v, "verify_batch_verdicts") as mock_batch:
+                # Query: "car OR motorcycle"
+                # Call 1 (car): [YES, NO]
+                # Call 2 (motorcycle): [NO, YES]
+                mock_batch.side_effect = [
+                    [VlmVerdict.YES, VlmVerdict.NO],
+                    [VlmVerdict.NO, VlmVerdict.YES],
+                ]
+
+                results = v.verify_query_complex(["img1", "img2"], "car OR motorcycle")
+                assert results == [VlmVerdict.YES, VlmVerdict.YES]
+
+    def test_cuda_oom_recovery_to_sequential_inference(self):
+        import torch
+        from unittest.mock import MagicMock, patch
+        from PIL import Image
+        from app.filtering.vlm_filter import VisualVerifier, VlmVerdict
+
+        with patch("app.filtering.vlm_filter._load_model") as mock_load:
+            mock_proc = MagicMock()
+            mock_model = MagicMock()
+            mock_load.return_value = (mock_proc, mock_model, "cuda")
+
+            v = VisualVerifier()
+
+            # First attempt (batch generate) raises CUDA OOM
+            # Fallback attempts (sequential generate) succeed
+            mock_model.generate.side_effect = [
+                RuntimeError("CUDA out of memory"),
+                MagicMock(),
+                MagicMock(),
+            ]
+            mock_proc.batch_decode.return_value = ["Yes"]
+
+            img1 = Image.new("RGB", (100, 100))
+            img2 = Image.new("RGB", (100, 100))
+
+            with patch("torch.cuda.empty_cache") as mock_empty_cache:
+                results = v.verify_batch_verdicts([img1, img2], "tree", batch_size=2)
+                assert len(results) == 2
+                assert all(r == VlmVerdict.YES for r in results)
+                assert mock_empty_cache.called
+
+    def test_never_cache_transient_error(self):
+        from unittest.mock import MagicMock, patch
+        from app.filtering.vlm_filter import VisualVerifier, VlmVerdict
+
+        with patch("app.filtering.vlm_filter._load_model") as mock_load:
+            mock_load.return_value = (MagicMock(), MagicMock(), "cpu")
+            v = VisualVerifier()
+
+            mock_redis = MagicMock()
+            with patch("app.core.redis_client.get_redis", return_value=mock_redis):
+                # Attempt to cache ERROR
+                v._set_cached_verdict("vlm_cache:test_key", VlmVerdict.ERROR)
+                assert mock_redis.set.call_count == 0  # Must NOT be called!
+
+                # Attempt to cache YES
+                v._set_cached_verdict("vlm_cache:test_key", VlmVerdict.YES)
+                assert mock_redis.set.call_count == 1  # YES is cached
+
+    def test_cache_separation_on_parameter_change(self):
+        from app.filtering.vlm_filter import _compute_vlm_cache_key
+
+        fp = "sha256_image_fingerprint"
+        q = "excavator"
+
+        k_base = _compute_vlm_cache_key(
+            fp, q, prompt_version="v1", model_id="model_a",
+            model_revision="commit_rev_1", model_config_identity="fp16_tok5_greedy",
+            preprocess_config="dim_384_notile", logical_operator="EXACT"
+        )
+        k_diff_prompt = _compute_vlm_cache_key(
+            fp, q, prompt_version="v2", model_id="model_a",
+            model_revision="commit_rev_1", model_config_identity="fp16_tok5_greedy",
+            preprocess_config="dim_384_notile", logical_operator="EXACT"
+        )
+        k_diff_model = _compute_vlm_cache_key(
+            fp, q, prompt_version="v1", model_id="model_b",
+            model_revision="commit_rev_1", model_config_identity="fp16_tok5_greedy",
+            preprocess_config="dim_384_notile", logical_operator="EXACT"
+        )
+        k_diff_revision = _compute_vlm_cache_key(
+            fp, q, prompt_version="v1", model_id="model_a",
+            model_revision="commit_rev_2", model_config_identity="fp16_tok5_greedy",
+            preprocess_config="dim_384_notile", logical_operator="EXACT"
+        )
+        k_diff_config = _compute_vlm_cache_key(
+            fp, q, prompt_version="v1", model_id="model_a",
+            model_revision="commit_rev_1", model_config_identity="fp32_tok10",
+            preprocess_config="dim_384_notile", logical_operator="EXACT"
+        )
+        k_diff_preprocess = _compute_vlm_cache_key(
+            fp, q, prompt_version="v1", model_id="model_a",
+            model_revision="commit_rev_1", model_config_identity="fp16_tok5_greedy",
+            preprocess_config="dim_512_tiled", logical_operator="EXACT"
+        )
+        k_diff_operator = _compute_vlm_cache_key(
+            fp, q, prompt_version="v1", model_id="model_a",
+            model_revision="commit_rev_1", model_config_identity="fp16_tok5_greedy",
+            preprocess_config="dim_384_notile", logical_operator="AND"
+        )
+
+        assert k_base != k_diff_prompt
+        assert k_base != k_diff_model
+        assert k_base != k_diff_revision
+        assert k_base != k_diff_config
+        assert k_base != k_diff_preprocess
+        assert k_base != k_diff_operator
+
+    def test_redis_unavailable_behavior(self):
+        from unittest.mock import MagicMock, patch
+        from app.filtering.vlm_filter import VisualVerifier, VlmVerdict
+
+        with patch("app.filtering.vlm_filter._load_model") as mock_load:
+            mock_load.return_value = (MagicMock(), MagicMock(), "cpu")
+            v = VisualVerifier()
+
+            with patch("app.core.redis_client.get_redis", side_effect=ConnectionError("Redis offline")):
+                # Should not raise exception; gracefully returns None
+                assert v._get_cached_verdict("vlm_cache:any") is None
+                # Should not raise on set
+                v._set_cached_verdict("vlm_cache:any", VlmVerdict.YES)
+
+    def test_corrupted_image_handling(self):
+        import io
+        from unittest.mock import MagicMock, patch
+        from app.filtering.vlm_filter import VisualVerifier, VlmVerdict
+
+        with patch("app.filtering.vlm_filter._load_model") as mock_load:
+            mock_load.return_value = (MagicMock(), MagicMock(), "cpu")
+            v = VisualVerifier()
+
+            # Corrupted image bytes
+            corrupted_stream = io.BytesIO(b"not an image byte sequence")
+            results = v.verify_batch_verdicts([corrupted_stream], "car")
+            assert results == [VlmVerdict.ERROR]

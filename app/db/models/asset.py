@@ -6,7 +6,7 @@ license, resolution, exact NAS path, processing status."""
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, text
+from sqlalchemy import DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -51,6 +51,16 @@ class Asset(Base):
     annotation_nas_path: Mapped[str | None] = mapped_column(Text, nullable=True)
     classes: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
 
+    batch_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("image_batches.id", ondelete="SET NULL"), nullable=True
+    )
+
+    window_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("candidate_windows.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+
     status: Mapped[AssetStatus] = mapped_column(
         String(32), nullable=False, default=AssetStatus.DISCOVERED
     )
@@ -68,10 +78,15 @@ class Asset(Base):
 
     job: Mapped["Job"] = relationship(back_populates="assets")
     job_source_task: Mapped["JobSourceTask"] = relationship(back_populates="assets")
+    batch: Mapped["ImageBatch | None"] = relationship("ImageBatch", back_populates="assets")
 
     __table_args__ = (
         UniqueConstraint(
             "job_id", "source_type", "source_item_id",
             name="uq_assets_job_id_source_type_source_item_id",
         ),
+        Index("ix_assets_batch_id", "batch_id"),
+        Index("ix_assets_window_id", "window_id"),
+        Index("ix_assets_checksum_sha256", "checksum_sha256"),
+        Index("ix_assets_phash", "phash"),
     )

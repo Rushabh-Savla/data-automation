@@ -29,7 +29,7 @@ export function JobsPage() {
     setOffset(0)
   }, [status, source, search])
 
-  const { data, isLoading } = useJobs({
+  const { data, isLoading, error, refetch } = useJobs({
     status: status === ALL ? undefined : status,
     source: source === ALL ? undefined : source,
     search: search || undefined,
@@ -88,7 +88,7 @@ export function JobsPage() {
 
         <Card>
           <CardContent className="px-0">
-            <JobList jobs={data?.items} isLoading={isLoading} />
+            <JobList jobs={data?.items} isLoading={isLoading} error={error} onRetry={() => refetch()} />
             {data && (
               <Pagination offset={offset} limit={PAGE_SIZE} total={data.total} onOffsetChange={setOffset} />
             )}

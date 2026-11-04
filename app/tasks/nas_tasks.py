@@ -541,3 +541,120 @@ def schedule_offload_for_job(job_id: str) -> None:
         logger.exception(
             "Could not schedule NAS offload for job %s; sweeper will pick these up", job_id
         )
+
+@celery_app.task(
+    name="app.tasks.nas_tasks.process_nas_upload_queue",
+    bind=True,
+    autoretry_for=(TransientConnectorError,),
+    retry_backoff=True,
+    retry_backoff_max=900,
+    retry_jitter=True,
+    max_retries=5,
+)
+def process_nas_upload_queue(self, max_transfers: int = 10) -> dict:
+    """Process durable NAS transfers under one global Redis lock."""
+
+    from app.storage.nas_writer import (
+        NasBatchWriter,
+        NasWriterLock,
+        dequeue_nas_batch,
+        is_cooldown_active,
+    )
+
+    if not is_storage_active():
+        return {"status": "skipped", "reason": "no_active_storage"}
+
+    if is_cooldown_active():
+        return {"status": "skipped", "reason": "cooldown_active"}
+
+    lock = NasWriterLock(
+        ttl_s=300,
+        heartbeat_interval_s=60,
+        allow_local_fallback=False,
+    )
+
+    if not lock.acquire(timeout_s=0):
+        return {"status": "skipped", "reason": "concurrency_lock_held"}
+
+    results = []
+
+    try:
+        params = get_active_storage_params()
+        if params is None:
+            return {"status": "skipped", "reason": "no_active_storage"}
+
+        limit = max(1, min(int(max_transfers), 10))
+
+        # One connection reused for sequential transfers.
+        with open_client(params) as client:
+            for _ in range(limit):
+
+                # Redis heartbeat also verifies current lock ownership.
+                if not lock.extend(300):
+                    raise TransientConnectorError(
+                        "NAS writer lock lease lost; stopping transfer processing."
+                    )
+
+                with session_scope() as db:
+                    transfer_id = dequeue_nas_batch(db)
+
+                    if transfer_id is None:
+                        break
+
+                    writer = NasBatchWriter(
+                        db,
+                        params=params,
+                        lock=lock,
+                    )
+
+                    result = writer.upload_batch(
+                        transfer_id,
+                        client=client,
+                    )
+
+                results.append({
+                    "transfer_id": str(transfer_id),
+                    "result": result,
+                })
+
+        return {
+            "status": "completed",
+            "processed_batches": len(results),
+        }
+
+    finally:
+        lock.release()
+
+
+@celery_app.task(
+    name="app.tasks.nas_tasks.reconcile_nas_transfers"
+)
+def reconcile_nas_transfers() -> dict:
+    """Discover actionable NAS transfers and dispatch the central queue."""
+
+    # Resolve dynamically so configuration changes are reflected.
+    from app.services.nas_config_service import is_storage_active as storage_active
+    from app.db.repositories.image_batch_repository import NasTransferBatchRepository
+
+    if not storage_active():
+        return {"status": "skipped", "reason": "no_active_storage"}
+
+    with session_scope() as db:
+        repo = NasTransferBatchRepository(db)
+        actionable = repo.list_actionable(limit=50)
+        pending_cleanups = repo.list_pending_cleanups(limit=50)
+
+    if actionable:
+        process_nas_upload_queue.delay()
+
+        return {
+            "status": "dispatched",
+            "actionable_count": len(actionable),
+            "cleaned_count": 0,
+        }
+
+    return {
+        "status": "idle",
+        "actionable_count": 0,
+        "cleaned_count": 0,
+    }

@@ -98,8 +98,7 @@ export function JobPhaseBanner({
         {overTarget && (
           <>
             {' '}
-            Already collected more than the target ({job.accepted_count} of {job.target_count}) — that&apos;s
-            expected; filtering trims it back down to the best matches afterward.
+            Target reached ({job.accepted_count} of {job.target_count}) — candidate admission stopped; finalizing verification and transfer.
           </>
         )}
       </div>

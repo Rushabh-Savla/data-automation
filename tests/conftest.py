@@ -9,3 +9,36 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 # only app.core.security.CredentialCipher() with no explicit key needs it,
 # and the tests that exercise that pass their own key explicitly.
 os.environ.setdefault("DATABASE_URL", "postgresql+psycopg://postgres:postgres@localhost:5432/data_automation_test")
+
+import pytest
+from sqlalchemy import create_engine, event
+from sqlalchemy.pool import StaticPool
+from sqlalchemy.orm import sessionmaker
+from app.db.base import Base
+
+
+@pytest.fixture
+def db_session():
+    engine = create_engine(
+        "sqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+
+    @event.listens_for(engine, "connect")
+    def register_sqlite_functions(dbapi_connection, connection_record):
+        import datetime
+        dbapi_connection.create_function("now", 0, lambda: datetime.datetime.now(datetime.timezone.utc).isoformat())
+        dbapi_connection.create_function("greatest", -1, lambda *args: max(args) if args else None)
+
+    from sqlalchemy.dialects.sqlite import JSON
+    from sqlalchemy.dialects.postgresql import JSONB
+    for table in Base.metadata.tables.values():
+        for col in table.columns:
+            if isinstance(col.type, JSONB):
+                col.type = JSON()
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    session = Session()
+    yield session
+    session.close()

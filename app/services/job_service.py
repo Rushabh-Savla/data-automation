@@ -16,7 +16,7 @@ from app.db.models.job import Job
 from app.db.models.job_source_task import JobSourceTask
 from app.db.repositories.job_repository import JobRepository
 from app.db.repositories.job_source_task_repository import JobSourceTaskRepository
-from app.domain.enums import JOB_SOURCE_TASK_TERMINAL_STATUSES, JobSourceTaskStatus, JobStatus, SourceType
+from app.domain.enums import JOB_SOURCE_TASK_TERMINAL_STATUSES, JobSourceTaskStatus, JobStatus, SourceSelectionMode, SourceType
 from app.domain.state_machine import IllegalTransitionError, JobStateMachine
 from app.services.cancellation_service import CancellationService
 from app.services.progress_service import ProgressPublisher
@@ -110,6 +110,7 @@ class JobService:
         self,
         query: str,
         sources: list[SourceType] | None = None,
+        source_selection_mode: SourceSelectionMode | None = None,
         name: str | None = None,
         target_count: int | None = None,
         deadline_at: datetime | None = None,
@@ -118,17 +119,18 @@ class JobService:
         schedule_timezone: str = "UTC",
         config: dict | None = None,
     ) -> Job:
-        # No sources picked -> fan out across every connector the platform
-        # currently has implemented. This is what makes "just give a query"
-        # actually run on every source automatically, rather than requiring
-        # the caller to know and list connector names up front.
-        was_auto_sourced = not sources
-        if not sources:
-            sources = sorted(get_implemented_sources() - _EXPLICIT_ONLY_SOURCES, key=lambda s: s.value)
-            if not sources:
-                raise ValueError("No source connectors are implemented yet")
+        from app.services.source_dispatch_service import SourceDispatchService
+
+        resolved_sources, effective_mode = SourceDispatchService.resolve_sources(
+            requested_sources=sources,
+            selection_mode=source_selection_mode,
+            db=self.db,
+        )
+        was_auto_sourced = (effective_mode != SourceSelectionMode.MANUAL)
+        sources = resolved_sources
 
         job_config = dict(config or {})
+        job_config["source_selection_mode"] = effective_mode.value
 
         # Fast path: for a small auto-sourced target count, dispatching every
         # connector at once wastes time — Kaggle/Roboflow pull whole datasets
@@ -193,8 +195,22 @@ class JobService:
         JobRepository.apply_status_timestamps(job, job.status)
         self.db.flush()
 
+        # Ensure active batch and initial candidate window are ready before workers start
+        try:
+            from app.tasks.batch_orchestration import BatchOrchestrator
+            from app.services.candidate_reservation_service import ensure_candidate_window
+            orchestrator = BatchOrchestrator(self.db, job.id)
+            batch = orchestrator.get_or_create_active_batch()
+            if batch is not None:
+                ensure_candidate_window(self.db, batch)
+        except Exception as exc:
+            logger.warning(f"Initial batch/window creation warning: {exc}")
+
         dispatched_any = False
+        allowed_sources = set(job.sources or [])
         for task in self.task_repo.list_for_job(job_id):
+            if task.source_type not in allowed_sources:
+                continue
             task_path = _SOURCE_DISCOVERY_TASKS.get(SourceType(task.source_type))
             if task_path is None:
                 self.task_repo.set_status(
@@ -233,8 +249,11 @@ class JobService:
         self.cancellation.clear_paused(str(job_id))
         self.db.flush()
 
+        allowed_sources = set(job.sources or [])
         for task in self.task_repo.list_for_job(job_id):
             if task.status in JOB_SOURCE_TASK_TERMINAL_STATUSES:
+                continue
+            if task.source_type not in allowed_sources:
                 continue
             source_type = SourceType(task.source_type)
             if _resume_pending_items(source_type, str(job_id), str(task.id), task.checkpoint):
@@ -275,9 +294,12 @@ class JobService:
         job.config = {k: v for k, v in (job.config or {}).items() if k != "_topup"}
         self.db.flush()
 
+        allowed_sources = set(job.sources or [])
         for task in self.task_repo.list_for_job(job_id):
             if task.status not in JOB_SOURCE_TASK_TERMINAL_STATUSES:
                 continue  # still actively working (e.g. a slower sibling source) -- leave it alone
+            if task.source_type not in allowed_sources:
+                continue
             source_type = SourceType(task.source_type)
             task_path = _SOURCE_DISCOVERY_TASKS.get(source_type)
             if task_path is None:

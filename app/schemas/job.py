@@ -6,7 +6,7 @@ from datetime import datetime
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from app.domain.enums import JobCompletionReason, JobSourceTaskStatus, JobStatus, SourceType
+from app.domain.enums import JobCompletionReason, JobSourceTaskStatus, JobStatus, SourceSelectionMode, SourceType
 
 # Discovery/download stops as soon as target_count is hit, but the overfetch
 # buffer (see target_overfetch_buffer in app/core/config.py) means
@@ -28,6 +28,10 @@ class JobCreateRequest(BaseModel):
             "connector — the platform default, so a user only has to supply "
             "a query, not pick sources by hand."
         ),
+    )
+    source_selection_mode: SourceSelectionMode | None = Field(
+        default=None,
+        description="Source selection strategy: manual, auto, or random.",
     )
     name: str = Field(..., min_length=1, description="Job name — also used to name its NAS storage folder")
     target_count: int | None = Field(default=None, gt=0)
@@ -103,6 +107,7 @@ class JobSourceTaskResponse(BaseModel):
     discovered_count: int
     downloaded_count: int
     accepted_count: int
+    relevance_accepted_count: int = 0
     rejected_count: int
     error_count: int
     error_message: str | None
@@ -127,6 +132,7 @@ class JobResponse(BaseModel):
     name: str | None
     query: str
     sources: list[str]
+    source_selection_mode: SourceSelectionMode = SourceSelectionMode.MANUAL
     target_count: int | None
     deadline_at: datetime | None
     scheduled_start_at: datetime | None
@@ -135,8 +141,15 @@ class JobResponse(BaseModel):
     discovered_count: int
     downloaded_count: int
     accepted_count: int
+    relevance_accepted_count: int = 0
     rejected_count: int
     duplicate_count: int
+    review_pending_count: int = 0
+    retry_pending_count: int = 0
+    upload_pending_count: int = 0
+    uploading_count: int = 0
+    nas_verified_count: int = 0
+    completed_count: int = 0
     error_message: str | None
     created_at: datetime
     updated_at: datetime
@@ -202,12 +215,20 @@ class JobDetailResponse(JobResponse):
 class JobProgressResponse(BaseModel):
     job_id: uuid.UUID
     status: JobStatus
+    source_selection_mode: SourceSelectionMode = SourceSelectionMode.MANUAL
     target_count: int | None
     accepted_count: int
+    relevance_accepted_count: int = 0
     rejected_count: int
     duplicate_count: int
     discovered_count: int
     downloaded_count: int
+    review_pending_count: int = 0
+    retry_pending_count: int = 0
+    upload_pending_count: int = 0
+    uploading_count: int = 0
+    nas_verified_count: int = 0
+    completed_count: int = 0
     filtering_in_progress: bool = False
     source_tasks: list[JobSourceTaskResponse] = Field(default_factory=list)
 

@@ -37,10 +37,7 @@ const optionalNumberString = z
 export const jobCreateSchema = z
   .object({
     query: z.string().min(1, 'Tell us what you want to collect'),
-    name: z
-      .string()
-      .min(1, 'Job name is required')
-      .refine((v) => v.trim().length > 0, { message: 'Job name is required' }),
+    name: z.string().optional(),
 
     useAutoSources: z.boolean(),
     sources: z.array(

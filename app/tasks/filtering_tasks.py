@@ -145,6 +145,11 @@ def run_relevance_filter(self, job_id: str):
         batch_size = job.config.get("relevance_filter_batch_size", _DEFAULT_RELEVANCE_BATCH_SIZE)
 
     redis_client = get_redis()
+    in_progress_key = f"job:{job_id}:filtering_in_progress"
+    if not redis_client.set(in_progress_key, "1", nx=True, ex=1800):
+        logger.info(f"Filtering already in progress for job {job_id}; skipping duplicate dispatch")
+        return
+
     # Clear any guard left behind by a previous pass, otherwise a re-drive
     # would arm the barrier and then have its finalize suppressed. This has to
     # happen before the no-candidates early return below as well: a top-up
@@ -158,6 +163,7 @@ def run_relevance_filter(self, job_id: str):
         # Nothing left to classify — still go through finalize so a job whose
         # assets were all filtered by a previous (crashed) pass reaches dedup
         # and completion instead of stopping here.
+        redis_client.delete(in_progress_key)
         finalize_relevance_filter.delay(job_id)
         return
 
@@ -180,23 +186,12 @@ def run_relevance_filter(self, job_id: str):
         relevance_filter_batch.delay(job_id, batch)
 
 
-# Outcome of the relevance decision for one asset. "error" is a distinct
-# third state on purpose: it must never be conflated with a genuine "no",
-# because a rejection deletes the file. Previously any exception -- a model
-# OOM, a transient read failure -- set vlm_pass=False and the image was
-# destroyed as if the model had confidently judged it irrelevant.
+# Outcome of the relevance decision for one asset.
+# "review" (REVIEW_PENDING) and "error" (RETRY_PENDING) are distinct non-destructive states:
+# they must never be conflated with a genuine "no", because a rejection deletes the file.
 _ACCEPT = "accept"
 _REJECT = "reject"
-_ERROR = "error"
-
-
-# Outcome of the relevance decision for one asset. "error" is a distinct
-# third state on purpose: it must never be conflated with a genuine "no",
-# because a rejection deletes the file. Previously any exception -- a model
-# OOM, a transient read failure -- was recorded as a rejection and the image
-# was destroyed as if the model had confidently judged it irrelevant.
-_ACCEPT = "accept"
-_REJECT = "reject"
+_REVIEW = "review"
 _ERROR = "error"
 
 
@@ -204,59 +199,75 @@ def _classify_batch(
     job_query: str,
     items: list[tuple[str, str]],
 ) -> list[tuple[str, str, float | None]]:
-    """Decides relevance for (asset_id, nas_path) pairs.
+    """Decides relevance for (asset_id, nas_path) pairs using TinyVLM.
 
-    Returns (asset_id, outcome, score) where outcome is _ACCEPT / _REJECT /
-    _ERROR. `score` is 1.0 / 0.0 / None -- the VLM gives a verdict, not a
-    calibrated probability, and recording a fabricated confidence is what
-    made the previous implementation so misleading: it showed "95.2%" next to
-    images containing no weapon at all.
-
-    A single model decides, on the whole frame. The previous cascade scored a
-    CLIP embedding first and escalated only an uncertain middle band, which
-    sounds cheaper but measured a separation of +0.007 between real weapons
-    and briefcases -- so the band never fired and everything was accepted.
-    See app/filtering/vlm_filter.py for the full measurement.
-
-    Kept out of the task body so the expensive work cannot hold a database
-    transaction: an hour of idle-in-transaction is what let the
-    inherited-socket fork bug surface as a mid-batch OperationalError."""
+    Returns (asset_id, outcome, score) where outcome is _ACCEPT / _REJECT / _REVIEW / _ERROR.
+    `score` is 1.0 (accept) / 0.0 (reject) / 0.5 (review) / None (error).
+    """
     from app.filtering import query_expansion
-    from app.filtering.vlm_filter import VisualVerifier
+    from app.filtering.vlm_filter import VisualVerifier, VlmVerdict
 
     if not items:
         return []
 
-    # "car and person" is a request for either class, not for one thing that is
-    # both -- see query_expansion.query_subjects. Most queries are a single subject.
-    subjects = query_expansion.query_subjects(job_query)
-
     try:
         verifier = VisualVerifier()
         logger.info(
-            f"[VLM RELEVANCY] Using model '{verifier.model_id}' to evaluate {len(items)} asset(s) for subjects: {subjects!r}"
+            f"[TinyVLM RELEVANCY] Using model '{verifier.model_id}' to evaluate {len(items)} asset(s) for query: {job_query!r}"
         )
     except Exception:
-        # The gate itself is unusable. Every asset becomes _ERROR so it stays
-        # PROMOTED for a later pass, rather than being deleted because a model
-        # failed to load.
-        logger.exception(f"[VLM RELEVANCY] Relevance model unavailable; deferring {len(items)} asset(s)")
+        # The gate itself is unusable. Every asset becomes _ERROR (RETRY_PENDING) so it stays
+        # preserved for a later pass, rather than being deleted because a model failed to load.
+        logger.exception(f"[TinyVLM RELEVANCY] Model unavailable; deferring {len(items)} asset(s) to RETRY_PENDING")
         return [(asset_id, _ERROR, None) for asset_id, _ in items]
 
-    verdicts = verifier.verify_batch_any([path for _, path in items], subjects)
+    paths = [item[1] for item in items]
+    fingerprints = [item[2] if len(item) > 2 else None for item in items]
 
-    decisions: list[tuple[str, str, float | None]] = []
-    for (asset_id, _path), verdict in zip(items, verdicts):
-        if verdict is None:
-            decisions.append((asset_id, _ERROR, None))
-        elif verdict:
-            decisions.append((asset_id, _ACCEPT, 1.0))
+    # Explicit boolean query parsing (AND / OR) vs standard subject expansion
+    if " AND " in job_query or " OR " in job_query:
+        verdicts = verifier.verify_query_complex(paths, job_query)
+        decisions: list[tuple[str, str, float | None]] = []
+        for item, v in zip(items, verdicts):
+            asset_id = item[0]
+            if v == VlmVerdict.YES:
+                decisions.append((asset_id, _ACCEPT, 1.0))
+            elif v == VlmVerdict.NO:
+                decisions.append((asset_id, _REJECT, 0.0))
+            elif v == VlmVerdict.UNCERTAIN:
+                decisions.append((asset_id, _REVIEW, 0.5))
+            else:
+                decisions.append((asset_id, _ERROR, None))
+    else:
+        subjects = query_expansion.query_subjects(job_query)
+        if len(subjects) == 1:
+            verdicts = verifier.verify_batch_verdicts(paths, subjects[0], fingerprints=fingerprints)
+            decisions = []
+            for item, v in zip(items, verdicts):
+                asset_id = item[0]
+                if v == VlmVerdict.YES:
+                    decisions.append((asset_id, _ACCEPT, 1.0))
+                elif v == VlmVerdict.NO:
+                    decisions.append((asset_id, _REJECT, 0.0))
+                elif v == VlmVerdict.UNCERTAIN:
+                    decisions.append((asset_id, _REVIEW, 0.5))
+                else:
+                    decisions.append((asset_id, _ERROR, None))
         else:
-            decisions.append((asset_id, _REJECT, 0.0))
+            verdicts = verifier.verify_batch_any(paths, subjects)
+            decisions = []
+            for item, verdict in zip(items, verdicts):
+                asset_id = item[0]
+                if verdict is None:
+                    decisions.append((asset_id, _REVIEW, 0.5))
+                elif verdict:
+                    decisions.append((asset_id, _ACCEPT, 1.0))
+                else:
+                    decisions.append((asset_id, _REJECT, 0.0))
 
     accepted = sum(1 for _, o, _ in decisions if o == _ACCEPT)
     logger.info(
-        f"[VLM RELEVANCY] Model '{verifier.model_id}' completed evaluation ({subjects!r}): {accepted}/{len(decisions)} accepted"
+        f"[TinyVLM RELEVANCY] Model '{verifier.model_id}' completed evaluation: {accepted}/{len(decisions)} accepted"
     )
     return decisions
 
@@ -340,7 +351,7 @@ def relevance_filter_batch(self, job_id: str, asset_ids: list[str]) -> dict:
     that decrements the FanIn barrier, because a batch that dies without
     decrementing would leave the barrier permanently short of zero and the
     job would never finalize — the exact failure this design replaced."""
-    passed = rejected = errored = 0
+    passed = rejected = review_pending = errored = 0
     error: str | None = None
 
     try:
@@ -355,7 +366,7 @@ def relevance_filter_batch(self, job_id: str, asset_ids: list[str]) -> dict:
             asset_repo = AssetRepository(db)
             job = job_repo.get(job_uuid)
             if job is None:
-                return {"passed": 0, "rejected": 0}
+                return {"passed": 0, "rejected": 0, "review_pending": 0, "retry_pending": 0}
 
             query = job.query
             items: list[tuple[str, str]] = []
@@ -376,11 +387,14 @@ def relevance_filter_batch(self, job_id: str, asset_ids: list[str]) -> dict:
                 if asset.status != AssetStatus.PROMOTED:
                     continue
                 try:
-                    items.append((asset_id_str, asset_files.local_path_for_read(str(asset.nas_path))))
+                    sha = getattr(asset, "checksum_sha256", None)
+                    items.append((asset_id_str, asset_files.local_path_for_read(str(asset.nas_path)), sha))
                 except (FileNotFoundError, asset_files.NasUnreachable) as e:
-                    # Image is on the NAS and could not be fetched right now: leave it
-                    # PROMOTED for a later pass rather than judge it blind.
-                    logger.warning(f"Skipping asset {asset_id_str}: {e}")
+                    # Image is on the NAS and could not be fetched right now: mark RETRY_PENDING
+                    # rather than judge it blind or delete it.
+                    logger.warning(f"Deferring asset {asset_id_str} to RETRY_PENDING: {e}")
+                    asset_repo.set_status(uuid.UUID(asset_id_str), AssetStatus.RETRY_PENDING)
+                    errored += 1
 
         # -- Inference phase: NO session held. -----------------------------
         decisions = _classify_batch(query, items)
@@ -395,14 +409,22 @@ def relevance_filter_batch(self, job_id: str, asset_ids: list[str]) -> dict:
                 for asset_id_str, outcome, score in chunk:
                     asset_uuid = uuid.UUID(asset_id_str)
                     if outcome == _ERROR:
-                        # We could not decide. Leave the asset PROMOTED so a
-                        # later pass reconsiders it, keep its file, and touch
-                        # no counters. Deleting here — which is what the old
-                        # fail-closed path did — destroyed images whenever a
-                        # model merely failed to load.
+                        # Model error / CUDA OOM / corrupt file: mark RETRY_PENDING.
+                        # File is preserved, never destroyed.
+                        asset_repo.set_status(
+                            asset_uuid, AssetStatus.RETRY_PENDING, relevance_score=score
+                        )
                         errored += 1
                         continue
-                    if outcome == _ACCEPT:
+                    elif outcome == _REVIEW:
+                        # Ambiguous outcome: mark REVIEW_PENDING for human inspection.
+                        # File is preserved.
+                        asset_repo.set_status(
+                            asset_uuid, AssetStatus.REVIEW_PENDING, relevance_score=score
+                        )
+                        review_pending += 1
+                        continue
+                    elif outcome == _ACCEPT:
                         asset_repo.set_status(
                             asset_uuid, AssetStatus.RELEVANCE_PASSED, relevance_score=score
                         )
@@ -414,17 +436,12 @@ def relevance_filter_batch(self, job_id: str, asset_ids: list[str]) -> dict:
                             asset_uuid, AssetStatus.RELEVANCE_REJECTED, relevance_score=score
                         )
                         # Only the relevant/filtered set should ever sit on NAS —
-                        # delete the file now that it's known to be irrelevant,
-                        # rather than leaving it orphaned forever (see
-                        # delete_asset_files' docstring).
+                        # delete the file now that it's known to be irrelevant.
                         if asset is not None:
                             delete_asset_files(asset)
-                        # This asset was already counted in job.accepted_count at
-                        # promotion time (the target_count fast-path needs a running
-                        # count before filtering can possibly have run) — correct it
-                        # now that we know it's actually irrelevant.
-                        job_repo.increment_counts(job_uuid, accepted=-1, rejected=1)
                         rejected += 1
+                if hasattr(db, "get"):
+                    reconcile(db, job_uuid)
 
             # Accumulate passed IDs in Redis; the upload fires once ALL batches for
             # this job are done (see finalize_relevance_filter / schedule_offload_for_job).
@@ -471,24 +488,34 @@ def relevance_filter_batch(self, job_id: str, asset_ids: list[str]) -> dict:
     finally:
         ProgressPublisher(get_redis()).publish(
             job_id,
-            {"type": "relevance_filter_progress", "passed": passed, "rejected": rejected},
+            {
+                "type": "relevance_filter_progress",
+                "passed": passed,
+                "rejected": rejected,
+                "review_pending": review_pending,
+                "retry_pending": errored,
+            },
         )
         last_batch_out = FanIn(get_redis()).finish(job_id, _FANIN_NAME) <= 0
         # Also hand on when nothing is left awaiting a verdict, even if the counter is not at
         # zero. A restart kills batches in flight; Celery re-delivers enough of them that every
         # asset does get judged, but the killed ones never decremented, so the counter never
-        # reached zero and the job sat idle until the watchdog's timer ended it (a COCO job:
-        # all 1507 images judged at 12:17, completed at 12:48). Finalize is guarded against
-        # running twice, so an extra trigger is harmless.
+        # reached zero and the job sat idle until the watchdog's timer ended it.
         if last_batch_out or _all_assets_judged(job_id):
             finalize_relevance_filter.delay(job_id)
 
-    if errored:
-        logger.warning(
-            f"{errored} asset(s) in this batch could not be decided and were left "
-            f"PROMOTED for a later pass (job {job_id})"
+    if errored or review_pending:
+        logger.info(
+            f"Batch completed for job {job_id}: {passed} passed, {rejected} rejected, "
+            f"{review_pending} review_pending, {errored} retry_pending"
         )
-    return {"passed": passed, "rejected": rejected, "errored": errored, "error": error}
+    return {
+        "passed": passed,
+        "rejected": rejected,
+        "review_pending": review_pending,
+        "errored": errored,
+        "error": error,
+    }
 
 
 @celery_app.task(name="app.tasks.filtering_tasks.finalize_relevance_filter", bind=True)
@@ -513,6 +540,7 @@ def finalize_relevance_filter(self, job_id: str):
         return
 
     FanIn(redis_client).clear(job_id, _FANIN_NAME)
+    redis_client.delete(f"job:{job_id}:filtering_in_progress")
 
     job_uuid = uuid.UUID(job_id)
     with session_scope() as db:
@@ -537,6 +565,11 @@ def finalize_relevance_filter(self, job_id: str):
 
 @celery_app.task(name="app.tasks.filtering_tasks.run_deduplication", bind=True)
 def run_deduplication(self, job_id: str):
+    from pathlib import Path
+    from app.filtering.canonical_selector import CanonicalSelector
+    from app.filtering.cross_batch_dedup import CrossBatchDeduplicator
+    from app.storage.asset_files import local_path_for_read
+
     job_uuid = uuid.UUID(job_id)
 
     with session_scope() as db:
@@ -547,32 +580,56 @@ def run_deduplication(self, job_id: str):
             return
 
         assets = asset_repo.list_for_dedup(job_uuid)
-        pairs = [(str(a.id), a.phash, a.embedding) for a in assets]
-
-        deduper = HybridDeduplicator(
-            hamming_threshold=job.config.get("dedup_hamming_threshold", 5),
-            cosine_threshold=job.config.get("dedup_cosine_threshold", 0.97),
-        )
-        groups = deduper.find_duplicate_groups(pairs)
-
+        cross_dedup = CrossBatchDeduplicator(db)
         duplicate_count = 0
-        for group in groups:
-            for dup_id in group.duplicate_asset_ids:
-                dup_asset = asset_repo.get(uuid.UUID(dup_id))
-                asset_repo.set_status(
-                    uuid.UUID(dup_id), AssetStatus.DUPLICATE, is_duplicate_of=uuid.UUID(group.keep_asset_id)
-                )
-                # Only the kept (non-duplicate) copy should remain on NAS.
-                if dup_asset is not None:
-                    delete_asset_files(dup_asset)
+
+        # Level 1: Fast SHA256 index lookup
+        sha_map: dict[str, Asset] = {}
+        for a in assets:
+            if not a.checksum_sha256:
+                continue
+            if a.checksum_sha256 in sha_map:
+                existing = sha_map[a.checksum_sha256]
+                winner, loser = CanonicalSelector.select_canonical(existing, a)
+                CanonicalSelector.apply_duplicate_relationship(winner, loser)
+                sha_map[a.checksum_sha256] = winner
+                delete_asset_files(loser)
                 duplicate_count += 1
+            else:
+                sha_map[a.checksum_sha256] = a
+
+        # Level 3/4/5: Perceptual, Semantic and Structural Verification
+        active_assets = [a for a in assets if a.status != AssetStatus.DUPLICATE]
+        for a in active_assets:
+            local_path = None
+            if a.nas_path:
+                try:
+                    local_path = Path(local_path_for_read(str(a.nas_path)))
+                except Exception:
+                    local_path = None
+
+            res = cross_dedup.deduplicate_candidate(
+                job_id=job_uuid,
+                candidate_id=a.id,
+                candidate_phash=a.phash,
+                candidate_embedding=a.embedding,
+                candidate_file_or_buffer=local_path,
+            )
+            if res.is_duplicate and res.duplicate_of_id and res.duplicate_of_id != a.id:
+                canonical = asset_repo.get(res.duplicate_of_id)
+                if canonical:
+                    winner, loser = CanonicalSelector.select_canonical(canonical, a)
+                    CanonicalSelector.apply_duplicate_relationship(winner, loser)
+                    if loser.id == a.id:
+                        delete_asset_files(loser)
+                        duplicate_count += 1
 
         db.flush()
         # Derived rather than hand-decremented: the DUPLICATE status written
         # above is the fact, and reconcile reads it back for both rollups.
         reconcile(db, job_uuid)
         db.flush()
-        logger.info(f"Dedup for job {job_id}: {duplicate_count} duplicates found across {len(groups)} group(s)")
+        logger.info(f"Intelligent dedup for job {job_id}: {duplicate_count} confirmed duplicate(s)")
 
     ProgressPublisher(get_redis()).publish(job_id, {"type": "dedup_complete", "duplicate_count": duplicate_count})
 
@@ -581,6 +638,11 @@ def run_deduplication(self, job_id: str):
     # the next round is trying to build, and would make a job oscillate around
     # its target instead of converging on it. The planner runs the trim on the
     # final round, once no further rounds are coming.
+    # Trigger batch orchestration progress check to coordinate 600-item batch replenishment
+    from app.tasks.batch_orchestration import process_active_batch
+
+    process_active_batch.delay(job_id)
+
     from app.tasks.orchestration_tasks import plan_topup_round
 
     plan_topup_round.delay(job_id)

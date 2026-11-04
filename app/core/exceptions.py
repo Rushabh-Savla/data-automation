@@ -53,6 +53,24 @@ class JobTargetReached(JobStopped):
     completion_reason is computed separately by JobCompletionEvaluator."""
 
 
+class CandidateWindowFull(JobStopped):
+    """The current candidate window has no remaining admission capacity."""
+
+    def __init__(
+        self,
+        window_id: str | None,
+        window_index: int | None,
+        checkpoint_index: int,
+    ):
+        self.window_id = str(window_id) if window_id is not None else None
+        self.window_index = int(window_index) if window_index is not None else None
+        self.checkpoint_index = int(checkpoint_index)
+        super().__init__(
+            f"Candidate window {self.window_id} is full at source index "
+            f"{self.checkpoint_index}"
+        )
+
+
 class StorageError(Exception):
     """Failure writing to / reading from the configured StorageBackend."""
 

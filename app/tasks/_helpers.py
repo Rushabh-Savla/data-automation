@@ -87,14 +87,24 @@ def heartbeat_during(task_uuid: uuid.UUID):
 
 def build_should_stop(job_id: uuid.UUID, job_source_task_id: uuid.UUID | None = None) -> Callable[[], bool]:
     """Returns True if the job has been paused, cancelled, has already
-    reached its target_count (see build_on_progress's fast-path check), or —
-    when job_source_task_id is given — this one source has hit its own
-    fair-share cap while other selected sources are still working."""
+    reached its target_count (see build_on_progress's fast-path check),
+    this one source has hit its fair-share cap, or local staging disk usage
+    exceeds the high watermark (80%) backpressure threshold."""
+    from app.storage.ram_buffer import LocalStagingManager
+
     cancellation = CancellationService(get_redis())
     source_task_str = str(job_source_task_id) if job_source_task_id is not None else None
+    staging_manager = LocalStagingManager()
 
     def should_stop() -> bool:
-        return cancellation.should_stop(str(job_id), source_task_str)
+        if cancellation.should_stop(str(job_id), source_task_str):
+            return True
+        if staging_manager.is_staging_backpressure_active():
+            logger.warning(
+                f"[STAGING BACKPRESSURE] Halting download for job {job_id} — local staging disk is above high watermark (80%)"
+            )
+            return True
+        return False
 
     return should_stop
 
@@ -102,12 +112,20 @@ def build_should_stop(job_id: uuid.UUID, job_source_task_id: uuid.UUID | None = 
 def build_on_progress(
     db: Session, job_id: uuid.UUID, job_source_task_id: uuid.UUID
 ) -> Callable[[dict], None]:
+    import time
+    from sqlalchemy.exc import OperationalError
+
     task_repo = JobSourceTaskRepository(db)
     job_repo = JobRepository(db)
     publisher = ProgressPublisher(get_redis())
     cancellation = CancellationService(get_redis())
 
+    update_count = 0
+    last_commit_time = time.monotonic()
+
     def on_progress(delta: dict) -> None:
+        nonlocal update_count, last_commit_time
+
         checkpoint_delta = delta.get("checkpoint")
         if checkpoint_delta is not None:
             # Shallow-merge into the existing checkpoint dict rather than
@@ -121,14 +139,10 @@ def build_on_progress(
             task_repo.heartbeat(job_source_task_id, checkpoint=merged)
         else:
             task_repo.heartbeat(job_source_task_id)
-        task_repo.increment_counts(
-            job_source_task_id,
-            discovered=delta.get("discovered", 0),
-            downloaded=delta.get("downloaded", 0),
-            accepted=delta.get("accepted", 0),
-            rejected=delta.get("rejected", 0),
-            errors=delta.get("errors", 0),
-        )
+
+        # STRICT LOCK ORDERING: ALWAYS update Job first, then JobSourceTask.
+        # Consistent lock acquisition order eliminates deadlock (Postgres 40P01)
+        # under concurrent worker execution.
         job_repo.increment_counts(
             job_id,
             discovered=delta.get("discovered", 0),
@@ -137,18 +151,37 @@ def build_on_progress(
             rejected=delta.get("rejected", 0),
             duplicate=delta.get("duplicate", 0),
         )
-        # Commit (not just flush) on every progress event, not only when the
-        # enclosing task returns. A single ingest task's session_scope() can
-        # stay open for a long, uninterrupted run (thousands of images); if
-        # counters/checkpoint/heartbeat only became durable at task-return
-        # time, (a) REST poll / DB-reading consumers would see stale counts
-        # for the whole run instead of live progress, and (b) a mid-task
-        # crash would roll back *all* of that run's progress instead of just
-        # the item in flight when it died. Each Asset row is already
-        # committed per-item in its own session (see
-        # standardize_and_promote_sync) — this brings the JobSourceTask/Job
-        # rollups and checkpoint to the same durability granularity.
-        db.commit()
+        task_repo.increment_counts(
+            job_source_task_id,
+            discovered=delta.get("discovered", 0),
+            downloaded=delta.get("downloaded", 0),
+            accepted=delta.get("accepted", 0),
+            rejected=delta.get("rejected", 0),
+            errors=delta.get("errors", 0),
+        )
+
+        update_count += 1
+        now = time.monotonic()
+        should_commit = (
+            checkpoint_delta is not None
+            or delta.get("errors", 0) > 0
+            or update_count >= 10
+            or (now - last_commit_time) >= 2.0
+        )
+
+        if should_commit:
+            update_count = 0
+            last_commit_time = now
+            for attempt in range(3):
+                try:
+                    db.commit()
+                    break
+                except OperationalError as exc:
+                    db.rollback()
+                    if attempt == 2:
+                        logger.warning(f"Failed to commit progress for task {job_source_task_id}: {exc}")
+                        raise
+                    time.sleep(0.05 * (2 ** attempt))
 
         # Fast-path completion check: as soon as a count-based job's
         # (buffered) target is hit, flag it so should_stop() (checked by
@@ -166,30 +199,28 @@ def build_on_progress(
         if delta.get("accepted"):
             job = job_repo.get(job_id)
             if job is not None and job.target_count is not None:
-                # On a top-up round the planner has already measured this
-                # query's real post-filter yield and sized the round from it.
-                # Use that number rather than the static buffer, which is only
-                # a first-round prior -- a query whose survivors are 14% of
-                # what it downloads needs roughly 7x, and no fixed multiplier
-                # expresses that.
+                # If batch processing is enabled for this job (default), the candidate window
+                # bounds each round to download_candidate_window (e.g. 600) rather than downloading
+                # the entire job target (e.g. 5000) upfront.
+                batch_mode = job.config.get("batch_mode", True)
                 topup_state = (job.config or {}).get("_topup") or {}
                 topup_quota = topup_state.get("quota") or {}
                 if topup_quota:
-                    # Anchored to a fixed baseline captured once when the
-                    # round was dispatched (plan_topup_round), NOT the live
-                    # job.accepted_count read here — that field grows with
-                    # every accepted image in this same round, so comparing
-                    # against "current + quota" recomputed on every call is a
-                    # moving target that can never be reached (quota is
-                    # always positive), and the topup round never stops
-                    # itself. Falling back to the live count only covers a
-                    # job.config predating this baseline field.
                     baseline = topup_state.get("raw_accepted_at_round_start", job.accepted_count)
                     target = baseline + sum(topup_quota.values())
+                elif batch_mode:
+                    # Bounded candidate window: stop this round once the current batch window is reached
+                    candidate_window = job.config.get("candidate_window", get_settings().download_candidate_window)
+                    # Current round target is capped to candidate window or remaining job target
+                    active_batch_target = min(candidate_window, job.target_count)
+                    target = buffered_target(active_batch_target, get_settings().target_overfetch_buffer)
                 else:
                     target = buffered_target(job.target_count, get_settings().target_overfetch_buffer)
                 if job.accepted_count >= target:
                     cancellation.mark_target_reached(str(job_id))
+                    # Trigger processing of the acquired candidate window immediately without waiting for slow sources
+                    from app.tasks.orchestration_tasks import check_and_advance_job
+                    check_and_advance_job(str(job_id))
                 else:
                     # Per-source fair-share cap: without this, whichever
                     # source happens to be fastest (e.g. its data was

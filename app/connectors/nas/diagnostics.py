@@ -16,10 +16,9 @@ from pathlib import Path
 from app.connectors.nas.base import (
     IMAGE_EXTENSIONS,
     NasClient,
-    NasNotFoundError,
     NasConnectionParams,
+    NasNotFoundError,
     join_relpath,
-    normalize_relpath,
     open_client,
 )
 from app.core.exceptions import ConnectorError
@@ -63,15 +62,79 @@ def run_connection_test(params: NasConnectionParams, require_write: bool = False
         client.connect()
     except ConnectorError as exc:
         return NasTestOutcome(ok=False, message=params.redact(str(exc)))
-    except Exception as exc:  # never let an adapter bug surface as a 500 with internals
+    except Exception as exc:  # noqa: BLE001 # never let an adapter bug surface as a 500 with internals
         return NasTestOutcome(ok=False, message=params.redact(f"Unexpected error: {type(exc).__name__}"))
 
-    outcome = NasTestOutcome(ok=True)
+    latency_ms = int((time.monotonic() - started) * 1000)
     try:
-        outcome.latency_ms = int((time.monotonic() - started) * 1000)
-        outcome.can_read = True
-        outcome.can_write = True
-        outcome.message = f"Connected to {params.protocol.upper()} NAS server successfully."
+        # 1. Test reading source folder
+        can_read = False
+        sample_files: list[str] = []
+        read_err: str | None = None
+        try:
+            for rf in client.walk(
+                rel=params.base_path,
+                recursive=True,
+                extensions=IMAGE_EXTENSIONS,
+                max_files=_SAMPLE_LIMIT,
+                max_dirs=_PROBE_DIR_BUDGET,
+            ):
+                sample_files.append(rf.path)
+            can_read = True
+        except NasNotFoundError as exc:
+            can_read = False
+            read_err = f"Source folder '{params.base_path}' not found: {exc}"
+        except Exception as exc:  # noqa: BLE001
+            can_read = False
+            read_err = f"Could not read source folder '{params.base_path}': {exc}"
+
+        # 2. Test writing storage folder
+        can_write = False
+        write_err: str | None = None
+        try:
+            _probe_write(client, params.storage_path)
+            can_write = True
+        except Exception as exc:  # noqa: BLE001
+            can_write = False
+            write_err = f"cannot write to storage folder '{params.storage_path}': {exc}"
+
+        # 3. Determine overall success (ok) and message
+        if require_write:
+            ok = can_write
+        else:
+            ok = can_read
+
+        messages: list[str] = []
+        if can_read and can_write:
+            if not sample_files:
+                messages.append("Source folder contains no images.")
+            messages.append("Share can be read and written.")
+        elif can_read and not can_write:
+            if require_write:
+                messages.append(write_err or "cannot write to storage folder")
+            else:
+                if not sample_files:
+                    messages.append("Source folder contains no images.")
+                messages.append("Source folder can be read.")
+        elif not can_read and can_write:
+            if read_err:
+                messages.append(read_err)
+            else:
+                messages.append(f"Source folder '{params.base_path}' not found")
+        else:
+            if read_err:
+                messages.append(read_err)
+            if write_err:
+                messages.append(write_err)
+
+        final_msg = params.redact(" ".join(messages))
+        return NasTestOutcome(
+            ok=ok,
+            can_read=can_read,
+            can_write=can_write,
+            message=final_msg,
+            latency_ms=latency_ms,
+            sample_files=sample_files,
+        )
     finally:
         client.close()
-    return outcome

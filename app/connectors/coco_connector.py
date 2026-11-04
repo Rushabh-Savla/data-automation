@@ -404,8 +404,10 @@ class CocoConnector:
         checkpoint: dict,
         should_stop: ShouldStopFn,
         on_progress: OnProgressFn,
+        admit_candidate=None,
     ) -> Iterator[RawAssetDraft]:
         from PIL import Image
+        from app.core.exceptions import CandidateWindowFull
 
         split = item.external_ref.get("split", self.split)
         image_ids = item.external_ref["image_ids"]
@@ -438,46 +440,148 @@ class CocoConnector:
         subset_path = workdir / f"coco_subset_{shard_hash}.json"
         subset_path.write_text(json.dumps(subset))
 
-        # Every image not already done is fetched a few at a time, ahead of the walk
-        # below, which then yields them in order exactly as before.
-        start = checkpoint.get("index", 0)
+        # Candidate admission happens BEFORE a download future is submitted.
+        # Only candidates admitted by PostgreSQL enter the thread pool.
+        start = max(0, int(checkpoint.get("index", 0)))
         pool = ThreadPoolExecutor(max_workers=_FETCH_CONCURRENCY)
-        try:
-            downloads = {
-                image_id: pool.submit(
-                    _download_image, images_by_id[image_id].get("coco_url"), workdir / images_by_id[image_id]["file_name"]
-                )
-                for image_id in image_ids[start:]
-                if image_id in images_by_id
-            }
+        downloads = {}
+        admissions = {}
+        duplicate_ids = set()
+        stop_at = None
+        stop_signal = None
 
+        def mark_failed_reservation(admission):
+            reservation_id = getattr(admission, "reservation_id", None)
+            if reservation_id is None:
+                return
+            try:
+                from app.services.candidate_reservation_service import mark_candidate_failed
+                mark_candidate_failed(reservation_id)
+            except Exception:
+                logger.exception(
+                    "Could not mark failed COCO reservation %s", reservation_id
+                )
+
+        try:
+            # Reserve first, then submit. If the window fills, no later
+            # candidate is submitted, even if this shard has more images.
             for i, image_id in enumerate(image_ids):
                 if i < start:
                     continue
+
                 if should_stop():
-                    on_progress({"checkpoint": {"index": i}})
-                    raise JobStopped("should_stop() signalled during COCO shard walk")
+                    stop_at = i
+                    stop_signal = JobStopped(
+                        "Job stop requested during COCO candidate admission"
+                    )
+                    break
 
                 image_info = images_by_id.get(image_id)
                 if image_info is None:
+                    continue
+
+                source_item_id = f"coco_{split}_{image_id}"
+                admission = None
+
+                if admit_candidate is not None:
+                    admission = admit_candidate(source_item_id)
+                    raw_status = getattr(admission, "status", "")
+                    status = str(getattr(raw_status, "value", raw_status)).upper()
+
+                    if status == "DUPLICATE":
+                        duplicate_ids.add(image_id)
+                        continue
+
+                    if status == "WINDOW_FULL":
+                        stop_at = i
+                        stop_signal = CandidateWindowFull(
+                            getattr(admission, "window_id", None),
+                            getattr(admission, "window_index", None),
+                            i,
+                        )
+                        break
+
+                    if status != "ADMITTED":
+                        stop_at = i
+                        stop_signal = FatalConnectorError(
+                            f"Candidate admission failed for {source_item_id}: "
+                            f"{status or 'unknown admission status'}"
+                        )
+                        break
+
+                    if (
+                        getattr(admission, "reservation_id", None) is None
+                        or getattr(admission, "window_id", None) is None
+                    ):
+                        stop_at = i
+                        stop_signal = FatalConnectorError(
+                            f"Incomplete reservation metadata for {source_item_id}"
+                        )
+                        break
+
+                    admissions[image_id] = admission
+
+                dest = workdir / image_info["file_name"]
+                downloads[image_id] = pool.submit(
+                    _download_image,
+                    image_info.get("coco_url"),
+                    dest,
+                )
+
+            # Finish all already-admitted candidates before signalling the
+            # window boundary. Never submit candidates beyond stop_at.
+            process_end = stop_at if stop_at is not None else len(image_ids)
+
+            for i in range(start, process_end):
+                image_id = image_ids[i]
+                image_info = images_by_id.get(image_id)
+
+                if image_info is None:
                     on_progress({"rejected": 1})
+                    on_progress({"checkpoint": {"index": i + 1}})
+                    continue
+
+                if image_id in duplicate_ids:
+                    on_progress({"checkpoint": {"index": i + 1}})
+                    continue
+
+                future = downloads.get(image_id)
+                if future is None:
                     continue
 
                 url = image_info.get("coco_url")
                 dest = workdir / image_info["file_name"]
+
                 try:
-                    downloads[image_id].result()
+                    future.result()
                     with Image.open(dest) as img:
                         img.verify()
                     with Image.open(dest) as img:
                         w, h = img.size
+
                     if w < self.min_w or h < self.min_h:
+                        mark_failed_reservation(admissions.get(image_id))
                         on_progress({"rejected": 1})
+                        on_progress({"checkpoint": {"index": i + 1}})
                         continue
-                except Exception as e:
-                    logger.warning(f"COCO image {image_id} download/validation failed: {e}")
+
+                except Exception as exc:
+                    mark_failed_reservation(admissions.get(image_id))
+                    logger.warning(
+                        f"COCO image {image_id} download/validation failed: {exc}"
+                    )
                     on_progress({"rejected": 1})
+                    on_progress({"checkpoint": {"index": i + 1}})
                     continue
+
+                admission = admissions.get(image_id)
+                reservation_metadata = {}
+                if admission is not None:
+                    reservation_metadata = {
+                        "candidate_reservation_id": str(admission.reservation_id),
+                        "candidate_window_id": str(admission.window_id),
+                        "candidate_window_index": int(admission.window_index),
+                    }
 
                 draft = RawAssetDraft(
                     source_item_id=f"coco_{split}_{image_id}",
@@ -490,16 +594,22 @@ class CocoConnector:
                     annotation_format="coco_json",
                     width=w,
                     height=h,
-                    # "vlm": chosen by the relevance model among images the dataset does not label for this
-                    # query, so the boxes here are COCO's other objects, not the queried one.
                     metadata={
                         "coco_image_id": image_id,
                         "split": split,
                         "matched_by": "vlm" if item.external_ref.get("unlabelled") else "label",
+                        **reservation_metadata,
                     },
                 )
                 on_progress({"checkpoint": {"index": i + 1}, "downloaded": 1})
                 yield draft
+
+            if stop_signal is not None:
+                # Resume at the first candidate that was not admitted.
+                on_progress({"checkpoint": {"index": stop_at}})
+                raise stop_signal
+
         finally:
-            # A stop or failure part-way must not wait for, or keep starting, the rest.
-            pool.shutdown(wait=False, cancel_futures=True)
+            # Wait for already-submitted downloads. No unadmitted download
+            # should remain running after the source reports its boundary.
+            pool.shutdown(wait=True, cancel_futures=True)

@@ -8,6 +8,7 @@ do want per-item dispatch, and for standalone testing).
 """
 
 import logging
+import shutil
 import uuid
 
 from app.connectors.base import RawAssetDraft
@@ -17,6 +18,7 @@ from app.db.session import session_scope
 from app.domain.enums import AssetStatus, SourceType
 from app.services.standardization_service import AssetRejected, StandardizationService
 from app.storage.local_filesystem import LocalFilesystemStorage
+from app.storage.ram_buffer import SpooledCandidateBuffer
 from app.tasks.celery_app import celery_app
 
 logger = logging.getLogger(__name__)
@@ -33,17 +35,37 @@ def standardize_and_promote_sync(
     settings = get_settings()
     storage = LocalFilesystemStorage(settings.nas_root)
 
-    with session_scope() as db:
-        asset_repo = AssetRepository(db)
-        service = StandardizationService(asset_repo, storage, min_resolution)
+    # Ensure candidate passes through MemoryManager and SpooledCandidateBuffer
+    created_buffer = False
+    if getattr(draft, "buffer", None) is None and draft.local_tmp_path and draft.local_tmp_path.exists():
         try:
-            asset, created = service.standardize_and_promote(
-                job_id, job_source_task_id, source_type, draft
-            )
-            return asset.status, created
-        except AssetRejected as e:
-            logger.info(f"Rejected asset {draft.source_item_id}: {e}")
-            raise
+            file_size = draft.local_tmp_path.stat().st_size
+            buf = SpooledCandidateBuffer(initial_reservation=file_size)
+            with open(draft.local_tmp_path, "rb") as f_in:
+                shutil.copyfileobj(f_in, buf._file)
+            buf.total_bytes = file_size
+            buf.seek(0)
+            draft.buffer = buf
+            created_buffer = True
+        except Exception as e:
+            logger.debug(f"Could not buffer draft into memory ({e}), using path directly")
+
+    try:
+        with session_scope() as db:
+            asset_repo = AssetRepository(db)
+            service = StandardizationService(asset_repo, storage, min_resolution)
+            try:
+                asset, created = service.standardize_and_promote(
+                    job_id, job_source_task_id, source_type, draft
+                )
+                return asset.status, created
+            except AssetRejected as e:
+                logger.info(f"Rejected asset {draft.source_item_id}: {e}")
+                raise
+    finally:
+        if created_buffer and draft.buffer:
+            draft.buffer.close()
+            draft.buffer = None
 
 
 @celery_app.task(name="app.tasks.standardize_tasks.standardize_and_promote", bind=True)

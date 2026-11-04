@@ -166,6 +166,18 @@ export function NasTestConnectionTab({
                   {testResult.latency_ms !== null ? `${Math.round(testResult.latency_ms)} ms` : 'N/A'}
                 </p>
               </div>
+              <div className="rounded-lg bg-background/80 p-3 shadow-xs">
+                <span className="text-[11px] font-medium text-muted-foreground uppercase">Read Access</span>
+                <p className="text-sm font-semibold text-emerald-600">
+                  {testResult.can_read ? 'Verified (Can read)' : 'Cannot read'}
+                </p>
+              </div>
+              <div className="rounded-lg bg-background/80 p-3 shadow-xs">
+                <span className="text-[11px] font-medium text-muted-foreground uppercase">Write Access</span>
+                <p className="text-sm font-semibold text-emerald-600">
+                  {testResult.can_write ? 'Verified (Can write)' : 'Cannot write'}
+                </p>
+              </div>
             </div>
 
             <div className="text-xs text-emerald-800 dark:text-emerald-200">

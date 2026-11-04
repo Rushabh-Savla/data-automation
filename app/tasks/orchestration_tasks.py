@@ -9,6 +9,8 @@ import logging
 import uuid
 from datetime import datetime, timezone
 
+from sqlalchemy import select
+
 from app.core.config import get_settings
 from app.core.logging import bind_job_context, clear_job_context
 from app.core.redis_client import get_redis
@@ -18,10 +20,17 @@ from app.db.repositories.job_repository import JobRepository
 from app.db.repositories.job_source_task_repository import JobSourceTaskRepository
 from app.db.session import session_scope
 from app.domain.completion import JobCompletionEvaluator, JobSnapshot
-from app.domain.enums import AssetStatus, JobSourceTaskStatus, JobStatus, SourceType
+from app.domain.enums import (
+    AssetStatus,
+    JOB_SOURCE_TASK_TERMINAL_STATUSES,
+    JobSourceTaskStatus,
+    JobStatus,
+    SourceType,
+)
 from app.domain.recovery import is_orphaned, orphan_cutoff
 from app.domain.state_machine import JobStateMachine
 from app.domain.topup import SourceState, TopupPlanner, TopupSnapshot, filtering_incomplete
+from app.tasks._helpers import buffered_target
 from app.services.cancellation_service import CancellationService
 from app.services.progress_service import ProgressPublisher
 from app.services.worker_boot import last_worker_boot
@@ -37,6 +46,7 @@ def on_source_finished(self, results, job_id: str, job_source_task_id: str):
     bind_job_context(job_id, job_source_task_id)
 
     cancellation = CancellationService(get_redis())
+    window_waiting = False
 
     with session_scope() as db:
         task_repo = JobSourceTaskRepository(db)
@@ -47,6 +57,10 @@ def on_source_finished(self, results, job_id: str, job_source_task_id: str):
 
         had_errors = any(isinstance(r, dict) and r.get("error") for r in (results or []))
         had_stopped = any(isinstance(r, dict) and r.get("stopped") for r in (results or []))
+        had_window_full = any(
+            isinstance(r, dict) and r.get("window_full")
+            for r in (results or [])
+        )
 
         # Record which dispatched items (keyed the same way download tasks
         # key their own checkpoint — see _run_item_download) reached a
@@ -59,7 +73,7 @@ def on_source_finished(self, results, job_id: str, job_source_task_id: str):
         # re-running discovery and rebuilding the whole chord (see
         # JobService.resume / _resume_task).
         done_items = {
-            r["item"] for r in (results or []) if isinstance(r, dict) and r.get("item") and not r.get("stopped")
+            r["item"] for r in (results or []) if isinstance(r, dict) and r.get("item") and not r.get("stopped") and not r.get("window_full")
         }
         if done_items:
             existing_completed = set(task.checkpoint.get("_completed_items", []))
@@ -84,6 +98,9 @@ def on_source_finished(self, results, job_id: str, job_source_task_id: str):
 
         if had_stopped and cancellation.is_cancelled(job_id):
             final_status = JobSourceTaskStatus.CANCELLED
+        elif had_window_full:
+            final_status = JobSourceTaskStatus.WINDOW_WAITING
+            window_waiting = True
         elif had_errors:
             final_status = JobSourceTaskStatus.COMPLETED_PARTIAL
         else:
@@ -102,7 +119,13 @@ def on_source_finished(self, results, job_id: str, job_source_task_id: str):
     # tens of thousands of files does not hold up the job's progression.
     from app.tasks.cleanup_tasks import cleanup_local
 
-    cleanup_local.delay(job_source_task_id)
+    if not window_waiting:
+        cleanup_local.delay(job_source_task_id)
+    else:
+        logger.info(
+            f"[WINDOW] Source task {job_source_task_id} is waiting for "
+            "the active candidate window; preserving its work directory."
+        )
 
     check_and_advance_job(job_id)
     clear_job_context()
@@ -149,18 +172,56 @@ def check_and_advance_job(job_id: str) -> None:
     with session_scope() as db:
         task_repo = JobSourceTaskRepository(db)
         job_repo = JobRepository(db)
-        all_terminal = task_repo.all_terminal_for_job(job_uuid)
-        if not all_terminal:
-            return
+        asset_repo = AssetRepository(db)
 
         job = job_repo.get(job_uuid)
-        if job is None:
+        if job is None or job.status not in (JobStatus.RUNNING, JobStatus.DISCOVERING):
+            return
+
+        all_terminal = task_repo.all_terminal_for_job(job_uuid)
+        tasks = task_repo.list_for_job(job_uuid)
+        all_waiting_or_terminal = bool(tasks) and all(
+            t.status in JOB_SOURCE_TASK_TERMINAL_STATUSES or t.status == JobSourceTaskStatus.WINDOW_WAITING
+            for t in tasks
+        )
+
+        # Check if an eligible candidate window or batch is ready for processing
+        cancellation = CancellationService(get_redis())
+
+        from app.db.models.candidate_window import CandidateWindow
+        active_window = db.execute(
+            select(CandidateWindow)
+            .where(CandidateWindow.job_id == job_uuid)
+            .order_by(CandidateWindow.window_index.desc())
+            .limit(1)
+        ).scalar_one_or_none()
+
+        window_is_full = active_window is not None and active_window.status == "FULL"
+        window_limit = active_window.candidate_limit if active_window else None
+
+        candidate_window = job.config.get("candidate_window", get_settings().download_candidate_window)
+        active_batch_target = min(candidate_window, job.target_count or candidate_window)
+        window_buffered_target = buffered_target(active_batch_target, get_settings().target_overfetch_buffer)
+
+        promoted_count = asset_repo.count_for_job(job_uuid, status=AssetStatus.PROMOTED)
+
+        window_ready = (
+            cancellation.is_target_reached(str(job_id))
+            or (window_is_full and promoted_count > 0)
+            or (all_waiting_or_terminal and promoted_count > 0)
+            or (window_limit is not None and promoted_count >= window_limit and promoted_count > 0)
+            or job.accepted_count >= window_buffered_target
+            or promoted_count >= window_buffered_target
+            or (promoted_count >= active_batch_target and promoted_count > 0)
+        )
+
+        if not all_terminal and not window_ready:
             return
 
         remaining_sources = job.config.get("_fast_path_remaining_sources") or []
         target_reached = job.target_count is not None and job.accepted_count >= job.target_count
 
-        if remaining_sources and not target_reached:
+        if remaining_sources and not target_reached and all_terminal:
             redis_client = get_redis()
             escalate_key = f"job:{job_id}:fast_path_escalated"
             if not redis_client.set(escalate_key, "1", nx=True, ex=86400):
@@ -195,13 +256,14 @@ def check_and_advance_job(job_id: str) -> None:
 
     redis_client = get_redis()
     dispatch_key = f"job:{job_id}:filtering_dispatched"
-    if not redis_client.set(dispatch_key, "1", nx=True, ex=60):
+    if not redis_client.set(dispatch_key, "1", nx=True, ex=300):
         return
 
     ProgressPublisher(redis_client).publish(job_id, {"type": "connector_finished"})
     # Downstream pipeline: relevance filter -> dedup -> completion evaluation.
-    # run_deduplication chains to evaluate_job_completion itself once it
-    # finishes (see app/tasks/filtering_tasks.py).
+    # When batch processing is active, run_relevance_filter processes the current
+    # bounded window, followed by process_active_batch to verify accepted items
+    # and plan replacement windows.
     from app.tasks.filtering_tasks import run_relevance_filter
 
     run_relevance_filter.delay(job_id)
@@ -368,9 +430,10 @@ def plan_topup_round(self, job_id: str):
                 get_redis().delete(f"job:{job_id}:filtering_dispatched")
 
                 exhausted = {s.source_type for s in sources if s.exhausted}
+                allowed_sources = set(job.sources or [])
                 for task in tasks:
                     source_value = str(getattr(task.source_type, "value", task.source_type))
-                    if source_value in exhausted:
+                    if source_value in exhausted or source_value not in allowed_sources:
                         continue
                     task_repo.set_status(task.id, JobSourceTaskStatus.PENDING)
                     task_repo.heartbeat(task.id)
@@ -607,23 +670,32 @@ def watchdog_scan():
             elif (
                 job.status in (JobStatus.RUNNING, JobStatus.DISCOVERING)
                 and (
-                    (now - job.updated_at).total_seconds() > settings.filtering_stall_threshold_s
+                    (now - (job.updated_at.replace(tzinfo=timezone.utc) if job.updated_at and job.updated_at.tzinfo is None else (job.updated_at or now))).total_seconds() > settings.filtering_stall_threshold_s
                     # ... or it has been idle since before the last worker boot, i.e.
                     # the chain was killed by a restart and nothing is coming back.
-                    or is_orphaned(job.updated_at, restart_cutoff)
+                    or is_orphaned(job.updated_at.replace(tzinfo=timezone.utc) if job.updated_at and job.updated_at.tzinfo is None else job.updated_at, restart_cutoff)
                 )
-                and task_repo.all_terminal_for_job(job.id)
+                and (
+                    task_repo.all_terminal_for_job(job.id)
+                    or (
+                        AssetRepository(db).count_for_job(job.id, status=AssetStatus.PROMOTED) >= min(
+                            job.config.get("candidate_window", settings.download_candidate_window),
+                            job.target_count or settings.download_candidate_window,
+                        )
+                    )
+                    or (
+                        AssetRepository(db).count_for_job(job.id, status=AssetStatus.PROMOTED) > 0
+                        and CancellationService(get_redis()).is_target_reached(str(job.id))
+                    )
+                )
+                and not get_redis().exists(f"job:{job.id}:filtering_in_progress")
                 # Re-driving is idempotent but not free, and the pass takes a while
                 # to bump updated_at: without this it would be re-driven every scan.
                 and get_redis().set(f"watchdog:redrive:{job.id}", "1", nx=True, ex=300)
             ):
-                # Post-ingestion stall: every source finished, but the
-                # filtering -> dedup -> completion chain died part-way and
-                # nothing else in this watchdog can see it. The stalled-task
-                # sweep above only looks at JobSourceTasks in a non-terminal
-                # state, and the deadline sweep only fires for jobs that set
-                # a deadline — so a job like this had no recovery path at
-                # all and stayed `running` forever.
+                # Post-ingestion stall: either every source finished, or an eligible batch of
+                # PROMOTED assets is waiting while sources are slow/exhausted, but the
+                # filtering -> dedup -> completion chain died or was never dispatched.
                 #
                 # Re-driving is safe to repeat: run_relevance_filter only
                 # selects PROMOTED assets, so already-classified assets are
@@ -631,9 +703,11 @@ def watchdog_scan():
                 # counts from the DB. A job whose assets are all already
                 # classified therefore passes straight through to dedup and
                 # completion rather than redoing any inference.
+                promoted_count = AssetRepository(db).count_for_job(job.id, status=AssetStatus.PROMOTED)
                 logger.warning(
-                    f"Watchdog: job {job.id} has all sources terminal but is still "
-                    f"{job.status.value} and idle since {job.updated_at}; re-driving filtering"
+                    f"Watchdog: job {job.id} has {promoted_count} PROMOTED assets waiting "
+                    f"(all_terminal={task_repo.all_terminal_for_job(job.id)}) and is idle since {job.updated_at}; "
+                    f"re-driving filtering"
                 )
                 redis_client = get_redis()
                 redis_client.delete(f"job:{job.id}:filtering_dispatched")
@@ -668,6 +742,13 @@ def _resume_task(job_id: str, job_source_task_id: str, source_type, checkpoint: 
     except ValueError:
         logger.warning(f"Watchdog: unknown source_type={source_type}, cannot resume")
         return
+
+    with session_scope() as db:
+        from app.db.models.job import Job
+        job = db.get(Job, uuid.UUID(job_id))
+        if job and str(source.value) not in (job.sources or []):
+            logger.warning(f"Watchdog: source {source_type} is not in job {job_id} sources, skipping resume")
+            return
 
     if _resume_pending_items(source, job_id, job_source_task_id, checkpoint):
         return

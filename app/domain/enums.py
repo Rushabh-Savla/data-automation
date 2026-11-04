@@ -19,6 +19,12 @@ class SourceType(str, enum.Enum):
     NAS_SHARE = "nas_share"
 
 
+class SourceSelectionMode(str, enum.Enum):
+    MANUAL = "manual"
+    AUTO = "auto"
+    RANDOM = "random"
+
+
 class JobStatus(str, enum.Enum):
     DRAFT = "draft"
     SCHEDULED = "scheduled"
@@ -61,6 +67,7 @@ class JobSourceTaskStatus(str, enum.Enum):
     PENDING = "pending"
     DISCOVERING = "discovering"
     DOWNLOADING = "downloading"
+    WINDOW_WAITING = "window_waiting"
     STANDARDIZING = "standardizing"
     COMPLETED = "completed"
     COMPLETED_PARTIAL = "completed_partial"
@@ -82,21 +89,71 @@ class AssetStatus(str, enum.Enum):
     DOWNLOADING = "downloading"
     DOWNLOADED = "downloaded"
     STANDARDIZING = "standardizing"
+    STANDARDIZED = "standardized"
     PROMOTED = "promoted"
     RELEVANCE_PENDING = "relevance_pending"
     RELEVANCE_PASSED = "relevance_passed"
     RELEVANCE_REJECTED = "relevance_rejected"
+    REVIEW_PENDING = "review_pending"
+    RETRY_PENDING = "retry_pending"
+    READY_FOR_UPLOAD = "ready_for_upload"
+    UPLOADING = "uploading"
+    NAS_VERIFIED = "nas_verified"
+    COMPLETED = "completed"
     DUPLICATE = "duplicate"
     FAILED = "failed"
 
 
 # Assets in these statuses count as "accepted" toward a job's target_count
 # and are what export/asset-browsing defaults to including.
-ASSET_ACCEPTED_STATUSES = {
-    AssetStatus.PROMOTED,
-    AssetStatus.RELEVANCE_PENDING,
+# Strictly excludes unclassified (PROMOTED, RELEVANCE_PENDING), duplicates,
+# rejections, uncertain reviews, errors, and unverified assets.
+RELEVANCE_ACCEPTED_STATUSES = {
     AssetStatus.RELEVANCE_PASSED,
+    AssetStatus.READY_FOR_UPLOAD,
+    AssetStatus.UPLOADING,
+    AssetStatus.NAS_VERIFIED,
+    AssetStatus.COMPLETED,
 }
+ASSET_ACCEPTED_STATUSES = RELEVANCE_ACCEPTED_STATUSES
+
+# Disjoint metric status sets for detailed lifecycle accounting
+UPLOAD_PENDING_STATUSES = {AssetStatus.READY_FOR_UPLOAD}
+UPLOADING_STATUSES = {AssetStatus.UPLOADING}
+NAS_VERIFIED_STATUSES = {AssetStatus.NAS_VERIFIED}
+COMPLETED_STATUSES = {AssetStatus.COMPLETED}
+REJECTED_STATUSES = {AssetStatus.RELEVANCE_REJECTED}
+DUPLICATE_STATUSES = {AssetStatus.DUPLICATE}
+REVIEW_PENDING_STATUSES = {AssetStatus.REVIEW_PENDING}
+RETRY_PENDING_STATUSES = {AssetStatus.RETRY_PENDING}
+
+
+class BatchStatus(str, enum.Enum):
+    CREATED = "created"
+    DISCOVERING = "discovering"
+    DOWNLOADING = "downloading"
+    PROCESSING = "processing"
+    FILTERING = "filtering"
+    FILLING_SHORTFALL = "filling_shortfall"
+    REPLENISHING = "replenishing"
+    READY_FOR_UPLOAD = "ready_for_upload"
+    UPLOADING = "uploading"
+    NAS_UPLOADING = "nas_uploading"
+    NAS_PENDING = "nas_pending"
+    VERIFYING = "verifying"
+    NAS_VERIFIED = "nas_verified"
+    COMPLETED = "completed"
+    PARTIAL = "partial"
+    FAILED = "failed"
+    PAUSED = "paused"
+
+
+class TransferStatus(str, enum.Enum):
+    PENDING = "pending"
+    UPLOADING = "uploading"
+    VERIFIED = "verified"
+    COMPLETED = "completed"
+    FAILED = "failed"
 
 
 class AnnotationFormat(str, enum.Enum):

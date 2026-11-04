@@ -30,7 +30,7 @@ from app.connectors.base import (
     SourceItem,
     register_connector,
 )
-from app.core.exceptions import FatalConnectorError, JobStopped, TransientConnectorError
+from app.core.exceptions import CandidateWindowFull, FatalConnectorError, JobStopped, TransientConnectorError
 from app.domain.enums import SourceType
 
 logger = logging.getLogger(__name__)
@@ -156,6 +156,7 @@ class KaggleConnector:
         checkpoint: dict,
         should_stop: ShouldStopFn,
         on_progress: OnProgressFn,
+        admit_candidate=None,
     ) -> Iterator[RawAssetDraft]:
         import kagglehub
 
@@ -183,7 +184,8 @@ class KaggleConnector:
 
         walk_index = checkpoint.get("walk_index", 0) if checkpoint else 0
         yield from self._walk_and_yield(
-            cached_path, slug, dataset_url, license_name, walk_index, should_stop, on_progress
+            cached_path, slug, dataset_url, license_name, walk_index, should_stop, on_progress,
+            admit_candidate=admit_candidate,
         )
 
     # -- Ported verbatim from kaggle_downloader.py --------------------------------
@@ -199,8 +201,18 @@ class KaggleConnector:
             logger.info(f"  Extracting: {zip_path.name}")
             try:
                 extract_dir.mkdir(exist_ok=True)
+                total_uncompressed = 0
+                total_files = 0
                 with zipfile.ZipFile(zip_path, "r") as zf:
                     for member in zf.infolist():
+                        total_files += 1
+                        total_uncompressed += member.file_size
+                        if total_files > 2000:
+                            logger.warning(f"  Archive exceeded file count limit (2000): {zip_path.name}")
+                            break
+                        if total_uncompressed > 10 * 1024 * 1024 * 1024:
+                            logger.warning(f"  Archive exceeded 10GB uncompressed size limit: {zip_path.name}")
+                            break
                         member_path = (extract_dir / member.filename).resolve()
                         if not str(member_path).startswith(str(extract_dir.resolve())):
                             logger.warning(f"  Zip-slip blocked: {member.filename}")
@@ -223,6 +235,7 @@ class KaggleConnector:
         start_index: int,
         should_stop: ShouldStopFn,
         on_progress: OnProgressFn,
+        admit_candidate=None,
     ) -> Iterator[RawAssetDraft]:
         from PIL import Image
 
@@ -252,7 +265,32 @@ class KaggleConnector:
             rel_path = src_img.relative_to(root)
             source_item_id = make_source_item_id(slug, str(rel_path))
 
+            admission = None
+            if admit_candidate is not None:
+                admission = admit_candidate(source_item_id)
+                raw_status = getattr(admission, "status", "")
+                status = str(getattr(raw_status, "value", raw_status)).upper()
+                if status == "DUPLICATE":
+                    on_progress({"checkpoint": {"walk_index": i + 1}})
+                    continue
+                if status == "WINDOW_FULL":
+                    on_progress({"checkpoint": {"walk_index": i}})
+                    raise CandidateWindowFull(
+                        getattr(admission, "window_id", None),
+                        getattr(admission, "window_index", None),
+                        i,
+                    )
+                if status != "ADMITTED":
+                    raise FatalConnectorError(
+                        f"Candidate admission failed for {source_item_id}: {status}"
+                    )
+
             ann_path = self._find_annotation(src_img, root)
+            metadata = {"original_path": str(rel_path)}
+            if admission is not None:
+                metadata["candidate_reservation_id"] = str(admission.reservation_id)
+                metadata["candidate_window_id"] = str(admission.window_id)
+                metadata["candidate_window_index"] = int(admission.window_index)
 
             draft = RawAssetDraft(
                 source_item_id=source_item_id,
@@ -265,7 +303,7 @@ class KaggleConnector:
                 annotation_format=self._guess_annotation_format(ann_path),
                 width=w,
                 height=h,
-                metadata={"original_path": str(rel_path)},
+                metadata=metadata,
             )
             on_progress({"checkpoint": {"walk_index": i + 1}, "downloaded": 1})
             yield draft

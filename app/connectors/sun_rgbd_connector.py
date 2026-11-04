@@ -43,7 +43,7 @@ from app.connectors.base import (
 )
 from app.connectors.query_terms import match_labels
 from app.core.config import get_settings
-from app.core.exceptions import JobStopped, TransientConnectorError
+from app.core.exceptions import CandidateWindowFull, FatalConnectorError, JobStopped, TransientConnectorError
 from app.domain.enums import SourceType
 from app.services.format_conversion import BBox, ClassRegistry, boxes_to_yolo_lines
 
@@ -246,6 +246,7 @@ class SunRgbdConnector:
         checkpoint: dict,
         should_stop: ShouldStopFn,
         on_progress: OnProgressFn,
+        admit_candidate=None,
     ) -> Iterator[RawAssetDraft]:
         import shutil
 
@@ -289,9 +290,33 @@ class SunRgbdConnector:
                     on_progress({"checkpoint": {"index": i}})
                     raise JobStopped("should_stop() signalled during SUN RGB-D shard walk")
 
+                source_item_id = f"sunrgbd_{record_idx}"
+                admission = None
+                if admit_candidate is not None:
+                    admission = admit_candidate(source_item_id)
+                    raw_status = getattr(admission, "status", "")
+                    status = str(getattr(raw_status, "value", raw_status)).upper()
+                    if status == "DUPLICATE":
+                        on_progress({"checkpoint": {"index": i + 1}})
+                        continue
+                    if status == "WINDOW_FULL":
+                        on_progress({"checkpoint": {"index": i}})
+                        raise CandidateWindowFull(
+                            getattr(admission, "window_id", None),
+                            getattr(admission, "window_index", None),
+                            i,
+                        )
+                    if status != "ADMITTED":
+                        raise FatalConnectorError(
+                            f"Candidate admission failed for {source_item_id}: {status}"
+                        )
+
                 rec = records[record_idx]
                 src_img = local_path(record_idx)
                 if not src_img.exists() and record_idx not in downloads:
+                    if admission is not None and getattr(admission, "reservation_id", None):
+                        from app.services.candidate_reservation_service import mark_candidate_failed
+                        mark_candidate_failed(admission.reservation_id)
                     on_progress({"rejected": 1})
                     continue
 
@@ -306,6 +331,9 @@ class SunRgbdConnector:
                     with Image.open(dest) as img:
                         w, h = img.size
                     if w < self.min_w or h < self.min_h:
+                        if admission is not None and getattr(admission, "reservation_id", None):
+                            from app.services.candidate_reservation_service import mark_candidate_failed
+                            mark_candidate_failed(admission.reservation_id)
                         on_progress({"rejected": 1})
                         continue
                 except (requests.RequestException, remote_zip.RangeNotSupportedError) as e:
@@ -313,6 +341,9 @@ class SunRgbdConnector:
                     on_progress({"checkpoint": {"index": i}})
                     raise TransientConnectorError(f"SUN RGB-D image fetch failed: {e}") from e
                 except Exception as e:
+                    if admission is not None and getattr(admission, "reservation_id", None):
+                        from app.services.candidate_reservation_service import mark_candidate_failed
+                        mark_candidate_failed(admission.reservation_id)
                     logger.warning(f"SUN RGB-D record {record_idx} copy/validate failed: {e}")
                     on_progress({"rejected": 1})
                     continue
@@ -334,8 +365,17 @@ class SunRgbdConnector:
                     ann_path.write_text("\n".join(lines))
                     annotation_format = "yolo_txt"
 
+                metadata = {
+                    "sun_rgbd_sequence": rec["sequence"],
+                    "matched_by": "vlm" if item.external_ref.get("unlabelled") else "label",
+                }
+                if admission is not None:
+                    metadata["candidate_reservation_id"] = str(admission.reservation_id)
+                    metadata["candidate_window_id"] = str(admission.window_id)
+                    metadata["candidate_window_index"] = int(admission.window_index)
+
                 draft = RawAssetDraft(
-                    source_item_id=f"sunrgbd_{record_idx}",
+                    source_item_id=source_item_id,
                     source_url=None,
                     dataset_identifier=item.dataset_identifier,
                     license=item.license_hint,
@@ -348,10 +388,7 @@ class SunRgbdConnector:
                     classes=registry.names,
                     # "vlm": found by the relevance model among images the dataset does not label
                     # for this query, so the boxes here are SUN's other objects, not the queried one.
-                    metadata={
-                        "sun_rgbd_sequence": rec["sequence"],
-                        "matched_by": "vlm" if item.external_ref.get("unlabelled") else "label",
-                    },
+                    metadata=metadata,
                 )
                 on_progress({"checkpoint": {"index": i + 1}, "downloaded": 1})
                 yield draft

@@ -32,7 +32,7 @@ from app.connectors.visual_genome_connector import VisualGenomeConnector
 from app.connectors.web_connector import WebScrapeConnector
 from app.connectors.youtube_connector import YouTubeConnector
 from app.core.config import get_settings
-from app.core.exceptions import FatalConnectorError, JobStopped, TransientConnectorError
+from app.core.exceptions import CandidateWindowFull, FatalConnectorError, JobStopped, TransientConnectorError
 from app.db.repositories.credential_repository import CredentialRepository
 from app.db.repositories.job_source_task_repository import JobSourceTaskRepository
 from app.db.session import session_scope
@@ -134,16 +134,56 @@ def _run_item_download(
 
         min_res = tuple(task.job.config.get("min_resolution", (64, 64))) if task.job else (64, 64)
 
-        accepted = rejected = 0
+        accepted = downloaded = rejected = 0
+
+        def mark_draft_reservation_failed(draft) -> None:
+            metadata = getattr(draft, "metadata", None) or {}
+            reservation_id = metadata.get("candidate_reservation_id")
+            if not reservation_id:
+                return
+
+            try:
+                from app.services.candidate_reservation_service import (
+                    mark_candidate_failed,
+                )
+                mark_candidate_failed(reservation_id)
+            except Exception:
+                logger.exception(
+                    "Could not mark candidate reservation %s as FAILED",
+                    reservation_id,
+                )
+
         try:
             for draft in fetch(checkpoint, should_stop, on_progress):
                 try:
-                    standardize_and_promote_sync(job_uuid, task_uuid, source_type, draft, min_res)
+                    standardize_and_promote_sync(
+                        job_uuid, task_uuid, source_type, draft, min_res
+                    )
+                    downloaded += 1
                     accepted += 1
-                    on_progress({"accepted": 1})
+                    on_progress({"downloaded": 1})
                 except AssetRejected:
+                    mark_draft_reservation_failed(draft)
                     rejected += 1
                     on_progress({"rejected": 1})
+                except Exception:
+                    mark_draft_reservation_failed(draft)
+                    raise
+        except CandidateWindowFull as exc:
+            logger.info(
+                f"[WINDOW] {checkpoint_key} reached candidate window "
+                f"{exc.window_id} at source index {exc.checkpoint_index}"
+            )
+            unbind_context()
+            return {
+                "item": checkpoint_key,
+                "accepted": accepted,
+                "rejected": rejected,
+                "window_full": True,
+                "window_id": exc.window_id,
+                "window_index": exc.window_index,
+                "checkpoint_index": exc.checkpoint_index,
+            }
         except JobStopped:
             logger.info(f"Job {job_id} stopped mid-item ({checkpoint_key})")
             unbind_context()
@@ -226,6 +266,19 @@ def _run_item_download(
     return {"item": checkpoint_key, "accepted": accepted, "rejected": rejected}
 
 
+def _make_admit_candidate(job_source_task_id: str, source_type: SourceType):
+    from app.services.candidate_reservation_service import admit_candidate_for_task
+
+    def admit_candidate(source_item_id: str):
+        return admit_candidate_for_task(
+            job_source_task_id,
+            source_type,
+            source_item_id,
+        )
+
+    return admit_candidate
+
+
 @celery_app.task(
     name="app.tasks.ingest_tasks.download_kaggle_dataset",
     bind=True,
@@ -253,6 +306,7 @@ def download_kaggle_dataset(self, job_id: str, job_source_task_id: str, item_dic
         min_res = tuple(task.job.config.get("min_resolution", (64, 64))) if task and task.job else (64, 64)
 
     connector = KaggleConnector(min_resolution=min_res)
+    admit_candidate = _make_admit_candidate(job_source_task_id, SourceType.KAGGLE)
 
     def fetch(checkpoint, should_stop, on_progress):
         # kagglehub.dataset_download() is one blocking call with no progress
@@ -264,7 +318,10 @@ def download_kaggle_dataset(self, job_id: str, job_source_task_id: str, item_dic
         # dataset means it never actually finishes (killed → re-download
         # from zero → killed again).
         with credential_service.scoped_env(SourceType.KAGGLE), heartbeat_during(uuid.UUID(job_source_task_id)):
-            yield from connector.fetch(item, workdir, checkpoint, should_stop, on_progress)
+            yield from connector.fetch(
+                item, workdir, checkpoint, should_stop, on_progress,
+                admit_candidate=admit_candidate,
+            )
 
     return _run_item_download(
         job_id, job_source_task_id, SourceType.KAGGLE, slug, fetch,
@@ -304,12 +361,25 @@ def download_roboflow_item(self, job_id: str, job_source_task_id: str, item_dict
         export_format = task.job.config.get("roboflow", {}).get("export_format", "yolov8") if task and task.job else "yolov8"
 
     connector = RoboflowConnector(api_keys=api_keys, export_format=export_format, min_resolution=min_res)
+    admit_candidate = _make_admit_candidate(job_source_task_id, SourceType.ROBOFLOW)
 
     def fetch(checkpoint, should_stop, on_progress):
-        yield from connector.fetch(item, workdir, checkpoint, should_stop, on_progress)
+        yield from connector.fetch(item, workdir, checkpoint, should_stop, on_progress, admit_candidate=admit_candidate)
 
     return _run_item_download(job_id, job_source_task_id, SourceType.ROBOFLOW, checkpoint_key, fetch, bound_task=self)
 
+
+
+def _default_frames_per_video(target_count: int | None) -> int:
+    """Per-video frame ceiling, scaled to the job's target.
+
+    Floored so a small job still gets usable coverage from each video, and
+    capped so a large job does not let one video dominate.
+    """
+    import math
+    if not target_count:
+        return 60
+    return max(30, min(300, math.ceil(target_count / 5)))
 
 
 @celery_app.task(
@@ -412,9 +482,10 @@ def download_web_batch(self, job_id: str, job_source_task_id: str, item_dict: di
         min_res = tuple(task.job.config.get("min_resolution", (64, 64))) if task and task.job else (64, 64)
 
     connector = WebScrapeConnector(min_resolution=min_res)
+    admit_candidate = _make_admit_candidate(job_source_task_id, SourceType.WEB)
 
     def fetch(checkpoint, should_stop, on_progress):
-        yield from connector.fetch(item, workdir, checkpoint, should_stop, on_progress)
+        yield from connector.fetch(item, workdir, checkpoint, should_stop, on_progress, admit_candidate=admit_candidate)
 
     return _run_item_download(job_id, job_source_task_id, SourceType.WEB, shard_id, fetch, bound_task=self)
 
@@ -446,8 +517,24 @@ def download_coco_shard(self, job_id: str, job_source_task_id: str, item_dict: d
 
     connector = CocoConnector(min_resolution=min_res, split=item.external_ref.get("split", "val2017"))
 
+    def admit_candidate(source_item_id):
+        from app.services.candidate_reservation_service import admit_candidate_for_task
+
+        return admit_candidate_for_task(
+            job_source_task_id,
+            SourceType.COCO,
+            source_item_id,
+        )
+
     def fetch(checkpoint, should_stop, on_progress):
-        yield from connector.fetch(item, workdir, checkpoint, should_stop, on_progress)
+        yield from connector.fetch(
+            item,
+            workdir,
+            checkpoint,
+            should_stop,
+            on_progress,
+            admit_candidate=admit_candidate,
+        )
 
     return _run_item_download(job_id, job_source_task_id, SourceType.COCO, shard_id, fetch, bound_task=self)
 
@@ -478,9 +565,10 @@ def download_open_images_shard(self, job_id: str, job_source_task_id: str, item_
         min_res = tuple(task.job.config.get("min_resolution", (64, 64))) if task and task.job else (64, 64)
 
     connector = OpenImagesConnector(min_resolution=min_res, split=item.external_ref.get("split", "validation"))
+    admit_candidate = _make_admit_candidate(job_source_task_id, SourceType.OPEN_IMAGES)
 
     def fetch(checkpoint, should_stop, on_progress):
-        yield from connector.fetch(item, workdir, checkpoint, should_stop, on_progress)
+        yield from connector.fetch(item, workdir, checkpoint, should_stop, on_progress, admit_candidate=admit_candidate)
 
     return _run_item_download(job_id, job_source_task_id, SourceType.OPEN_IMAGES, shard_id, fetch, bound_task=self)
 
@@ -511,9 +599,10 @@ def download_pascal_voc_shard(self, job_id: str, job_source_task_id: str, item_d
         min_res = tuple(task.job.config.get("min_resolution", (64, 64))) if task and task.job else (64, 64)
 
     connector = PascalVocConnector(min_resolution=min_res)
+    admit_candidate = _make_admit_candidate(job_source_task_id, SourceType.PASCAL_VOC)
 
     def fetch(checkpoint, should_stop, on_progress):
-        yield from connector.fetch(item, workdir, checkpoint, should_stop, on_progress)
+        yield from connector.fetch(item, workdir, checkpoint, should_stop, on_progress, admit_candidate=admit_candidate)
 
     return _run_item_download(job_id, job_source_task_id, SourceType.PASCAL_VOC, shard_id, fetch, bound_task=self)
 
@@ -544,9 +633,10 @@ def download_visual_genome_shard(self, job_id: str, job_source_task_id: str, ite
         min_res = tuple(task.job.config.get("min_resolution", (64, 64))) if task and task.job else (64, 64)
 
     connector = VisualGenomeConnector(min_resolution=min_res)
+    admit_candidate = _make_admit_candidate(job_source_task_id, SourceType.VISUAL_GENOME)
 
     def fetch(checkpoint, should_stop, on_progress):
-        yield from connector.fetch(item, workdir, checkpoint, should_stop, on_progress)
+        yield from connector.fetch(item, workdir, checkpoint, should_stop, on_progress, admit_candidate=admit_candidate)
 
     return _run_item_download(job_id, job_source_task_id, SourceType.VISUAL_GENOME, shard_id, fetch, bound_task=self)
 
@@ -577,9 +667,10 @@ def download_davis_shard(self, job_id: str, job_source_task_id: str, item_dict: 
         min_res = tuple(task.job.config.get("min_resolution", (64, 64))) if task and task.job else (64, 64)
 
     connector = DavisConnector(min_resolution=min_res)
+    admit_candidate = _make_admit_candidate(job_source_task_id, SourceType.DAVIS)
 
     def fetch(checkpoint, should_stop, on_progress):
-        yield from connector.fetch(item, workdir, checkpoint, should_stop, on_progress)
+        yield from connector.fetch(item, workdir, checkpoint, should_stop, on_progress, admit_candidate=admit_candidate)
 
     return _run_item_download(job_id, job_source_task_id, SourceType.DAVIS, shard_id, fetch, bound_task=self)
 
@@ -610,6 +701,7 @@ def download_sun_rgbd_shard(self, job_id: str, job_source_task_id: str, item_dic
         min_res = tuple(task.job.config.get("min_resolution", (64, 64))) if task and task.job else (64, 64)
 
     connector = SunRgbdConnector(min_resolution=min_res)
+    admit_candidate = _make_admit_candidate(job_source_task_id, SourceType.SUN_RGBD)
 
     def fetch(checkpoint, should_stop, on_progress):
         # The 6.9GB SUNRGBD.zip is fetched lazily, on the first shard's first
@@ -620,7 +712,7 @@ def download_sun_rgbd_shard(self, job_id: str, job_source_task_id: str, item_dic
         # stalled and re-runs its discovery, queueing a second set of shards
         # that block on the same lock.
         with heartbeat_during(uuid.UUID(job_source_task_id)):
-            yield from connector.fetch(item, workdir, checkpoint, should_stop, on_progress)
+            yield from connector.fetch(item, workdir, checkpoint, should_stop, on_progress, admit_candidate=admit_candidate)
 
     return _run_item_download(job_id, job_source_task_id, SourceType.SUN_RGBD, shard_id, fetch, bound_task=self)
 
@@ -651,9 +743,10 @@ def download_nuscenes_shard(self, job_id: str, job_source_task_id: str, item_dic
         min_res = tuple(task.job.config.get("min_resolution", (64, 64))) if task and task.job else (64, 64)
 
     connector = NuImagesConnector(min_resolution=min_res)
+    admit_candidate = _make_admit_candidate(job_source_task_id, SourceType.NUSCENES)
 
     def fetch(checkpoint, should_stop, on_progress):
-        yield from connector.fetch(item, workdir, checkpoint, should_stop, on_progress)
+        yield from connector.fetch(item, workdir, checkpoint, should_stop, on_progress, admit_candidate=admit_candidate)
 
     return _run_item_download(job_id, job_source_task_id, SourceType.NUSCENES, shard_id, fetch, bound_task=self)
 
@@ -723,12 +816,13 @@ def download_nas_share_shard(self, job_id: str, job_source_task_id: str, item_di
     # never carried in item_dict (which is stored in Celery messages/checkpoints).
     params = get_saved_params()
     connector = NasShareConnector(params, min_resolution=min_res) if params is not None else None
+    admit_candidate = _make_admit_candidate(job_source_task_id, SourceType.NAS_SHARE)
 
     def fetch(checkpoint, should_stop, on_progress):
         if connector is None:
             # Raised inside fetch (not before the driver) so it is recorded as an item
             # error instead of breaking the chord for every other shard.
             raise FatalConnectorError("NAS is not configured")
-        yield from connector.fetch(item, workdir, checkpoint, should_stop, on_progress)
+        yield from connector.fetch(item, workdir, checkpoint, should_stop, on_progress, admit_candidate=admit_candidate)
 
     return _run_item_download(job_id, job_source_task_id, SourceType.NAS_SHARE, shard_id, fetch, bound_task=self)

@@ -33,7 +33,7 @@ from app.connectors.nas.base import (
     open_client,
 )
 from app.connectors.query_terms import expand_terms, singularize
-from app.core.exceptions import ConnectorError, JobStopped, TransientConnectorError
+from app.core.exceptions import CandidateWindowFull, ConnectorError, FatalConnectorError, JobStopped, TransientConnectorError
 from app.domain.enums import SourceType
 
 logger = logging.getLogger(__name__)
@@ -108,6 +108,7 @@ class NasShareConnector:
         checkpoint: dict,
         should_stop: ShouldStopFn,
         on_progress: OnProgressFn,
+        admit_candidate=None,
     ) -> Iterator[RawAssetDraft]:
         from PIL import Image
 
@@ -123,6 +124,29 @@ class NasShareConnector:
                     on_progress({"checkpoint": {"index": i}})
                     raise JobStopped("should_stop() signalled during NAS share shard walk")
 
+                identity = f"{self.params.protocol}://{self.params.host}/{self.params.share.strip('/')}/{rel}"
+                source_item_id = f"nas_{hashlib.sha1(identity.encode()).hexdigest()[:32]}"
+
+                admission = None
+                if admit_candidate is not None:
+                    admission = admit_candidate(source_item_id)
+                    raw_status = getattr(admission, "status", "")
+                    status = str(getattr(raw_status, "value", raw_status)).upper()
+                    if status == "DUPLICATE":
+                        on_progress({"checkpoint": {"index": i + 1}})
+                        continue
+                    if status == "WINDOW_FULL":
+                        on_progress({"checkpoint": {"index": i}})
+                        raise CandidateWindowFull(
+                            getattr(admission, "window_id", None),
+                            getattr(admission, "window_index", None),
+                            i,
+                        )
+                    if status != "ADMITTED":
+                        raise FatalConnectorError(
+                            f"Candidate admission failed for {source_item_id}: {status}"
+                        )
+
                 suffix = Path(rel).suffix.lower() or ".jpg"
                 dest = workdir / f"{hashlib.sha1(rel.encode()).hexdigest()[:16]}{suffix}"
                 try:
@@ -133,27 +157,40 @@ class NasShareConnector:
                         w, h = img.size
                     if w < self.min_w or h < self.min_h:
                         dest.unlink(missing_ok=True)
+                        if admission is not None and getattr(admission, "reservation_id", None):
+                            from app.services.candidate_reservation_service import mark_candidate_failed
+                            mark_candidate_failed(admission.reservation_id)
                         on_progress({"rejected": 1})
                         continue
                 except NasNotFoundError:
-                    # Deleted or moved on the NAS since discovery: skip this one file.
+                    if admission is not None and getattr(admission, "reservation_id", None):
+                        from app.services.candidate_reservation_service import mark_candidate_failed
+                        mark_candidate_failed(admission.reservation_id)
                     on_progress({"rejected": 1})
                     continue
                 except TransientConnectorError:
                     dest.unlink(missing_ok=True)
-                    raise  # the driver retries the shard from its checkpoint
+                    raise
                 except ConnectorError:
                     dest.unlink(missing_ok=True)
-                    raise  # login/permission problems affect every file: surface, don't skip
+                    raise
                 except Exception as e:
                     logger.warning(f"NAS image {rel} could not be read as an image: {e}")
                     dest.unlink(missing_ok=True)
+                    if admission is not None and getattr(admission, "reservation_id", None):
+                        from app.services.candidate_reservation_service import mark_candidate_failed
+                        mark_candidate_failed(admission.reservation_id)
                     on_progress({"rejected": 1})
                     continue
 
-                identity = f"{self.params.protocol}://{self.params.host}/{self.params.share.strip('/')}/{rel}"
+                metadata = {"nas_path": rel, "matched_by": "vlm" if unlabelled else "path"}
+                if admission is not None:
+                    metadata["candidate_reservation_id"] = str(admission.reservation_id)
+                    metadata["candidate_window_id"] = str(admission.window_id)
+                    metadata["candidate_window_index"] = int(admission.window_index)
+
                 draft = RawAssetDraft(
-                    source_item_id=f"nas_{hashlib.sha1(identity.encode()).hexdigest()[:32]}",
+                    source_item_id=source_item_id,
                     source_url=f"nas://{self.params.host or 'local'}/{self.params.share.strip('/')}/{rel}",
                     dataset_identifier=item.dataset_identifier,
                     license=item.license_hint,
@@ -161,7 +198,7 @@ class NasShareConnector:
                     original_name=Path(rel).name,
                     width=w,
                     height=h,
-                    metadata={"nas_path": rel, "matched_by": "vlm" if unlabelled else "path"},
+                    metadata=metadata,
                 )
                 on_progress({"checkpoint": {"index": i + 1}, "downloaded": 1})
                 yield draft

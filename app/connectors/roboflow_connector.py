@@ -37,7 +37,7 @@ from app.connectors.base import (
     SourceItem,
     register_connector,
 )
-from app.core.exceptions import FatalConnectorError, JobStopped, TransientConnectorError
+from app.core.exceptions import CandidateWindowFull, FatalConnectorError, JobStopped, TransientConnectorError
 from app.domain.enums import SourceType
 
 logger = logging.getLogger(__name__)
@@ -214,6 +214,7 @@ class RoboflowConnector:
         checkpoint: dict,
         should_stop: ShouldStopFn,
         on_progress: OnProgressFn,
+        admit_candidate=None,
     ) -> Iterator[RawAssetDraft]:
         if not self.api_keys:
             raise FatalConnectorError("ROBOFLOW_API_KEY not configured")
@@ -241,7 +242,8 @@ class RoboflowConnector:
 
         try:
             yield from self._api_download(
-                workspace, project, version, license_name, dataset_url, workdir, checkpoint, should_stop, on_progress
+                workspace, project, version, license_name, dataset_url, workdir, checkpoint, should_stop, on_progress,
+                admit_candidate=admit_candidate,
             )
             return
         except JobStopped:
@@ -250,11 +252,13 @@ class RoboflowConnector:
             logger.warning(f"Direct API download failed ({e}) — trying SDK")
 
         yield from self._sdk_download(
-            workspace, project, version, license_name, dataset_url, workdir, checkpoint, should_stop, on_progress
+            workspace, project, version, license_name, dataset_url, workdir, checkpoint, should_stop, on_progress,
+            admit_candidate=admit_candidate,
         )
 
     def _api_download(
-        self, workspace, project, version, license_name, dataset_url, workdir, checkpoint, should_stop, on_progress
+        self, workspace, project, version, license_name, dataset_url, workdir, checkpoint, should_stop, on_progress,
+        admit_candidate=None,
     ) -> Iterator[RawAssetDraft]:
         formats_to_try = [self.export_format] + [f for f in _FORMAT_FALLBACK if f != self.export_format]
         link = None
@@ -289,7 +293,8 @@ class RoboflowConnector:
         zip_path.unlink(missing_ok=True)
 
         yield from self._walk_export_dir(
-            extract_dir, workspace, project, version, license_name, dataset_url, checkpoint, should_stop, on_progress
+            extract_dir, workspace, project, version, license_name, dataset_url, checkpoint, should_stop, on_progress,
+            admit_candidate=admit_candidate,
         )
 
     def _try_format(self, workspace: str, project: str, version, fmt: str) -> str | None:
@@ -325,7 +330,8 @@ class RoboflowConnector:
         return None
 
     def _sdk_download(
-        self, workspace, project, version, license_name, dataset_url, workdir, checkpoint, should_stop, on_progress
+        self, workspace, project, version, license_name, dataset_url, workdir, checkpoint, should_stop, on_progress,
+        admit_candidate=None,
     ) -> Iterator[RawAssetDraft]:
         # version_obj.download() below is one uninterruptible blocking SDK
         # call with no should_stop() hook of its own (same limitation as
@@ -379,11 +385,13 @@ class RoboflowConnector:
                 ) from e
 
         yield from self._walk_export_dir(
-            export_dir, workspace, project, version, license_name, dataset_url, checkpoint, should_stop, on_progress
+            export_dir, workspace, project, version, license_name, dataset_url, checkpoint, should_stop, on_progress,
+            admit_candidate=admit_candidate,
         )
 
     def _walk_export_dir(
-        self, export_dir, workspace, project, version, license_name, dataset_url, checkpoint, should_stop, on_progress
+        self, export_dir, workspace, project, version, license_name, dataset_url, checkpoint, should_stop, on_progress,
+        admit_candidate=None,
     ) -> Iterator[RawAssetDraft]:
         splits = ["train", "valid", "test"]
         for split in splits:
@@ -398,11 +406,13 @@ class RoboflowConnector:
             yield from self._walk_split(
                 img_dir, lbl_dir, split, workspace, project, version, license_name, dataset_url,
                 start_index, should_stop, on_progress,
+                admit_candidate=admit_candidate,
             )
 
     def _walk_split(
         self, image_dir, label_dir, split, workspace, project, version, license_name, dataset_url,
         start_index, should_stop, on_progress,
+        admit_candidate=None,
     ) -> Iterator[RawAssetDraft]:
         from PIL import Image
 
@@ -419,14 +429,43 @@ class RoboflowConnector:
                 on_progress({"checkpoint": {split: {"split_index": i}}})
                 raise JobStopped("should_stop() signalled during Roboflow split walk")
 
+            source_item_id = _bounded_source_item_id(
+                f"rf_{safe_ws}__{safe_proj}__v{version}__{split}__{src_img.stem}"
+            )
+            admission = None
+            if admit_candidate is not None:
+                admission = admit_candidate(source_item_id)
+                raw_status = getattr(admission, "status", "")
+                status = str(getattr(raw_status, "value", raw_status)).upper()
+                if status == "DUPLICATE":
+                    on_progress({"checkpoint": {split: {"split_index": i + 1}}})
+                    continue
+                if status == "WINDOW_FULL":
+                    on_progress({"checkpoint": {split: {"split_index": i}}})
+                    raise CandidateWindowFull(
+                        getattr(admission, "window_id", None),
+                        getattr(admission, "window_index", None),
+                        i,
+                    )
+                if status != "ADMITTED":
+                    raise FatalConnectorError(
+                        f"Candidate admission failed for {source_item_id}: {status}"
+                    )
+
             try:
                 with Image.open(src_img) as img:
                     img.verify()
                 with Image.open(src_img) as img:
                     w, h = img.size
                 if w < self.min_w or h < self.min_h:
+                    if admission is not None and getattr(admission, "reservation_id", None):
+                        from app.services.candidate_reservation_service import mark_candidate_failed
+                        mark_candidate_failed(admission.reservation_id)
                     continue
             except Exception:
+                if admission is not None and getattr(admission, "reservation_id", None):
+                    from app.services.candidate_reservation_service import mark_candidate_failed
+                    mark_candidate_failed(admission.reservation_id)
                 on_progress({"rejected": 1})
                 continue
 
@@ -447,9 +486,12 @@ class RoboflowConnector:
                         annotation_format = "coco_json"
                         break
 
-            source_item_id = _bounded_source_item_id(
-                f"rf_{safe_ws}__{safe_proj}__v{version}__{split}__{src_img.stem}"
-            )
+            metadata = {"split": split}
+            if admission is not None:
+                metadata["candidate_reservation_id"] = str(admission.reservation_id)
+                metadata["candidate_window_id"] = str(admission.window_id)
+                metadata["candidate_window_index"] = int(admission.window_index)
+
             draft = RawAssetDraft(
                 source_item_id=source_item_id,
                 source_url=dataset_url,
@@ -462,7 +504,7 @@ class RoboflowConnector:
                 width=w,
                 height=h,
                 classes=classes,
-                metadata={"split": split},
+                metadata=metadata,
             )
             on_progress({"checkpoint": {split: {"split_index": i + 1}}, "downloaded": 1})
             yield draft

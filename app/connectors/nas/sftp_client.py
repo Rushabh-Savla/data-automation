@@ -8,6 +8,7 @@ from __future__ import annotations
 import posixpath
 import socket
 import stat as statmod
+import time
 from pathlib import Path
 
 import paramiko
@@ -77,12 +78,13 @@ class SftpClient(NasClient):
         )
         try:
             self._ssh.connect(p.host, **kwargs)
-        except paramiko.SSHException as exc:
-            if "banner" not in str(exc).lower():
+        except (paramiko.SSHException, EOFError) as exc:
+            if "banner" not in str(exc).lower() and not isinstance(exc, EOFError):
                 raise
             # A weak/overloaded embedded sshd can transiently fail to answer
             # the banner handshake in time even though it's basically fine a
-            # moment later — one retry before treating it as a real failure.
+            # moment later — brief pause and one retry before treating it as a real failure.
+            time.sleep(0.5)
             self._ssh.connect(p.host, **kwargs)
 
     def close(self) -> None:

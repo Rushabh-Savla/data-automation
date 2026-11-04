@@ -84,10 +84,9 @@ describe('NasConfigForm', () => {
     expect(screen.queryByText('Authentication')).not.toBeInTheDocument()
   })
 
-  it('only offers the storage folder while storing on the NAS', async () => {
+  it('does not render dataset storage in nas config form', () => {
     renderForm(baseConfig)
-    expect(screen.getByLabelText('Storage folder')).toBeInTheDocument()
-    await userEvent.click(screen.getByRole('checkbox', { name: /store filtered images on this nas/i }))
+    expect(screen.queryByText('Dataset Storage')).not.toBeInTheDocument()
     expect(screen.queryByLabelText('Storage folder')).not.toBeInTheDocument()
   })
 

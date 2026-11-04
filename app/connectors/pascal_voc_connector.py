@@ -33,7 +33,7 @@ from app.connectors.base import (
 from app.connectors.open_vocab import scan_candidates
 from app.connectors.query_terms import match_labels
 from app.core.config import get_settings
-from app.core.exceptions import FatalConnectorError, JobStopped, TransientConnectorError
+from app.core.exceptions import CandidateWindowFull, FatalConnectorError, JobStopped, TransientConnectorError
 from app.domain.enums import SourceType
 
 logger = logging.getLogger(__name__)
@@ -186,6 +186,7 @@ class PascalVocConnector:
         checkpoint: dict,
         should_stop: ShouldStopFn,
         on_progress: OnProgressFn,
+        admit_candidate=None,
     ) -> Iterator[RawAssetDraft]:
         import shutil
 
@@ -208,9 +209,33 @@ class PascalVocConnector:
                 on_progress({"checkpoint": {"index": i}})
                 raise JobStopped("should_stop() signalled during Pascal VOC shard walk")
 
+            source_item_id = f"voc2012_{image_id}"
+            admission = None
+            if admit_candidate is not None:
+                admission = admit_candidate(source_item_id)
+                raw_status = getattr(admission, "status", "")
+                status = str(getattr(raw_status, "value", raw_status)).upper()
+                if status == "DUPLICATE":
+                    on_progress({"checkpoint": {"index": i + 1}})
+                    continue
+                if status == "WINDOW_FULL":
+                    on_progress({"checkpoint": {"index": i}})
+                    raise CandidateWindowFull(
+                        getattr(admission, "window_id", None),
+                        getattr(admission, "window_index", None),
+                        i,
+                    )
+                if status != "ADMITTED":
+                    raise FatalConnectorError(
+                        f"Candidate admission failed for {source_item_id}: {status}"
+                    )
+
             src_img = devkit_dir / "JPEGImages" / f"{image_id}.jpg"
             src_xml = devkit_dir / "Annotations" / f"{image_id}.xml"
             if not src_img.exists() or not src_xml.exists():
+                if admission is not None and getattr(admission, "reservation_id", None):
+                    from app.services.candidate_reservation_service import mark_candidate_failed
+                    mark_candidate_failed(admission.reservation_id)
                 on_progress({"rejected": 1})
                 continue
 
@@ -224,15 +249,31 @@ class PascalVocConnector:
                 with Image.open(dest_img) as img:
                     w, h = img.size
                 if w < self.min_w or h < self.min_h:
+                    if admission is not None and getattr(admission, "reservation_id", None):
+                        from app.services.candidate_reservation_service import mark_candidate_failed
+                        mark_candidate_failed(admission.reservation_id)
                     on_progress({"rejected": 1})
                     continue
             except Exception as e:
+                if admission is not None and getattr(admission, "reservation_id", None):
+                    from app.services.candidate_reservation_service import mark_candidate_failed
+                    mark_candidate_failed(admission.reservation_id)
                 logger.warning(f"Pascal VOC image {image_id} copy/validate failed: {e}")
                 on_progress({"rejected": 1})
                 continue
 
+            metadata = {
+                "voc_image_id": image_id,
+                # "vlm": picked by the relevance model among images not labelled for this query.
+                "matched_by": "vlm" if item.external_ref.get("unlabelled") else "label",
+            }
+            if admission is not None:
+                metadata["candidate_reservation_id"] = str(admission.reservation_id)
+                metadata["candidate_window_id"] = str(admission.window_id)
+                metadata["candidate_window_index"] = int(admission.window_index)
+
             draft = RawAssetDraft(
-                source_item_id=f"voc2012_{image_id}",
+                source_item_id=source_item_id,
                 source_url=None,
                 dataset_identifier=item.dataset_identifier,
                 license=item.license_hint,
@@ -242,11 +283,7 @@ class PascalVocConnector:
                 annotation_format="voc_xml",
                 width=w,
                 height=h,
-                metadata={
-                    "voc_image_id": image_id,
-                    # "vlm": picked by the relevance model among images not labelled for this query.
-                    "matched_by": "vlm" if item.external_ref.get("unlabelled") else "label",
-                },
+                metadata=metadata,
             )
             on_progress({"checkpoint": {"index": i + 1}, "downloaded": 1})
             yield draft

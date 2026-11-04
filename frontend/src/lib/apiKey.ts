@@ -7,9 +7,11 @@ import { DEV_API_KEY } from '@/lib/env'
 const STORAGE_KEY = 'data-automation.api-key'
 
 export function getApiKey(): string {
-  return localStorage.getItem(STORAGE_KEY) ?? DEV_API_KEY
+  const stored = localStorage.getItem(STORAGE_KEY)?.trim()
+  if (stored) return stored
+  return DEV_API_KEY
 }
 
 export function setApiKey(key: string): void {
-  localStorage.setItem(STORAGE_KEY, key)
+  localStorage.setItem(STORAGE_KEY, key.trim())
 }

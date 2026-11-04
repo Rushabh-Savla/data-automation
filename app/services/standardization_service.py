@@ -5,6 +5,7 @@ to NAS + record provenance" happens, shared by every connector.
 
 import hashlib
 import logging
+import shutil
 import uuid
 from datetime import datetime, timezone
 from functools import lru_cache
@@ -105,30 +106,199 @@ class StandardizationService:
         source_type: SourceType,
         draft: RawAssetDraft,
     ) -> tuple[Asset, bool]:
-        width, height = self._validate_image(draft.local_tmp_path)
+        """Validate and persist an asset.
 
-        checksum = self._checksum(draft.local_tmp_path)
+        Window candidates are atomically staged on local SSD before their
+        Asset and CandidateReservation records are committed together.
+        Legacy non-window ingestion retains the configured storage backend.
+        """
+        buf = getattr(draft, "buffer", None)
 
-        rel_dest = self._relative_path(job_id, source_type, draft)
-        nas_path = self.storage.write(draft.local_tmp_path, rel_dest)
+        if buf is not None:
+            try:
+                width, height = buf.validate_image(self.min_w, self.min_h)
+            except Exception as exc:
+                raise AssetRejected(
+                    f"Corrupt or unreadable image stream: {exc}"
+                ) from exc
+            checksum = buf.compute_sha256()
+            phash = buf.compute_phash()
+            embedding = buf.compute_clip_embedding()
+        else:
+            width, height = self._validate_image(draft.local_tmp_path)
+            checksum = self._checksum(draft.local_tmp_path)
+            phash = self._compute_phash(draft.local_tmp_path)
+            embedding = self._compute_embedding(draft.local_tmp_path)
 
-        annotation_nas_path = None
-        annotation_format = AnnotationFormat.NONE
-        if draft.annotation_tmp_path is not None and draft.annotation_tmp_path.exists():
-            ann_rel_dest = self._relative_annotation_path(job_id, source_type, draft)
-            annotation_nas_path = self.storage.write(draft.annotation_tmp_path, ann_rel_dest)
-            annotation_format = AnnotationFormat(draft.annotation_format or AnnotationFormat.NONE)
+        metadata = draft.metadata or {}
+        reservation_id_raw = metadata.get("candidate_reservation_id")
 
-        # Computed inline (not deferred to the async dedup task) since it's a
-        # cheap, already-open-the-file operation — avoids a second I/O pass
-        # over every image later just to hash it.
-        phash = self._compute_phash(draft.local_tmp_path)
-        embedding = self._compute_embedding(draft.local_tmp_path)
+        batch_id = None
+        window_id = None
+        reservation = None
+
+        if reservation_id_raw:
+            from sqlalchemy import select
+            from app.db.models.candidate_reservation import CandidateReservation
+            from app.db.models.candidate_window import CandidateWindow
+            from app.db.models.image_batch import ImageBatch
+            from app.storage.window_staging import WindowStagingManager
+
+            db = self.asset_repo.db
+            reservation_uuid = uuid.UUID(str(reservation_id_raw))
+
+            reservation = db.execute(
+                select(CandidateReservation)
+                .where(CandidateReservation.id == reservation_uuid)
+                .with_for_update()
+            ).scalar_one_or_none()
+
+            if reservation is None:
+                raise RuntimeError(
+                    f"Candidate reservation {reservation_uuid} not found"
+                )
+
+            if (
+                reservation.job_id != job_id
+                or reservation.job_source_task_id != job_source_task_id
+                or str(reservation.source_type) != str(source_type.value)
+                or reservation.source_item_id != draft.source_item_id
+            ):
+                raise RuntimeError(
+                    f"Candidate reservation ownership mismatch: {reservation_uuid}"
+                )
+
+            if reservation.status not in ("RESERVED", "STAGED"):
+                raise RuntimeError(
+                    f"Reservation {reservation_uuid} has invalid state "
+                    f"{reservation.status}"
+                )
+
+            window = db.get(CandidateWindow, reservation.window_id)
+            if window is None:
+                raise RuntimeError(
+                    f"Candidate window {reservation.window_id} not found"
+                )
+
+            if metadata.get("candidate_window_id") != str(window.id):
+                raise RuntimeError("Draft candidate window does not match reservation")
+
+            batch = db.get(ImageBatch, window.batch_id)
+            if batch is None or batch.job_id != job_id:
+                raise RuntimeError("Candidate batch is missing or belongs to another job")
+
+            batch_id = batch.id
+            window_id = window.id
+
+            staging = WindowStagingManager()
+            asset_id = reservation.asset_id or reservation.id
+
+            image_source = (
+                draft.local_tmp_path
+                if draft.local_tmp_path and draft.local_tmp_path.exists()
+                else buf
+            )
+            if image_source is None:
+                raise RuntimeError(
+                    f"No local image or buffer available for {draft.source_item_id}"
+                )
+
+            file_ext = (
+                draft.local_tmp_path.suffix.lstrip(".").lower()
+                if draft.local_tmp_path
+                else Path(draft.original_name or "image.jpg").suffix.lstrip(".").lower()
+            ) or "jpg"
+
+            staged_image = staging.stage_accepted_image(
+                job_id,
+                batch.batch_index,
+                window.window_index,
+                asset_id,
+                file_ext,
+                image_source,
+            )
+
+            if self._checksum(staged_image) != checksum:
+                raise IOError(
+                    f"Staged image checksum mismatch for {draft.source_item_id}"
+                )
+
+            nas_path = str(staged_image)
+            annotation_nas_path = None
+            annotation_format = AnnotationFormat.NONE
+
+            if draft.annotation_tmp_path and draft.annotation_tmp_path.exists():
+                annotation_format = AnnotationFormat(
+                    draft.annotation_format or AnnotationFormat.NONE
+                )
+
+                annotation_dir = (
+                    staging.get_window_staging_dir(
+                        job_id, batch.batch_index, window.window_index
+                    ) / "annotations"
+                )
+                annotation_dir.mkdir(parents=True, exist_ok=True)
+
+                annotation_ext = draft.annotation_tmp_path.suffix.lower() or ".txt"
+                annotation_dest = annotation_dir / f"{asset_id}{annotation_ext}"
+                annotation_tmp = annotation_dir / (
+                    f".{asset_id}.{uuid.uuid4().hex}.tmp"
+                )
+
+                try:
+                    shutil.copy2(draft.annotation_tmp_path, annotation_tmp)
+                    annotation_tmp.replace(annotation_dest)
+                except Exception:
+                    annotation_tmp.unlink(missing_ok=True)
+                    raise
+
+                annotation_nas_path = str(annotation_dest)
+
+        else:
+            rel_dest = self._relative_path(job_id, source_type, draft)
+
+            if buf is not None and (
+                not draft.local_tmp_path or not draft.local_tmp_path.exists()
+            ):
+                dest_path = (
+                    self.storage.resolve(rel_dest)
+                    if hasattr(self.storage, "resolve")
+                    else Path(rel_dest)
+                )
+                dest_path.parent.mkdir(parents=True, exist_ok=True)
+                buf.stage_to_file(dest_path)
+                nas_path = str(dest_path)
+            else:
+                nas_path = self.storage.write(draft.local_tmp_path, rel_dest)
+
+            annotation_nas_path = None
+            annotation_format = AnnotationFormat.NONE
+
+            if draft.annotation_tmp_path and draft.annotation_tmp_path.exists():
+                ann_rel_dest = self._relative_annotation_path(
+                    job_id, source_type, draft
+                )
+                annotation_nas_path = self.storage.write(
+                    draft.annotation_tmp_path, ann_rel_dest
+                )
+                annotation_format = AnnotationFormat(
+                    draft.annotation_format or AnnotationFormat.NONE
+                )
+
+        file_format = (
+            draft.local_tmp_path.suffix.lstrip(".").lower()
+            if draft.local_tmp_path
+            else Path(draft.original_name or "image.jpg").suffix.lstrip(".").lower()
+        )
 
         asset = Asset(
-            id=uuid.uuid4(),
+            id=reservation.asset_id if reservation and reservation.asset_id else (
+                reservation.id if reservation else uuid.uuid4()
+            ),
             job_id=job_id,
             job_source_task_id=job_source_task_id,
+            batch_id=batch_id,
+            window_id=window_id,
             source_type=source_type,
             source_item_id=draft.source_item_id,
             source_url=draft.source_url,
@@ -137,7 +307,7 @@ class StandardizationService:
             original_name=draft.original_name,
             width=width,
             height=height,
-            file_format=draft.local_tmp_path.suffix.lstrip(".").lower(),
+            file_format=file_format or "jpg",
             checksum_sha256=checksum,
             phash=phash,
             embedding=embedding,
@@ -146,10 +316,19 @@ class StandardizationService:
             annotation_nas_path=annotation_nas_path,
             classes=draft.classes,
             status=AssetStatus.PROMOTED,
-            asset_metadata=draft.metadata,
+            asset_metadata=metadata,
             promoted_at=datetime.now(timezone.utc),
         )
-        return self.asset_repo.upsert(asset)
+
+        stored_asset, created = self.asset_repo.upsert(asset)
+
+        if reservation is not None:
+            reservation.status = "STAGED"
+            reservation.asset_id = stored_asset.id
+            reservation.lease_expires_at = None
+            reservation.updated_at = datetime.now(timezone.utc)
+
+        return stored_asset, created
 
     def _validate_image(self, path: Path) -> tuple[int, int]:
         try:

@@ -1,0 +1,331 @@
+"""Atomic, window-scoped candidate admission using PostgreSQL row locks."""
+
+from __future__ import annotations
+
+import hashlib
+import uuid
+from datetime import datetime, timezone
+
+from sqlalchemy import func, select
+
+from app.core.config import get_settings
+from app.db.models.candidate_reservation import CandidateReservation
+from app.db.models.candidate_window import CandidateWindow
+from app.db.models.image_batch import ImageBatch
+from app.db.models.job_source_task import JobSourceTask
+from app.db.session import session_scope
+
+MAX_CANDIDATES_PER_WINDOW = 600
+
+TERMINAL_WINDOW_STATES = {"COMPLETED", "LOCAL_FALLBACK"}
+
+ALLOWED_WINDOW_STATES = {
+    "OPEN",
+    "ACQUIRING",
+    "FULL",
+    "PROCESSING",
+    "FILTERING",
+    "UPLOADING",
+    "NAS_PENDING",
+    "VERIFYING",
+    "PAUSED",
+    "FAILED",
+    "COMPLETED",
+    "LOCAL_FALLBACK",
+}
+
+
+def configured_limit() -> int:
+    value = int(get_settings().download_candidate_window)
+    return max(1, min(MAX_CANDIDATES_PER_WINDOW, value))
+
+
+def bounded_source_item_id(value: str) -> str:
+    value = str(value)
+    if not value:
+        raise ValueError("source_item_id cannot be empty")
+    if len(value) <= 512:
+        return value
+
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:24]
+    return f"{value[:487]}_{digest}"
+
+
+def open_candidate_window(
+    batch_id: uuid.UUID | str,
+) -> uuid.UUID:
+    """Get the current nonterminal window or explicitly create the next one.
+
+    A new window is created only if the preceding window is COMPLETED or
+    LOCAL_FALLBACK. Those states must only be set after durable commitment.
+    """
+
+    batch_uuid = uuid.UUID(str(batch_id))
+
+    with session_scope() as db:
+        batch = db.execute(
+            select(ImageBatch)
+            .where(ImageBatch.id == batch_uuid)
+            .with_for_update()
+        ).scalar_one_or_none()
+
+        if batch is None:
+            raise ValueError(f"ImageBatch {batch_uuid} does not exist")
+
+        latest = db.execute(
+            select(CandidateWindow)
+            .where(CandidateWindow.batch_id == batch_uuid)
+            .order_by(CandidateWindow.window_index.desc())
+            .limit(1)
+            .with_for_update()
+        ).scalar_one_or_none()
+
+        if latest is not None:
+            if latest.status not in TERMINAL_WINDOW_STATES:
+                return latest.id
+            next_index = latest.window_index + 1
+        else:
+            next_index = 1
+
+        window = CandidateWindow(
+            id=uuid.uuid4(),
+            batch_id=batch_uuid,
+            job_id=batch.job_id,
+            window_index=next_index,
+            candidate_limit=configured_limit(),
+            status="OPEN",
+        )
+
+        db.add(window)
+        db.flush()
+        window_id = window.id
+        db.commit()
+        return window_id
+
+
+def reserve_candidate(
+    window_id: uuid.UUID | str,
+    job_source_task_id: uuid.UUID | str,
+    source_type: str,
+    source_item_id: str,
+) -> uuid.UUID | None:
+    """Atomically reserve one candidate before its download begins.
+
+    Returns a reservation UUID when admitted.
+    Returns None for duplicates, inactive windows, or exhausted capacity.
+
+    All reservations, including failed candidates, consume window capacity.
+    """
+
+    window_uuid = uuid.UUID(str(window_id))
+    task_uuid = uuid.UUID(str(job_source_task_id))
+    source_value = str(getattr(source_type, "value", source_type))
+    item_key = bounded_source_item_id(source_item_id)
+
+    if not source_value or len(source_value) > 32:
+        raise ValueError("source_type must contain 1-32 characters")
+
+    with session_scope() as db:
+        window = db.execute(
+            select(CandidateWindow)
+            .where(CandidateWindow.id == window_uuid)
+            .with_for_update()
+        ).scalar_one_or_none()
+
+        if window is None or window.status not in ("OPEN", "ACQUIRING"):
+            return None
+
+        task = db.get(JobSourceTask, task_uuid)
+        if task is None or task.job_id != window.job_id:
+            return None
+
+        task_source = str(getattr(task.source_type, "value", task.source_type))
+        if task_source != source_value:
+            return None
+
+        # Protect against the same candidate appearing in another window.
+        existing = db.execute(
+            select(CandidateReservation.id).where(
+                CandidateReservation.batch_id == window.batch_id,
+                CandidateReservation.source_type == source_value,
+                CandidateReservation.source_item_id == item_key,
+            )
+        ).scalar_one_or_none()
+
+        if existing is not None:
+            return None
+
+        used = db.execute(
+            select(func.count(CandidateReservation.id)).where(
+                CandidateReservation.window_id == window_uuid
+            )
+        ).scalar_one()
+
+        effective_limit = max(
+            1, min(MAX_CANDIDATES_PER_WINDOW, int(window.candidate_limit))
+        )
+
+        if used >= effective_limit:
+            window.status = "FULL"
+            db.commit()
+            return None
+
+        reservation = CandidateReservation(
+            id=uuid.uuid4(),
+            window_id=window_uuid,
+            batch_id=window.batch_id,
+            job_id=window.job_id,
+            job_source_task_id=task_uuid,
+            source_type=source_value,
+            source_item_id=item_key,
+            status="RESERVED",
+        )
+
+        db.add(reservation)
+
+        if used + 1 >= effective_limit:
+            window.status = "FULL"
+        else:
+            window.status = "ACQUIRING"
+
+        db.flush()
+        reservation_id = reservation.id
+        db.commit()
+        return reservation_id
+
+
+def mark_candidate_staged(
+    reservation_id: uuid.UUID | str,
+    asset_id: uuid.UUID | str,
+) -> bool:
+    """Link a durably staged asset to its candidate reservation."""
+
+    reservation_uuid = uuid.UUID(str(reservation_id))
+    asset_uuid = uuid.UUID(str(asset_id))
+
+    with session_scope() as db:
+        reservation = db.execute(
+            select(CandidateReservation)
+            .where(CandidateReservation.id == reservation_uuid)
+            .with_for_update()
+        ).scalar_one_or_none()
+
+        if reservation is None:
+            return False
+
+        if reservation.status not in ("RESERVED", "STAGED"):
+            return reservation.status == "COMMITTED"
+
+        reservation.status = "STAGED"
+        reservation.asset_id = asset_uuid
+        reservation.lease_expires_at = None
+        reservation.updated_at = datetime.now(timezone.utc)
+
+        db.commit()
+        return True
+
+
+def mark_candidate_failed(
+    reservation_id: uuid.UUID | str,
+) -> bool:
+    """Record failure without releasing the candidate's reserved capacity."""
+
+    reservation_uuid = uuid.UUID(str(reservation_id))
+
+    with session_scope() as db:
+        reservation = db.execute(
+            select(CandidateReservation)
+            .where(CandidateReservation.id == reservation_uuid)
+            .with_for_update()
+        ).scalar_one_or_none()
+
+        if reservation is None:
+            return False
+
+        if reservation.status in ("STAGED", "COMMITTED"):
+            return False
+
+        reservation.status = "FAILED"
+        reservation.lease_expires_at = None
+        reservation.updated_at = datetime.now(timezone.utc)
+
+        db.commit()
+        return True
+
+
+def set_candidate_window_status(
+    window_id: uuid.UUID | str,
+    status: str,
+) -> bool:
+    """Explicitly transition a window; does not automatically open another."""
+
+    window_uuid = uuid.UUID(str(window_id))
+    new_status = str(status).upper()
+
+    if new_status not in ALLOWED_WINDOW_STATES:
+        raise ValueError(f"Unsupported candidate window status: {new_status}")
+
+    if new_status in TERMINAL_WINDOW_STATES:
+        raise ValueError(
+            "Terminal states require verified NAS or durable local-fallback "
+            "completion; use an evidence-backed completion function."
+        )
+
+    with session_scope() as db:
+        window = db.execute(
+            select(CandidateWindow)
+            .where(CandidateWindow.id == window_uuid)
+            .with_for_update()
+        ).scalar_one_or_none()
+
+        if window is None:
+            return False
+
+        if window.status in TERMINAL_WINDOW_STATES:
+            return window.status == new_status
+
+        if new_status in TERMINAL_WINDOW_STATES:
+            window.completed_at = datetime.now(timezone.utc)
+
+        window.status = new_status
+        window.updated_at = datetime.now(timezone.utc)
+        db.commit()
+        return True
+
+
+def get_candidate_window_stats(
+    window_id: uuid.UUID | str,
+) -> dict[str, int | str]:
+    """Return reservation usage for one specific candidate window."""
+
+    window_uuid = uuid.UUID(str(window_id))
+
+    with session_scope() as db:
+        window = db.get(CandidateWindow, window_uuid)
+
+        if window is None:
+            raise ValueError(f"CandidateWindow {window_uuid} does not exist")
+
+        rows = db.execute(
+            select(
+                CandidateReservation.status,
+                func.count(CandidateReservation.id),
+            )
+            .where(CandidateReservation.window_id == window_uuid)
+            .group_by(CandidateReservation.status)
+        ).all()
+
+        counts = {str(status): int(count) for status, count in rows}
+        used = sum(counts.values())
+        limit = max(1, min(MAX_CANDIDATES_PER_WINDOW, int(window.candidate_limit)))
+
+        return {
+            "window_id": str(window_uuid),
+            "window_index": int(window.window_index),
+            "status": str(window.status),
+            "reserved": used,
+            "limit": limit,
+            "remaining": max(0, limit - used),
+            "staged": counts.get("STAGED", 0),
+            "failed": counts.get("FAILED", 0),
+        }

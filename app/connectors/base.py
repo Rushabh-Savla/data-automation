@@ -20,7 +20,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 import requests
 
@@ -162,21 +162,12 @@ def limited_concurrency(
     stuck mid-handshake, say) can block every future caller with no visible
     error at all. Raises `TimeoutError` if no slot opens up in time.
     """
-    try:
-        lock_dir.mkdir(parents=True, exist_ok=True)
-    except (PermissionError, OSError):
-        lock_dir = Path("/tmp") / "_shared_cache" / lock_dir.name
-        lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_dir.mkdir(parents=True, exist_ok=True)
     handle = None
     started = time.monotonic()
     while handle is None:
         for slot in random.sample(range(slots), slots):  # random order spreads contention
-            try:
-                candidate = open(lock_dir / f".{name}.slot{slot}", "a")  # noqa: SIM115 - held for the slot's lifetime
-            except (PermissionError, OSError):
-                lock_dir = Path("/tmp") / "_shared_cache" / lock_dir.name
-                lock_dir.mkdir(parents=True, exist_ok=True)
-                candidate = open(lock_dir / f".{name}.slot{slot}", "a")
+            candidate = open(lock_dir / f".{name}.slot{slot}", "a")  # noqa: SIM115 - held for the slot's lifetime
             try:
                 fcntl.flock(candidate, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
@@ -344,6 +335,7 @@ class RawAssetDraft:
     height: int | None = None
     classes: list = field(default_factory=list)
     metadata: dict = field(default_factory=dict)
+    buffer: Any = None
 
 
 # Injected by the task wrapper: returns True if the job has been paused/cancelled.

@@ -39,18 +39,19 @@ from sqlalchemy.orm import Session
 from app.db.models.asset import Asset
 from app.db.models.job import Job
 from app.db.models.job_source_task import JobSourceTask
-from app.domain.enums import AssetStatus
+from app.domain.enums import (
+    ASSET_ACCEPTED_STATUSES,
+    RELEVANCE_ACCEPTED_STATUSES,
+    AssetStatus,
+)
 
 logger = logging.getLogger(__name__)
 
-# Statuses that mean "this asset survived and counts toward the target".
-# PROMOTED is included because an asset that has not been filtered yet is
-# provisionally accepted — the same convention ASSET_ACCEPTED_STATUSES uses.
-_ACCEPTED = (
-    AssetStatus.PROMOTED,
-    AssetStatus.RELEVANCE_PENDING,
-    AssetStatus.RELEVANCE_PASSED,
-)
+# Statuses that mean "this asset survived filtering and is accepted toward the target".
+# Strictly: {RELEVANCE_PASSED, READY_FOR_UPLOAD, UPLOADING, NAS_VERIFIED, COMPLETED}.
+# Unverified NAS uploads (READY_FOR_UPLOAD, UPLOADING) count toward candidate target progress,
+# but are NEVER counted as NAS-verified or completed.
+_ACCEPTED = tuple(RELEVANCE_ACCEPTED_STATUSES)
 _REJECTED = (AssetStatus.RELEVANCE_REJECTED, AssetStatus.FAILED)
 _DUPLICATE = (AssetStatus.DUPLICATE,)
 
@@ -120,6 +121,13 @@ def reconcile(db: Session, job_id: uuid.UUID) -> dict[str, int]:
 
     result = {
         "accepted": job.accepted_count,
+        "relevance_accepted": totals.get(AssetStatus.RELEVANCE_PASSED.value, 0),
+        "upload_pending": totals.get(AssetStatus.READY_FOR_UPLOAD.value, 0),
+        "uploading": totals.get(AssetStatus.UPLOADING.value, 0),
+        "nas_verified": totals.get(AssetStatus.NAS_VERIFIED.value, 0),
+        "completed": totals.get(AssetStatus.COMPLETED.value, 0),
+        "review_pending": totals.get(AssetStatus.REVIEW_PENDING.value, 0),
+        "retry_pending": totals.get(AssetStatus.RETRY_PENDING.value, 0),
         "rejected": job.rejected_count,
         "duplicate": job.duplicate_count,
         "downloaded": job.downloaded_count,

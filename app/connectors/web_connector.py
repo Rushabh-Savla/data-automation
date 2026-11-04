@@ -45,7 +45,7 @@ from app.connectors.base import (
     SourceItem,
     register_connector,
 )
-from app.core.exceptions import FatalConnectorError, JobStopped, TransientConnectorError
+from app.core.exceptions import CandidateWindowFull, FatalConnectorError, JobStopped, TransientConnectorError
 from app.domain.enums import SourceType
 
 logger = logging.getLogger(__name__)
@@ -280,6 +280,7 @@ class WebScrapeConnector:
         checkpoint: dict,
         should_stop: ShouldStopFn,
         on_progress: OnProgressFn,
+        admit_candidate=None,
     ) -> Iterator[RawAssetDraft]:
         if should_stop():
             raise JobStopped("should_stop() signalled before web shard download started")
@@ -303,7 +304,7 @@ class WebScrapeConnector:
             on_progress({"checkpoint": {}})
             raise JobStopped("should_stop() signalled after web shard download")
 
-        yield from self._walk_output(output_dir, item.dataset_identifier or "", on_progress)
+        yield from self._walk_output(output_dir, item.dataset_identifier or "", on_progress, admit_candidate=admit_candidate)
 
     @staticmethod
     def _run_img2dataset(url_list_path: Path, output_dir: Path, shard_id: str) -> None:
@@ -343,7 +344,7 @@ class WebScrapeConnector:
             tail = "\n".join(result.stderr.strip().splitlines()[-20:])
             raise TransientConnectorError(f"img2dataset failed for shard {shard_id} (exit {result.returncode}): {tail}")
 
-    def _walk_output(self, output_dir: Path, query: str, on_progress: OnProgressFn) -> Iterator[RawAssetDraft]:
+    def _walk_output(self, output_dir: Path, query: str, on_progress: OnProgressFn, admit_candidate=None) -> Iterator[RawAssetDraft]:
         from PIL import Image
 
         if not output_dir.exists():
@@ -363,20 +364,51 @@ class WebScrapeConnector:
                 on_progress({"rejected": 1})
                 continue
 
+            original_url = meta.get("url", "")
+            source_item_id = hashlib.md5(original_url.encode()).hexdigest()[:16]
+
+            admission = None
+            if admit_candidate is not None:
+                admission = admit_candidate(source_item_id)
+                raw_status = getattr(admission, "status", "")
+                status = str(getattr(raw_status, "value", raw_status)).upper()
+                if status == "DUPLICATE":
+                    continue
+                if status == "WINDOW_FULL":
+                    raise CandidateWindowFull(
+                        getattr(admission, "window_id", None),
+                        getattr(admission, "window_index", None),
+                        0,
+                    )
+                if status != "ADMITTED":
+                    raise FatalConnectorError(
+                        f"Candidate admission failed for {source_item_id}: {status}"
+                    )
+
             try:
                 with Image.open(img_path) as im:
                     im.verify()
                 with Image.open(img_path) as im:
                     w, h = im.size
                 if w < self.min_w or h < self.min_h:
+                    if admission is not None and getattr(admission, "reservation_id", None):
+                        from app.services.candidate_reservation_service import mark_candidate_failed
+                        mark_candidate_failed(admission.reservation_id)
                     on_progress({"rejected": 1})
                     continue
             except Exception:
+                if admission is not None and getattr(admission, "reservation_id", None):
+                    from app.services.candidate_reservation_service import mark_candidate_failed
+                    mark_candidate_failed(admission.reservation_id)
                 on_progress({"rejected": 1})
                 continue
 
-            original_url = meta.get("url", "")
-            source_item_id = hashlib.md5(original_url.encode()).hexdigest()[:16]
+            metadata = {"search_query": query}
+            if admission is not None:
+                metadata["candidate_reservation_id"] = str(admission.reservation_id)
+                metadata["candidate_window_id"] = str(admission.window_id)
+                metadata["candidate_window_index"] = int(admission.window_index)
+
             draft = RawAssetDraft(
                 source_item_id=source_item_id,
                 source_url=original_url,
@@ -386,7 +418,7 @@ class WebScrapeConnector:
                 original_name=img_path.name,
                 width=w,
                 height=h,
-                metadata={"search_query": query},
+                metadata=metadata,
             )
             on_progress({"downloaded": 1})
             yield draft

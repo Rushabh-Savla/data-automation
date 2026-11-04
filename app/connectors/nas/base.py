@@ -41,8 +41,13 @@ _SKIPPED_DIR_NAMES = frozenset(
 
 
 def _is_skipped_dir(name: str) -> bool:
-    # ".Trash", ".Trash-1000", ... — freedesktop trash folders are per-user named.
-    return name in _SKIPPED_DIR_NAMES or name.startswith(".Trash")
+    # Skip hidden unix dirs, Synology/QNAP/Windows system & recycle bins
+    lower = name.lower()
+    return (
+        lower in {s.lower() for s in _SKIPPED_DIR_NAMES}
+        or lower.startswith((".trash", "#recycle", "@recycle", "$recycle"))
+        or name.startswith((".", "#", "@", "$"))
+    )
 
 CONNECT_TIMEOUT_S = 15
 IO_TIMEOUT_S = 60
@@ -171,6 +176,26 @@ class NasClient(ABC):
     def size(self, rel: str) -> int | None:
         """Size in bytes, or None if the file does not exist."""
 
+    def compute_checksum(self, rel: str) -> str | None:
+        """Computes SHA256 checksum of the remote file at `rel`.
+
+        Subclasses may override with direct streaming.
+        Default downloads to a temporary file and hashes.
+        """
+        import hashlib
+        import tempfile
+
+        if not self.exists(rel):
+            return None
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir) / "check.tmp"
+            self.download(rel, tmp_path)
+            h = hashlib.sha256()
+            with open(tmp_path, "rb") as f:
+                while chunk := f.read(65536):
+                    h.update(chunk)
+            return h.hexdigest()
+
     # -- shared behaviour ------------------------------------------------------
     def download(self, rel: str, local: Path) -> None:
         """Download via a .part file so an interrupted transfer never leaves a
@@ -242,7 +267,14 @@ class NasClient(ABC):
                 return
             current, depth = stack.pop()
             listed += 1
-            entries = sorted(self.list_dir(current), key=lambda e: e.name)
+            try:
+                entries = sorted(self.list_dir(current), key=lambda e: e.name)
+            except (NasAuthError, PermissionError, OSError):
+                # An individual subdirectory may have restricted permissions (e.g. #Recycle,
+                # .Trash-1000, or admin-only folders). Skip it rather than aborting the walk.
+                if depth == 0:
+                    raise
+                continue
             subdirs: list[tuple[str, int]] = []
             for entry in entries:
                 child = f"{current}/{entry.name}" if current else entry.name

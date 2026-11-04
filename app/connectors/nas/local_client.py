@@ -91,3 +91,14 @@ class LocalClient(NasClient):
     def size(self, rel: str) -> int | None:
         target = self._abs(rel)
         return target.stat().st_size if target.is_file() else None
+
+    def compute_checksum(self, rel: str) -> str | None:
+        import hashlib
+        src = self._abs(rel)
+        if not src.is_file():
+            return None
+        h = hashlib.sha256()
+        with open(src, "rb") as f:
+            while chunk := f.read(65536):
+                h.update(chunk)
+        return h.hexdigest()
