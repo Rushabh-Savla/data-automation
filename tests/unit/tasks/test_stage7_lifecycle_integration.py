@@ -918,7 +918,8 @@ def test_20_atomic_ticket_reservation_and_stale_worker_rejection(db_session, mon
     db_session.commit()
 
     with patch("app.storage.ram_buffer.LocalStagingManager.is_staging_backpressure_active", return_value=False), \
-         patch("app.tasks.batch_orchestration.JobService._dispatch", return_value=None):
+         patch("app.tasks.batch_orchestration.JobService._dispatch", return_value=None), \
+         patch("app.tasks.batch_orchestration.get_redis", return_value=MagicMock()):
         # 1. Stale worker with old ticket is rejected
         res_stale = dispatch_batch_candidate_window(str(job.id), str(batch.id), candidate_count=50, ticket="stale-ticket-999")
         assert res_stale["status"] == "rejected_stale_ticket"

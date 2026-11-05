@@ -251,6 +251,33 @@ def _classify_batch(
     return decisions
 
 
+@celery_app.task(name="app.tasks.filtering_tasks.evaluate_transient_candidate_task", queue="filtering")
+def evaluate_transient_candidate_task(
+    image_path: str,
+    query: str,
+    threshold: float = 0.40,
+    fingerprint: str | None = None,
+) -> tuple[str, float | None]:
+    """Evaluates a single transient candidate image using SAM 3.1 on GPU.
+
+    Returns (outcome, score) where outcome is 'accept' | 'reject' | 'error'.
+    """
+    from app.filtering.sam3_filter import Sam3Verifier, OUTCOME_ACCEPT, OUTCOME_REJECT, OUTCOME_ERROR
+
+    try:
+        verifier = Sam3Verifier(default_threshold=threshold)
+        outcome, score = verifier.evaluate_asset(
+            image_item=image_path,
+            query=query,
+            threshold=threshold,
+            fingerprint=fingerprint,
+        )
+        return outcome, score
+    except Exception as exc:
+        logger.exception(f"[EARLY RELEVANCE] Inference failed for {image_path}: {exc}")
+        return OUTCOME_ERROR, None
+
+
 @celery_app.task(name="app.tasks.filtering_tasks.rerun_relevance_filter", bind=True)
 def rerun_relevance_filter(self, job_id: str, include_rejected: bool = False):
     """Re-judges a job's assets with the current relevance gate.

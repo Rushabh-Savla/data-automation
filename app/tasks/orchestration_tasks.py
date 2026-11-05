@@ -234,24 +234,37 @@ def check_and_advance_job(job_id: str) -> None:
                 process_active_batch.delay(str(job_uuid))
             return
 
+        pending_tiers = job.config.get("_orchestration_pending_tiers") or []
         remaining_sources = job.config.get("_fast_path_remaining_sources") or []
         target_reached = job.target_count is not None and job.accepted_count >= job.target_count
 
-        if remaining_sources and not target_reached and all_terminal:
+        if (pending_tiers or remaining_sources) and not target_reached and all_terminal:
+            current_tier = job.config.get("_orchestration_tier", 1)
+            next_tier_sources = []
+            new_pending_tiers = []
+
+            if pending_tiers:
+                next_tier_sources = pending_tiers[0]
+                new_pending_tiers = pending_tiers[1:]
+                next_tier_num = current_tier + 1
+            else:
+                next_tier_sources = remaining_sources
+                next_tier_num = current_tier + 1
+
             redis_client = get_redis()
-            escalate_key = f"job:{job_id}:fast_path_escalated"
+            escalate_key = f"job:{job_id}:tier_escalated_{next_tier_num}"
             if not redis_client.set(escalate_key, "1", nx=True, ex=86400):
-                # Another concurrent caller already claimed the escalation —
-                # nothing more to do this round; its own dispatch will make
-                # this job's task set non-terminal again until it finishes.
+                # Another concurrent caller already claimed this tier escalation
                 return
 
             new_config = dict(job.config)
-            new_config.pop("_fast_path_remaining_sources", None)
+            new_config["_orchestration_tier"] = next_tier_num
+            new_config["_orchestration_pending_tiers"] = new_pending_tiers
+            new_config["_fast_path_remaining_sources"] = [s for tier in new_pending_tiers for s in tier]
             job_repo.set_config(job_uuid, new_config)
 
             new_tasks = []
-            for source_value in remaining_sources:
+            for source_value in next_tier_sources:
                 task = JobSourceTask(id=uuid.uuid4(), job_id=job_uuid, source_type=source_value)
                 task_repo.create(task)
                 new_tasks.append((source_value, task.id))
@@ -259,11 +272,18 @@ def check_and_advance_job(job_id: str) -> None:
 
         else:
             new_tasks = None
+            next_tier_num = 1
+            next_tier_sources = []
 
-    if remaining_sources and not target_reached and new_tasks:
+    if new_tasks:
         from app.services.job_service import _SOURCE_DISCOVERY_TASKS, JobService
 
-        logger.info(f"Fast-path escalation for job {job_id}: target not reached from web, dispatching {remaining_sources}")
+        tier_names = {1: "Tier 1 (Web)", 2: "Tier 2 (Videos: YouTube)", 3: "Tier 3 (Datasets)"}
+        tier_label = tier_names.get(next_tier_num, f"Tier {next_tier_num}")
+        logger.info(
+            f"[RESOURCE ORCHESTRATION] Escalating Job {job_id} to {tier_label} "
+            f"because target not yet met ({job.accepted_count}/{job.target_count}). Dispatching: {next_tier_sources}"
+        )
         for source_value, task_id in new_tasks:
             task_path = _SOURCE_DISCOVERY_TASKS.get(SourceType(source_value))
             if task_path is not None:

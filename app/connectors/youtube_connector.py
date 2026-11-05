@@ -36,6 +36,7 @@ Changes (2024-09):
 """
 
 import logging
+import shutil
 import subprocess
 from collections.abc import Iterator
 from pathlib import Path
@@ -721,6 +722,15 @@ class YouTubeConnector:
             raise FatalConnectorError(f"No local video file to extract frames from for {url}")
 
         start_index = checkpoint.get("frame_index", 0) if stage == "extracting" else 0
+        import inspect
+        extract_kwargs = {}
+        try:
+            sig = inspect.signature(self._extract_frames)
+            if "admit_candidate" in sig.parameters or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+                extract_kwargs["admit_candidate"] = admit_candidate
+        except Exception:
+            extract_kwargs["admit_candidate"] = admit_candidate
+
         try:
             yield from self._extract_frames(
                 video_id,
@@ -731,7 +741,7 @@ class YouTubeConnector:
                 start_index,
                 should_stop,
                 on_progress,
-                admit_candidate=admit_candidate,
+                **extract_kwargs,
             )
         finally:
             self._cleanup_video_files(video_dir, video_id)

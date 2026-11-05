@@ -160,6 +160,9 @@ def _run_item_download(
             base_on_progress(delta)
 
         min_res = tuple(task.job.config.get("min_resolution", (64, 64))) if task.job else (64, 64)
+        job_query = task.job.query if task.job else ""
+        job_config = task.job.config if task.job else {}
+        relevance_thresh = job_config.get("relevance_threshold", 0.40)
 
         accepted = downloaded = rejected = 0
 
@@ -183,12 +186,36 @@ def _run_item_download(
         try:
             for draft in fetch(checkpoint, should_stop, on_progress):
                 try:
+                    relevance_score = None
+                    if draft.local_tmp_path and draft.local_tmp_path.exists():
+                        from app.services.relevance_gate_service import evaluate_transient_candidate
+                        outcome, score = evaluate_transient_candidate(
+                            image_path=draft.local_tmp_path,
+                            query=job_query,
+                            threshold=relevance_thresh,
+                            min_resolution=min_res,
+                        )
+                        if outcome == "reject":
+                            draft.local_tmp_path.unlink(missing_ok=True)
+                            if draft.annotation_tmp_path:
+                                draft.annotation_tmp_path.unlink(missing_ok=True)
+                            mark_draft_reservation_failed(draft)
+                            rejected += 1
+                            on_progress({"rejected": 1})
+                            continue
+                        elif outcome == "accept":
+                            relevance_score = score
+
                     standardize_and_promote_sync(
-                        job_uuid, task_uuid, source_type, draft, min_res
+                        job_uuid, task_uuid, source_type, draft, min_res, relevance_score=relevance_score
                     )
                     downloaded += 1
                     accepted += 1
                 except AssetRejected:
+                    if draft.local_tmp_path:
+                        draft.local_tmp_path.unlink(missing_ok=True)
+                    if draft.annotation_tmp_path:
+                        draft.annotation_tmp_path.unlink(missing_ok=True)
                     mark_draft_reservation_failed(draft)
                     rejected += 1
                     on_progress({"rejected": 1})
@@ -491,13 +518,22 @@ def download_youtube_video(self, job_id: str, job_source_task_id: str, item_dict
     admit_candidate = _make_admit_candidate(job_source_task_id, SourceType.YOUTUBE)
 
     def fetch(checkpoint, should_stop, on_progress):
+        import inspect
+        kwargs = {}
+        try:
+            sig = inspect.signature(connector.fetch)
+            if "admit_candidate" in sig.parameters or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+                kwargs["admit_candidate"] = admit_candidate
+        except Exception:
+            kwargs["admit_candidate"] = admit_candidate
+
         yield from connector.fetch(
             item,
             workdir,
             checkpoint,
             should_stop,
             on_progress,
-            admit_candidate=admit_candidate,
+            **kwargs,
         )
 
     try:
@@ -579,13 +615,22 @@ def download_coco_shard(self, job_id: str, job_source_task_id: str, item_dict: d
         )
 
     def fetch(checkpoint, should_stop, on_progress):
+        import inspect
+        kwargs = {}
+        try:
+            sig = inspect.signature(connector.fetch)
+            if "admit_candidate" in sig.parameters or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+                kwargs["admit_candidate"] = admit_candidate
+        except Exception:
+            kwargs["admit_candidate"] = admit_candidate
+
         yield from connector.fetch(
             item,
             workdir,
             checkpoint,
             should_stop,
             on_progress,
-            admit_candidate=admit_candidate,
+            **kwargs,
         )
 
     return _run_item_download(job_id, job_source_task_id, SourceType.COCO, shard_id, fetch, bound_task=self)

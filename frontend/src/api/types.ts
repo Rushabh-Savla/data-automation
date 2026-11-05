@@ -280,6 +280,7 @@ export interface JobResponse {
   /** Set on a run that a template spawned; points at the template. */
   parent_job_id: string | null
   config?: JobConfig | null
+  nas_destination?: string | null
 }
 
 export interface JobDetailResponse extends JobResponse {

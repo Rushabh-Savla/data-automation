@@ -335,12 +335,9 @@ def enqueue_nas_batch(
     """Enqueues an accepted batch into the centralized NAS upload queue and DB."""
     with session_scope() as db:
         transfer_repo = NasTransferBatchRepository(db)
-        if remote_dest is None:
-            try:
-                params = get_active_storage_params()
-                remote_dest = params.storage_path if params else "data_automation"
-            except Exception:
-                remote_dest = "data_automation"
+        from app.domain.nas_resolver import resolve_job_nas_destination
+        job = db.execute(select(Job).where(Job.id == job_id)).scalar_one_or_none()
+        remote_dest = resolve_job_nas_destination(job, default_storage=remote_dest)
 
         manifest_file = Path(manifest_path) if manifest_path else None
         total_files = 0
@@ -435,13 +432,11 @@ def enqueue_nas_window(
 
         asset_ids.append(asset_id)
 
-    if remote_dest is None:
-        params = get_active_storage_params()
-        remote_dest = (
-            params.storage_path if params else "data_automation"
-        )
-
     with session_scope() as db:
+        from app.domain.nas_resolver import resolve_job_nas_destination
+        job = db.execute(select(Job).where(Job.id == job_id)).scalar_one_or_none()
+        remote_dest = resolve_job_nas_destination(job, default_storage=remote_dest)
+
         batch = db.execute(
             select(ImageBatch).where(ImageBatch.id == batch_id)
         ).scalar_one_or_none()
@@ -654,6 +649,12 @@ class NasBatchWriter:
         job = self.db.execute(select(Job).where(Job.id == transfer.job_id)).scalar_one_or_none()
         job_folder = job_folder_name(job.name if job else None, transfer.job_id)
 
+        from app.domain.nas_resolver import resolve_job_nas_destination
+        effective_storage_path = resolve_job_nas_destination(
+            job,
+            default_storage=transfer.remote_path or (self.params.storage_path if self.params else None),
+        )
+
         # Handle durable transfer recovery before reading a staging manifest.
         if transfer.transfer_status == TransferStatus.COMPLETED:
             return {
@@ -770,6 +771,8 @@ class NasBatchWriter:
                 active_client,
                 window_id=transfer.window_id,
                 window_index=window_index,
+                storage_path=effective_storage_path,
+                manifest_path=manifest_path,
             )
 
         except (TransientConnectorError, ConnectionError, TimeoutError, OSError) as exc:
@@ -801,6 +804,8 @@ class NasBatchWriter:
         client: NasClient,
         window_id: uuid.UUID | None = None,
         window_index: int | None = None,
+        storage_path: str = "data_automation",
+        manifest_path: Path | None = None,
     ) -> dict:
         uploaded_count = 0
         total_bytes = 0
@@ -886,7 +891,7 @@ class NasBatchWriter:
 
             if window_id is not None:
                 final_rel = _remote_rel_for_window(
-                    self.params.storage_path,
+                    storage_path,
                     local_img_path,
                     batch.job_id,
                     job_folder,
@@ -895,7 +900,7 @@ class NasBatchWriter:
                 )
             else:
                 final_rel = _remote_rel_for(
-                    self.params.storage_path,
+                    storage_path,
                     local_img_path,
                     job_folder,
                 )
@@ -909,7 +914,7 @@ class NasBatchWriter:
             final_ann_rel = (
                 (
                     _remote_rel_for_window(
-                        self.params.storage_path,
+                        storage_path,
                         local_ann_path,
                         batch.job_id,
                         job_folder,
@@ -918,7 +923,7 @@ class NasBatchWriter:
                     )
                     if window_id is not None
                     else _remote_rel_for(
-                        self.params.storage_path,
+                        storage_path,
                         local_ann_path,
                         job_folder,
                     )
@@ -1029,6 +1034,21 @@ class NasBatchWriter:
                 "failed_files": failed_count,
                 "pending_files": max(0, total_items - uploaded_count - failed_count),
             }
+
+        # Publish verified manifest to NAS destination folder alongside images
+        if manifest_path and manifest_path.exists():
+            try:
+                owner_tag = getattr(self.lock, "owner_token", "default")[:8] if self.lock else "direct"
+                if window_id is not None and window_index is not None:
+                    manifest_remote_rel = f"{storage_path}/{job_folder}/batch_{batch.batch_index:03d}/window_{int(window_index):04d}/manifest.json"
+                else:
+                    manifest_remote_rel = f"{storage_path}/{job_folder}/batch_{batch.batch_index:03d}/manifest.json"
+                manifest_tmp = f"{manifest_remote_rel}.{transfer_id.hex[:8]}.{owner_tag}.part"
+                client._upload(manifest_path, manifest_tmp)
+                self._safe_publish(client, manifest_tmp, manifest_remote_rel, compute_file_sha256(manifest_path))
+                logger.info(f"[NAS WRITER] Uploaded verified manifest to {manifest_remote_rel}")
+            except Exception as e:
+                logger.warning(f"[NAS WRITER] Non-fatal: could not upload remote manifest: {e}")
 
         self.transfer_repo.mark_verified(transfer_id, owner_token=owner_token)
         if batch.status not in (BatchStatus.REPLENISHING, BatchStatus.DOWNLOADING, BatchStatus.PROCESSING):

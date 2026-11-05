@@ -91,37 +91,29 @@ def run_connection_test(params: NasConnectionParams, require_write: bool = False
         # 2. Test writing storage folder
         can_write = False
         write_err: str | None = None
-        has_storage_folder = bool(
-            params.storage_path
-            and params.storage_path.strip()
-            and params.storage_path.strip() != "data_automation"
-        )
-        if has_storage_folder:
-            try:
-                _probe_write(client, params.storage_path)
-                can_write = True
-            except Exception as exc:  # noqa: BLE001
-                can_write = False
-                write_err = f"cannot write to storage folder '{params.storage_path}': {exc}"
-        else:
+        try:
+            _probe_write(client, params.storage_path)
             can_write = True
+        except Exception as exc:  # noqa: BLE001
+            can_write = False
+            write_err = f"cannot write to storage folder '{params.storage_path}': {exc}"
 
         # 3. Determine overall success (ok) and message
-        if require_write and has_storage_folder:
-            ok = can_write and can_read
+        if require_write:
+            ok = can_write
         else:
             ok = can_read
 
         messages: list[str] = []
-        if can_read and (can_write or not has_storage_folder):
-            if not sample_files and params.base_path:
+        if can_read and can_write:
+            if not sample_files:
                 messages.append("Source folder contains no images.")
-            messages.append("NAS connection verified and accessible.")
+            messages.append("Share can be read and written.")
         elif can_read and not can_write:
-            if require_write and has_storage_folder:
+            if require_write:
                 messages.append(write_err or "cannot write to storage folder")
             else:
-                if not sample_files and params.base_path:
+                if not sample_files:
                     messages.append("Source folder contains no images.")
                 messages.append("Source folder can be read.")
         elif not can_read and can_write:

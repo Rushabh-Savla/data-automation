@@ -27,12 +27,8 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-# Connectors prohibited from auto/random selection
-PROHIBITED_AUTO_SOURCES: frozenset[SourceType] = frozenset({
-    SourceType.YOUTUBE,
-    SourceType.KITTI,
-    SourceType.NUSCENES,
-})
+# Connectors prohibited from auto/random selection (empty by default; YouTube is handled as Tier 2)
+PROHIBITED_AUTO_SOURCES: frozenset[SourceType] = frozenset()
 
 
 class SourceDispatchService:

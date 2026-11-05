@@ -30,6 +30,7 @@ def standardize_and_promote_sync(
     source_type: SourceType,
     draft: RawAssetDraft,
     min_resolution: tuple[int, int] = (64, 64),
+    relevance_score: float | None = None,
 ) -> tuple[AssetStatus, bool]:
     """Runs standardization inline within the caller's DB session/transaction."""
     settings = get_settings()
@@ -56,7 +57,7 @@ def standardize_and_promote_sync(
             service = StandardizationService(asset_repo, storage, min_resolution)
             try:
                 asset, created = service.standardize_and_promote(
-                    job_id, job_source_task_id, source_type, draft
+                    job_id, job_source_task_id, source_type, draft, relevance_score=relevance_score
                 )
                 return asset.status, created
             except AssetRejected as e:

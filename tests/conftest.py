@@ -9,6 +9,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 # only app.core.security.CredentialCipher() with no explicit key needs it,
 # and the tests that exercise that pass their own key explicitly.
 os.environ.setdefault("DATABASE_URL", "postgresql+psycopg://postgres:postgres@localhost:5432/data_automation_test")
+os.environ.setdefault("LOCAL_STAGING_PATH", "/tmp/data_automation_staging")
+os.environ.setdefault("NAS_ROOT", "/tmp/data_automation_nas")
 
 import pytest
 from sqlalchemy import create_engine, event

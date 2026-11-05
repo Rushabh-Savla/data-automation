@@ -135,28 +135,30 @@ class JobService:
         job_config = dict(config or {})
         job_config["source_selection_mode"] = effective_mode.value
 
-        # Fast path: for a small auto-sourced target count, dispatching every
-        # connector at once wastes time — Kaggle/Roboflow pull whole datasets
-        # and YouTube downloads+extracts video, all much slower than web
-        # scraping for a handful of images. Try web alone first; the
-        # remaining sources only get created/dispatched later if web didn't
-        # reach the target (see orchestration_tasks.check_and_advance_job's
-        # escalation branch). An explicit `sources` list is a deliberate
-        # user choice and is never deferred like this.
-        settings = get_settings()
-        deferred_sources: list[SourceType] = []
-        if (
-            was_auto_sourced
-            and settings.fast_path_enabled
-            and target_count is not None
-            and target_count <= settings.fast_path_max_target_count
-            and SourceType.WEB in sources
-        ):
-            deferred_sources = [s for s in sources if s != SourceType.WEB]
-            dispatch_sources = [SourceType.WEB]
-            job_config["_fast_path_remaining_sources"] = [s.value for s in deferred_sources]
+        # Intelligent Resource Orchestration:
+        # - Automatic Mode: Web Images (Tier 1) -> Videos (Tier 2) -> Dataset Resources (Tier 3)
+        # - Manual Mode: Concurrently execute every user-selected source
+        from app.domain.resource_orchestration import build_orchestration_tiers
+
+        if was_auto_sourced:
+            tiers = build_orchestration_tiers(sources)
+            if tiers:
+                dispatch_sources = tiers[0]
+                pending_tiers = [[s.value for s in t] for t in tiers[1:]]
+            else:
+                dispatch_sources = sources
+                pending_tiers = []
+
+            job_config["_orchestration_mode"] = "auto"
+            job_config["_orchestration_tier"] = 1
+            job_config["_orchestration_pending_tiers"] = pending_tiers
+            job_config["_fast_path_remaining_sources"] = [s.value for t in tiers[1:] for s in t] if tiers else []
         else:
+            # Manual Mode: all sources selected by the user run concurrently
             dispatch_sources = sources
+            job_config["_orchestration_mode"] = "manual"
+            job_config["_orchestration_tier"] = 1
+            job_config["_orchestration_pending_tiers"] = []
 
         # A recurring template also sits in SCHEDULED, and stays there: it is
         # never started itself, only swept by scan_schedules, which creates a

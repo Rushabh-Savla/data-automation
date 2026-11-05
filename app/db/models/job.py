@@ -33,6 +33,11 @@ class Job(Base):
             self.config = {}
         self.config["source_selection_mode"] = str(getattr(value, "value", value))
 
+    @property
+    def nas_destination(self) -> str:
+        from app.domain.nas_resolver import resolve_job_nas_destination
+        return resolve_job_nas_destination(self)
+
     target_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     deadline_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     scheduled_start_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

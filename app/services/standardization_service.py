@@ -105,6 +105,7 @@ class StandardizationService:
         job_source_task_id: uuid.UUID,
         source_type: SourceType,
         draft: RawAssetDraft,
+        relevance_score: float | None = None,
     ) -> tuple[Asset, bool]:
         """Validate and persist an asset.
 
@@ -315,7 +316,8 @@ class StandardizationService:
             annotation_format=annotation_format,
             annotation_nas_path=annotation_nas_path,
             classes=draft.classes,
-            status=AssetStatus.PROMOTED,
+            status=AssetStatus.RELEVANCE_PASSED if relevance_score is not None else AssetStatus.PROMOTED,
+            relevance_score=relevance_score,
             asset_metadata=metadata,
             promoted_at=datetime.now(timezone.utc),
         )

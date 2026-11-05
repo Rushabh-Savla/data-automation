@@ -23,6 +23,10 @@ export function JobSummaryCard({ job }: { job: JobDetailResponse }) {
           <Field label="Sources" value={job.sources.map((s) => sourceTypeLabels[s as keyof typeof sourceTypeLabels] ?? s).join(', ')} />
           <Field label="Rejected" value={String(job.rejected_count)} />
           <Field label="Duplicates" value={String(job.duplicate_count)} />
+          <Field
+            label="NAS Destination"
+            value={job.nas_destination || (job.config?.nas_storage_path as string | undefined) || 'Local storage (default)'}
+          />
           <Field label="Deadline" value={job.deadline_at ? formatDateTime(job.deadline_at) : 'None'} />
           <Field label="Created" value={formatDateTime(job.created_at)} />
           <Field label="Started" value={job.started_at ? formatDateTime(job.started_at) : '—'} />

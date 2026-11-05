@@ -188,9 +188,8 @@ def purge_orphan_work_dirs() -> dict:
             # the workdir out from under them would silently and permanently lose
             # the image (offload_asset_batch would find the local file gone and
             # have nothing left to retry).
-            pending_offload_task_ids = {
-                row[0]
-                for row in db.execute(
+            pending_offload_task_ids = set(
+                db.execute(
                     select(Asset.job_source_task_id)
                     .where(
                         Asset.job_source_task_id.in_(list(task_ids.values())),
@@ -199,8 +198,8 @@ def purge_orphan_work_dirs() -> dict:
                         ~Asset.nas_path.like(f"{asset_files.NAS_SCHEME}%"),
                     )
                     .distinct()
-                ).scalars()
-            }
+                ).scalars().all()
+            )
 
         for entry, task_id in task_ids.items():
             status = status_by_id.get(task_id)

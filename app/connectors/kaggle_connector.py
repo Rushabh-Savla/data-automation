@@ -196,7 +196,7 @@ class KaggleConnector:
             return
         for file_path in list(directory.rglob("*")):
             if file_path.is_file() and is_archive(file_path):
-                extract_dir = file_path.parent / f"{file_path.stem}_extracted"
+                extract_dir = file_path.parent / file_path.stem
                 if extract_dir.exists():
                     file_path.unlink(missing_ok=True)
                     continue
