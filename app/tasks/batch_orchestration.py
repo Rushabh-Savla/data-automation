@@ -374,6 +374,10 @@ def process_active_batch(self, job_id: str):
     bind_job_context(job_id)
 
     with session_scope() as db:
+        from app.services.job_counters import reconcile
+        reconcile(db, job_uuid)
+        db.commit()
+
         orchestrator = BatchOrchestrator(db, job_uuid)
         active_batch = orchestrator.get_or_create_active_batch()
         if active_batch is None:

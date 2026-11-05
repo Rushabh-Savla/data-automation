@@ -33,7 +33,7 @@ class JobCreateRequest(BaseModel):
         default=None,
         description="Source selection strategy: manual, auto, or random.",
     )
-    name: str = Field(..., min_length=1, description="Job name — also used to name its NAS storage folder")
+    name: str | None = Field(default=None, description="Job name — also used to name its NAS storage folder")
     target_count: int | None = Field(default=None, gt=0)
     deadline_at: datetime | None = None
     scheduled_start_at: datetime | None = None
@@ -51,6 +51,8 @@ class JobCreateRequest(BaseModel):
     @model_validator(mode="after")
     def _validate_config(self):
         import math
+        if not self.name or not self.name.strip():
+            self.name = self.query
         if self.config is not None:
             thresh = self.config.get("relevance_threshold")
             if thresh is None:

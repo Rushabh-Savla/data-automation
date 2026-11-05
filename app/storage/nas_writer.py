@@ -1172,6 +1172,10 @@ class NasBatchWriter:
         window.completed_at = datetime.now(timezone.utc)
         self.db.commit()
 
+        from app.services.job_counters import reconcile
+        reconcile(self.db, batch.job_id)
+        self.db.commit()
+
         manager = WindowStagingManager()
         staging_dir = manager.get_window_staging_dir(
             batch.job_id,
@@ -1278,6 +1282,10 @@ class NasBatchWriter:
         )
         for a in self.db.execute(stmt).scalars():
             a.status = AssetStatus.COMPLETED
+
+        from app.services.job_counters import reconcile
+        reconcile(self.db, batch.job_id)
+        self.db.commit()
 
         # Only complete the batch if it's not currently replenishing or downloading shortfall replacements
         batch_completed = False

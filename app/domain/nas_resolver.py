@@ -72,7 +72,11 @@ def resolve_job_nas_destination(
     if hasattr(job_or_config, "config") and isinstance(job_or_config.config, dict):
         custom_path = job_or_config.config.get("nas_storage_path")
     elif isinstance(job_or_config, dict):
-        custom_path = job_or_config.get("nas_storage_path")
+        cfg = job_or_config.get("config")
+        if isinstance(cfg, dict):
+            custom_path = cfg.get("nas_storage_path")
+        if not custom_path:
+            custom_path = job_or_config.get("nas_storage_path") or job_or_config.get("nas_destination")
 
     sanitized_custom = sanitize_nas_path(custom_path)
     if sanitized_custom:

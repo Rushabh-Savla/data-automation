@@ -565,6 +565,11 @@ def evaluate_job_completion(self, job_id: str):
             clear_job_context()
             return
 
+        from app.services.job_counters import reconcile
+        reconcile(db, job_uuid)
+        db.commit()
+        db.refresh(job)
+
         # Always enforce strict target consistency before making the completion snapshot:
         # If accepted assets exceed target_count, trim the lowest confidence excess assets
         # down to exactly target_count.
