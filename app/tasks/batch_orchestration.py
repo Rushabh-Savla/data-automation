@@ -306,26 +306,21 @@ class BatchOrchestrator:
         total_accepted = already_completed_count + len(assets)
 
         if batch.target_image_count and total_accepted > batch.target_image_count:
-            excess = total_accepted - batch.target_image_count
-            logger.info(
-                f"[BATCH MANIFEST] Batch #{batch.batch_index} has {total_accepted} accepted assets against target "
-                f"{batch.target_image_count}. Trimming {excess} surplus asset(s) with lowest confidence scores."
-            )
-            from app.services.standardization_service import delete_asset_files
-            surplus = sorted(assets, key=lambda a: (a.relevance_score is not None, a.relevance_score or 0.0))[:excess]
-            for a in surplus:
-                a.status = AssetStatus.RELEVANCE_REJECTED
-                delete_asset_files(a)
-                assets.remove(a)
-            self.db.flush()
+            from app.tasks.filtering_tasks import trim_excess_assets
+            trim_excess_assets(str(self.job_id))
+            self.db.expire_all()
+            assets = list(self.db.execute(stmt).scalars().all())
 
         # Update batch accepted_image_count to match exact kept assets across the batch
         self.batch_repo.reconcile_batch_counters(batch_id)
 
-        # Transition valid assets from RELEVANCE_PASSED to READY_FOR_UPLOAD
+        # Transition valid assets from RELEVANCE_PASSED to READY_FOR_UPLOAD only if file exists on disk
+        valid_assets = []
         for a in assets:
-            if a.status == AssetStatus.RELEVANCE_PASSED:
-                a.status = AssetStatus.READY_FOR_UPLOAD
+            if a.nas_path and Path(a.nas_path).is_file():
+                if a.status == AssetStatus.RELEVANCE_PASSED:
+                    a.status = AssetStatus.READY_FOR_UPLOAD
+                valid_assets.append(a)
 
         manifest_data = {
             "batch_id": str(batch.id),
@@ -333,7 +328,7 @@ class BatchOrchestrator:
             "batch_index": batch.batch_index,
             "job_query": job.query if job else "",
             "target_count": batch.target_image_count,
-            "accepted_count": len(assets),
+            "accepted_count": len(valid_assets),
             "created_at": datetime.now(timezone.utc).isoformat(),
             "items": [
                 {
@@ -346,7 +341,7 @@ class BatchOrchestrator:
                     "annotation_path": a.annotation_nas_path,
                     "classes": a.classes,
                 }
-                for a in assets
+                for a in valid_assets
             ],
         }
 

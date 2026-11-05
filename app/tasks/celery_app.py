@@ -190,6 +190,14 @@ def _cap_gpu_memory(**_):
 def _track_active_task(task_id=None, task=None, args=None, kwargs=None, **_):
     """Records this task's id under the job's active-task set so cancel() can
     revoke(terminate=True) it if it's already executing, not just queued."""
+    if not task or not getattr(task, "name", None):
+        return
+    task_name = task.name
+    if not (
+        task_name.startswith("app.tasks.discovery_tasks")
+        or task_name.startswith("app.tasks.ingest_tasks")
+    ):
+        return
     job_id = (kwargs or {}).get("job_id") or (args[0] if args else None)
     if not job_id:
         return

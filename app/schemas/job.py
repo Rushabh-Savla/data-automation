@@ -46,6 +46,7 @@ class JobCreateRequest(BaseModel):
         ),
     )
     schedule_timezone: str = "UTC"
+    nas_storage_path: str | None = None
     config: dict = Field(default_factory=dict)
 
     @model_validator(mode="after")
@@ -53,7 +54,10 @@ class JobCreateRequest(BaseModel):
         import math
         if not self.name or not self.name.strip():
             self.name = self.query
-        if self.config is not None:
+        if self.config is None:
+            self.config = {}
+        if self.nas_storage_path:
+            self.config["nas_storage_path"] = self.nas_storage_path.strip()
             thresh = self.config.get("relevance_threshold")
             if thresh is None:
                 thresh = self.config.get("yolo_world_conf_threshold")

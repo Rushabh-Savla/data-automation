@@ -618,7 +618,8 @@ def evaluate_job_completion(self, job_id: str):
                 shutil.rmtree(staging_dir, ignore_errors=True)
 
         # Actively revoke any lingering discovery or download tasks still executing for this job
-        cancellation.revoke_active_tasks(job_id)
+        current_id = {self.request.id} if getattr(self, "request", None) and getattr(self.request, "id", None) else set()
+        cancellation.revoke_active_tasks(job_id, exclude_task_ids=current_id)
         if new_status in (JobStatus.COMPLETED, JobStatus.COMPLETED_PARTIAL):
             cancellation.mark_target_reached(job_id)
         else:
