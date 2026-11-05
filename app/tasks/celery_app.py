@@ -80,7 +80,7 @@ celery_app.conf.update(
         },
         "purge-orphan-work-dirs": {
             "task": "app.tasks.cleanup_tasks.purge_orphan_work_dirs",
-            "schedule": 6 * 3600.0,
+            "schedule": 300.0,
         },
         # Removes the NAS copy of images that stopped being kept (see nas_tasks).
         "nas-leak-sweep": {

@@ -42,13 +42,8 @@ services:
     ports:
       - "8010:8000"
     volumes:
-      # Bind mounts (not named volumes): NAS_ROOT/WORK_ROOT stay the same
-      # host folder whether the API/worker run natively (uv run uvicorn,
-      # NAS_ROOT=./nas_data) or via this compose file — a named volume here
-      # would silently diverge into a second, container-only copy the moment
-      # someone switches between the two, which is exactly the class of bug
-      # this comment exists to prevent regressing (assets created one way
-      # become invisible/404 the other way).
+      - ./app:/srv/app
+      - ./sam3:/srv/sam3
       - ./nas_data:/nas
       - ./work_data:/work
     depends_on:
@@ -68,7 +63,7 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile.worker
-    command: ["uv", "run", "--no-sync", "celery", "-A", "app.tasks.celery_app", "worker", "--loglevel=info", "--concurrency=8",
+    command: ["uv", "run", "--no-sync", "celery", "-A", "app.tasks.celery_app", "worker", "--loglevel=info", "--concurrency=5",
               "-Q", "celery,discovery,download,standardize,cleanup,orchestration,export"]
     env_file: .env
     environment:
@@ -76,6 +71,7 @@ services:
       REDIS_URL: redis://redis:6379/0
       NAS_ROOT: /nas
       WORK_ROOT: /work
+      PYTHONPATH: "/srv/sam3:/srv"
       # NAS offload runs on this worker (standardize queue) — its own
       # rotating log file, separate from the rest of the worker's stdout.
       NAS_LOG_FILE: /srv/logs/nas.log
@@ -85,13 +81,8 @@ services:
       # app/tasks/celery_app.py.
       TORCH_NUM_THREADS: "2"
     volumes:
-      # Bind mounts (not named volumes): NAS_ROOT/WORK_ROOT stay the same
-      # host folder whether the API/worker run natively (uv run uvicorn,
-      # NAS_ROOT=./nas_data) or via this compose file — a named volume here
-      # would silently diverge into a second, container-only copy the moment
-      # someone switches between the two, which is exactly the class of bug
-      # this comment exists to prevent regressing (assets created one way
-      # become invisible/404 the other way).
+      - ./app:/srv/app
+      - ./sam3:/srv/sam3
       - ./nas_data:/nas
       - ./work_data:/work
       - ./logs:/srv/logs
@@ -120,7 +111,7 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile.worker
-    command: ["uv", "run", "--no-sync", "celery", "-A", "app.tasks.celery_app", "worker", "--loglevel=info", "--concurrency=2",
+    command: ["uv", "run", "--no-sync", "celery", "-A", "app.tasks.celery_app", "worker", "--loglevel=info", "--concurrency=1",
               "-Q", "filtering"]
     env_file: .env
     environment:
@@ -128,14 +119,13 @@ services:
       REDIS_URL: redis://redis:6379/0
       NAS_ROOT: /nas
       WORK_ROOT: /work
+      PYTHONPATH: "/srv/sam3:/srv"
       NVIDIA_VISIBLE_DEVICES: all
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
-      TORCH_NUM_THREADS: "4"
-      # Hard ceiling on the fraction of total VRAM this process may allocate,
-      # enforced by torch itself (see _cap_gpu_memory in app/tasks/celery_app.py).
-      # 2 children x 0.35 leaves ~30% of the card free for everything else on
-      # the host.
-      TORCH_CUDA_MEMORY_FRACTION: "0.35"
+      TORCH_NUM_THREADS: "2"
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+      # Ceiling on VRAM per child. Single worker child x 0.55 leaves ~45% (~7.3 GB) for Ollama and host.
+      TORCH_CUDA_MEMORY_FRACTION: "0.55"
     deploy:
       resources:
         reservations:
@@ -144,6 +134,8 @@ services:
               count: 1
               capabilities: [gpu]
     volumes:
+      - ./app:/srv/app
+      - ./sam3:/srv/sam3
       - ./nas_data:/nas
       - ./work_data:/work
       # Model weights (YOLO-World .pt, HuggingFace SmolVLM, CLIP) are large and
@@ -171,13 +163,8 @@ services:
       NAS_ROOT: /nas
       WORK_ROOT: /work
     volumes:
-      # Bind mounts (not named volumes): NAS_ROOT/WORK_ROOT stay the same
-      # host folder whether the API/worker run natively (uv run uvicorn,
-      # NAS_ROOT=./nas_data) or via this compose file — a named volume here
-      # would silently diverge into a second, container-only copy the moment
-      # someone switches between the two, which is exactly the class of bug
-      # this comment exists to prevent regressing (assets created one way
-      # become invisible/404 the other way).
+      - ./app:/srv/app
+      - ./sam3:/srv/sam3
       - ./nas_data:/nas
       - ./work_data:/work
     depends_on:

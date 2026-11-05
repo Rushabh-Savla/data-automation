@@ -29,6 +29,7 @@ from pathlib import Path
 
 import requests
 
+from app.connectors.archive_handler import is_archive, safe_extract_archive
 from app.connectors.base import (
     DiscoveryPage,
     OnProgressFn,
@@ -45,7 +46,7 @@ logger = logging.getLogger(__name__)
 RF_UNIVERSE_BASE = "https://universe.roboflow.com"
 RF_API_BASE = "https://api.roboflow.com"
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff"}
-_FORMAT_FALLBACK = ["yolov8", "yolov5pytorch", "coco", "voc"]
+_FORMAT_FALLBACK = ["yolov8", "folder", "yolov5pytorch", "coco", "voc"]
 _SDK_DOWNLOAD_TIMEOUT_S = 600
 # Matches Asset.source_item_id's column width (see the migration widening it
 # from 128 -> 512, prompted by real Roboflow exports overflowing 128 once
@@ -177,35 +178,54 @@ class RoboflowConnector:
 
     # -- Download --------------------------------------------------------------
 
-    def _resolve_latest_version(self, workspace: str, project: str) -> int | None:
-        """Looks up the project's actual latest version number instead of
-        guessing — Universe search results don't carry this, and assuming 1
-        fails permanently (not transiently) whenever a project's real
-        version differs. Returns None if the lookup itself fails, so the
-        caller can fall back to its own default rather than raising here."""
+    def _resolve_project_details(self, workspace: str, project: str) -> dict:
+        """Looks up the project's actual latest version and project type (e.g. classification)."""
         try:
             key = self._next_key()
             resp = requests.get(f"{RF_API_BASE}/{workspace}/{project}", params={"api_key": key}, timeout=15)
             resp.raise_for_status()
             data = resp.json()
         except Exception as e:
-            logger.debug(f"Could not resolve latest version for {workspace}/{project}: {e}")
-            return None
+            logger.debug(f"Could not resolve project details for {workspace}/{project}: {e}")
+            return {"latest_version": None, "type": "object-detection", "exports": []}
 
-        project_info = data.get("project", data)
-        versions = project_info.get("versions") or data.get("versions") or []
-        version_ids = []
-        for v in versions:
-            vid = v.get("id") if isinstance(v, dict) else v
-            if not vid:
-                continue
-            # Version "id" comes back as "workspace/project/<number>".
-            tail = str(vid).rsplit("/", 1)[-1]
-            if tail.isdigit():
-                version_ids.append(int(tail))
-        if version_ids:
-            return max(version_ids)
-        return None
+        project_info = data.get("project") or data
+        p_type = str(project_info.get("type", "object-detection")).lower()
+
+        raw_versions = data.get("versions")
+        if not isinstance(raw_versions, list):
+            raw_versions = project_info.get("versions")
+
+        latest = None
+        exports = []
+        if isinstance(raw_versions, int):
+            latest = raw_versions
+        elif isinstance(raw_versions, list):
+            version_ids = []
+            for v in raw_versions:
+                if isinstance(v, dict):
+                    vid = v.get("id")
+                    if v.get("exports"):
+                        exports = v.get("exports")
+                else:
+                    vid = v
+                if not vid:
+                    continue
+                tail = str(vid).rsplit("/", 1)[-1]
+                if tail.isdigit():
+                    version_ids.append(int(tail))
+            if version_ids:
+                latest = max(version_ids)
+
+        return {"latest_version": latest, "type": p_type, "exports": exports}
+
+    def _resolve_latest_version(self, workspace: str, project: str) -> int | None:
+        """Looks up the project's actual latest version number instead of
+        guessing — Universe search results don't carry this, and assuming 1
+        fails permanently (not transiently) whenever a project's real
+        version differs. Returns None if the lookup itself fails, so the
+        caller can fall back to its own default rather than raising here."""
+        return self._resolve_project_details(workspace, project).get("latest_version")
 
     def fetch(
         self,
@@ -231,19 +251,36 @@ class RoboflowConnector:
         workspace = item.external_ref["workspace"]
         project = item.external_ref["project"]
         version = item.external_ref.get("version")
-        if version is None:
-            version = self._resolve_latest_version(workspace, project) or 1
-            # Cache the resolved version back onto the item so a retry of
-            # this same fetch (checkpoint resume, re-queue, etc.) doesn't
-            # re-resolve it and risk picking a different number mid-job.
-            item.external_ref["version"] = version
+        project_type = item.external_ref.get("project_type")
+        if version is None or project_type is None:
+            details = self._resolve_project_details(workspace, project)
+            if version is None:
+                version = details.get("latest_version") or 1
+                item.external_ref["version"] = version
+            if project_type is None:
+                project_type = details.get("type", "object-detection")
+                item.external_ref["project_type"] = project_type
+
         license_name = item.license_hint or "Unknown"
         dataset_url = f"{RF_UNIVERSE_BASE}/{workspace}/{project}"
+
+        extract_dir = workdir / "roboflow_cache" / f"{workspace}__{project}__v{version}"
+        if extract_dir.exists() and any(
+            f.suffix.lower() in IMAGE_EXTENSIONS for f in extract_dir.rglob("*") if f.is_file() and not f.name.startswith(".")
+        ):
+            logger.info(
+                f"[ROBOFLOW] Reusing existing cached extraction for {workspace}/{project} in {extract_dir}"
+            )
+            yield from self._walk_export_dir(
+                extract_dir, workspace, project, version, license_name, dataset_url, checkpoint, should_stop, on_progress,
+                admit_candidate=admit_candidate,
+            )
+            return
 
         try:
             yield from self._api_download(
                 workspace, project, version, license_name, dataset_url, workdir, checkpoint, should_stop, on_progress,
-                admit_candidate=admit_candidate,
+                admit_candidate=admit_candidate, project_type=project_type,
             )
             return
         except JobStopped:
@@ -253,14 +290,18 @@ class RoboflowConnector:
 
         yield from self._sdk_download(
             workspace, project, version, license_name, dataset_url, workdir, checkpoint, should_stop, on_progress,
-            admit_candidate=admit_candidate,
+            admit_candidate=admit_candidate, project_type=project_type,
         )
 
     def _api_download(
         self, workspace, project, version, license_name, dataset_url, workdir, checkpoint, should_stop, on_progress,
-        admit_candidate=None,
+        admit_candidate=None, project_type: str = "object-detection",
     ) -> Iterator[RawAssetDraft]:
-        formats_to_try = [self.export_format] + [f for f in _FORMAT_FALLBACK if f != self.export_format]
+        if "classification" in str(project_type).lower():
+            formats_to_try = ["folder", "clip"]
+        else:
+            formats_to_try = [self.export_format] + [f for f in _FORMAT_FALLBACK if f != self.export_format]
+
         link = None
         for fmt in formats_to_try:
             link = self._try_format(workspace, project, version, fmt)
@@ -288,9 +329,7 @@ class RoboflowConnector:
                         raise JobStopped(f"should_stop() signalled mid-download for {workspace}/{project}")
                     f.write(chunk)
 
-        with zipfile.ZipFile(zip_path, "r") as zf:
-            zf.extractall(extract_dir)
-        zip_path.unlink(missing_ok=True)
+        safe_extract_archive(zip_path, extract_dir, remove_archive=True)
 
         yield from self._walk_export_dir(
             extract_dir, workspace, project, version, license_name, dataset_url, checkpoint, should_stop, on_progress,
@@ -331,7 +370,7 @@ class RoboflowConnector:
 
     def _sdk_download(
         self, workspace, project, version, license_name, dataset_url, workdir, checkpoint, should_stop, on_progress,
-        admit_candidate=None,
+        admit_candidate=None, project_type: str = "object-detection",
     ) -> Iterator[RawAssetDraft]:
         # version_obj.download() below is one uninterruptible blocking SDK
         # call with no should_stop() hook of its own (same limitation as
@@ -370,10 +409,21 @@ class RoboflowConnector:
         export_dir.mkdir(parents=True, exist_ok=True)
 
         def _do_download():
+            fmt = "folder" if "classification" in str(project_type).lower() else self.export_format
             try:
-                version_obj.download(model_format=self.export_format, location=str(export_dir), overwrite=True)
-            except TypeError:
-                version_obj.download(model_format=self.export_format, location=str(export_dir))
+                try:
+                    version_obj.download(model_format=fmt, location=str(export_dir), overwrite=True)
+                except TypeError:
+                    version_obj.download(model_format=fmt, location=str(export_dir))
+            except Exception as e:
+                if ("classification" in str(e).lower() or "invalid format" in str(e).lower()) and fmt != "folder":
+                    logger.info(f"Retrying Roboflow SDK export for {workspace}/{project} with 'folder' format")
+                    try:
+                        version_obj.download(model_format="folder", location=str(export_dir), overwrite=True)
+                    except TypeError:
+                        version_obj.download(model_format="folder", location=str(export_dir))
+                else:
+                    raise
 
         with ThreadPoolExecutor(max_workers=1) as executor:
             future = executor.submit(_do_download)
@@ -383,6 +433,13 @@ class RoboflowConnector:
                 raise TransientConnectorError(
                     f"Roboflow SDK export stalled past {_SDK_DOWNLOAD_TIMEOUT_S}s for {workspace}/{project}"
                 ) from e
+            except Exception as e:
+                if _looks_inaccessible(e):
+                    logger.warning(
+                        f"Roboflow project '{workspace}/{project}' cannot be exported ({e}) — skipping it."
+                    )
+                    return
+                raise
 
         yield from self._walk_export_dir(
             export_dir, workspace, project, version, license_name, dataset_url, checkpoint, should_stop, on_progress,
@@ -393,40 +450,78 @@ class RoboflowConnector:
         self, export_dir, workspace, project, version, license_name, dataset_url, checkpoint, should_stop, on_progress,
         admit_candidate=None,
     ) -> Iterator[RawAssetDraft]:
+        # Unpack any nested archives found inside export_dir
+        for arch in list(export_dir.rglob("*")):
+            if arch.is_file() and is_archive(arch):
+                try:
+                    safe_extract_archive(arch, remove_archive=True)
+                except Exception as e:
+                    logger.warning(f"Could not extract nested archive {arch.name}: {e}")
+
         splits = ["train", "valid", "test"]
+        yielded_any = False
+        cp = dict(checkpoint or {})
         for split in splits:
-            img_dir = export_dir / split / "images"
-            lbl_dir = export_dir / split / "labels"
-            if not img_dir.exists():
-                img_dir = export_dir / "images"
-                lbl_dir = export_dir / "labels"
-            if not img_dir.exists():
+            split_dir = export_dir / split
+            if not split_dir.exists():
                 continue
-            start_index = checkpoint.get(split, {}).get("split_index", 0) if checkpoint else 0
+            split_cp = cp.get(split, {}) if isinstance(cp.get(split), dict) else {}
+            if split_cp.get("completed"):
+                continue
+            img_dir = split_dir / "images"
+            lbl_dir = split_dir / "labels"
+            target_dir = img_dir if img_dir.exists() else split_dir
+            target_lbl = lbl_dir if img_dir.exists() else None
+            start_index = split_cp.get("split_index", 0)
             yield from self._walk_split(
-                img_dir, lbl_dir, split, workspace, project, version, license_name, dataset_url,
+                target_dir, target_lbl, split, workspace, project, version, license_name, dataset_url,
                 start_index, should_stop, on_progress,
                 admit_candidate=admit_candidate,
+                checkpoint=cp,
             )
+            cp[split] = {"completed": True}
+            on_progress({"checkpoint": dict(cp)})
+            yielded_any = True
+
+        if not yielded_any:
+            img_dir = export_dir / "images"
+            lbl_dir = export_dir / "labels"
+            target_dir = img_dir if img_dir.exists() else export_dir
+            target_lbl = lbl_dir if img_dir.exists() else None
+            default_cp = cp.get("default", {}) if isinstance(cp.get("default"), dict) else {}
+            if not default_cp.get("completed"):
+                start_index = default_cp.get("split_index", 0)
+                yield from self._walk_split(
+                    target_dir, target_lbl, "default", workspace, project, version, license_name, dataset_url,
+                    start_index, should_stop, on_progress,
+                    admit_candidate=admit_candidate,
+                    checkpoint=cp,
+                )
+                cp["default"] = {"completed": True}
+                on_progress({"checkpoint": dict(cp)})
 
     def _walk_split(
         self, image_dir, label_dir, split, workspace, project, version, license_name, dataset_url,
         start_index, should_stop, on_progress,
         admit_candidate=None,
+        checkpoint=None,
     ) -> Iterator[RawAssetDraft]:
         from PIL import Image
 
         image_files = sorted(
-            f for f in image_dir.rglob("*") if f.is_file() and f.suffix.lower() in IMAGE_EXTENSIONS
+            f for f in image_dir.rglob("*")
+            if f.is_file() and f.suffix.lower() in IMAGE_EXTENSIONS and not f.name.startswith(".")
         )
         safe_ws = workspace.replace("/", "_")
         safe_proj = project.replace("/", "_")
+        cp = dict(checkpoint or {})
 
         for i, src_img in enumerate(image_files):
             if i < start_index:
                 continue
             if should_stop():
-                on_progress({"checkpoint": {split: {"split_index": i}}})
+                cp[split] = {"split_index": i}
+                on_progress({"checkpoint": dict(cp)})
                 raise JobStopped("should_stop() signalled during Roboflow split walk")
 
             source_item_id = _bounded_source_item_id(
@@ -438,10 +533,12 @@ class RoboflowConnector:
                 raw_status = getattr(admission, "status", "")
                 status = str(getattr(raw_status, "value", raw_status)).upper()
                 if status == "DUPLICATE":
-                    on_progress({"checkpoint": {split: {"split_index": i + 1}}})
+                    cp[split] = {"split_index": i + 1}
+                    on_progress({"checkpoint": dict(cp)})
                     continue
                 if status == "WINDOW_FULL":
-                    on_progress({"checkpoint": {split: {"split_index": i}}})
+                    cp[split] = {"split_index": i}
+                    on_progress({"checkpoint": dict(cp)})
                     raise CandidateWindowFull(
                         getattr(admission, "window_id", None),
                         getattr(admission, "window_index", None),
@@ -472,19 +569,25 @@ class RoboflowConnector:
             ann_path = None
             annotation_format = None
             classes: list = []
-            if label_dir.exists():
+            if label_dir is not None and label_dir.exists():
                 lbl_file = label_dir / f"{src_img.stem}.txt"
                 if lbl_file.exists():
                     ann_path = lbl_file
                     annotation_format = "yolo_txt"
                     classes = _parse_yolo_classes(lbl_file)
-            if ann_path is None:
+            if ann_path is None and label_dir is not None:
                 for coco_name in ("_annotations.coco.json", "annotations.json"):
                     coco_file = image_dir.parent / coco_name
                     if coco_file.exists():
                         ann_path = coco_file
                         annotation_format = "coco_json"
                         break
+            if not classes:
+                parent_name = src_img.parent.name
+                if parent_name not in ("images", split, "train", "valid", "test", "default", image_dir.name):
+                    classes = [parent_name]
+                else:
+                    classes = [project]
 
             metadata = {"split": split}
             if admission is not None:
@@ -506,7 +609,8 @@ class RoboflowConnector:
                 classes=classes,
                 metadata=metadata,
             )
-            on_progress({"checkpoint": {split: {"split_index": i + 1}}, "downloaded": 1})
+            cp[split] = {"split_index": i + 1}
+            on_progress({"checkpoint": dict(cp), "downloaded": 1})
             yield draft
 
 
@@ -524,6 +628,10 @@ def _looks_inaccessible(e: Exception) -> bool:
         or "missing permission" in msg
         or "graphmethodexception" in msg
         or ("version number" in msg and "not found" in msg)
+        or "invalid format" in msg
+        or "is an invalid format" in msg
+        or "project type" in msg
+        or "format for project" in msg
     )
 
 

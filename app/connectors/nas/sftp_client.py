@@ -116,10 +116,9 @@ class SftpClient(NasClient):
             return NasAuthError(f"Access denied on the NAS — check account permissions ({exc})")
         if isinstance(exc, paramiko.SSHException) and "banner" in str(exc).lower():
             return NasConnectionError(
-                f"The NAS accepted the connection but did not respond like an SSH server — "
-                f"check that {self.params.host}:{self.params.port or 22} is fully powered on "
-                "(not still restarting), that nothing else is using that port, and that no "
-                "firewall is interfering."
+                f"The NAS accepted the connection but did not respond like an SSH server ('Not allowed at this time' / banner error). "
+                f"OpenSSH 9.8+ enforces temporary rate-limiting penalties (PerSourcePenalties) when there are rapid requests "
+                f"or failed authentication attempts. Please wait ~30 seconds for the penalty cooldown to reset before retrying."
             )
         if isinstance(exc, (paramiko.SSHException, socket.timeout, TimeoutError, OSError, EOFError)):
             return NasConnectionError(f"Could not reach {self.params.host}: {self.params.redact(str(exc))}")

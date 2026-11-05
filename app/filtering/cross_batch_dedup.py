@@ -131,6 +131,7 @@ class CrossBatchDeduplicator:
         candidate_img_or_hash: str | Path | bytes,
         candidate_dims: tuple[int, int] | None = None,
         cross_job: bool | None = None,
+        reference_assets: list[Asset] | None = None,
     ) -> uuid.UUID | None:
         """Level 2: Canonical Pixel Duplicate Screening (candidate fingerprinting).
 
@@ -149,14 +150,24 @@ class CrossBatchDeduplicator:
 
         use_cross_job = cross_job if cross_job is not None else (self.dedup_scope == "global")
 
-        # Check existing assets with matching pixel_hash stored in asset_metadata
-        stmt = select(Asset).where(
-            Asset.status.in_([AssetStatus.RELEVANCE_PASSED, AssetStatus.PROMOTED])
-        )
-        if not use_cross_job:
-            stmt = stmt.where(Asset.job_id == job_id)
-
-        rows = self.db.execute(stmt).scalars().all()
+        if reference_assets is not None:
+            rows = [
+                a for a in reference_assets
+                if a.status in (AssetStatus.RELEVANCE_PASSED, AssetStatus.PROMOTED)
+                and (use_cross_job or a.job_id == job_id)
+            ]
+        else:
+            if not hasattr(self, "_pixel_ref_cache"):
+                self._pixel_ref_cache = {}
+            cache_key = (job_id, use_cross_job)
+            if cache_key not in self._pixel_ref_cache:
+                stmt = select(Asset).where(
+                    Asset.status.in_([AssetStatus.RELEVANCE_PASSED, AssetStatus.PROMOTED])
+                )
+                if not use_cross_job:
+                    stmt = stmt.where(Asset.job_id == job_id)
+                self._pixel_ref_cache[cache_key] = self.db.execute(stmt).scalars().all()
+            rows = self._pixel_ref_cache[cache_key]
         for ref_asset in rows:
             ref_meta = ref_asset.asset_metadata or {}
             ref_pixel_hash = ref_meta.get("pixel_hash")
@@ -225,6 +236,7 @@ class CrossBatchDeduplicator:
         exclude_batch_id: uuid.UUID | None = None,
         candidate_file_or_buffer: Path | bytes | None = None,
         cross_job: bool | None = None,
+        reference_assets: list[Asset] | None = None,
     ) -> DuplicateCheckResult:
         """Performs full 5-level deduplication on a candidate asset.
 
@@ -240,17 +252,30 @@ class CrossBatchDeduplicator:
 
         use_cross_job = cross_job if cross_job is not None else (self.dedup_scope == "global")
 
-        stmt = select(Asset).where(
-            Asset.id != candidate_id,
-            Asset.status == AssetStatus.RELEVANCE_PASSED,
-        )
-        if not use_cross_job:
-            stmt = stmt.where(Asset.job_id == job_id)
+        if reference_assets is not None:
+            rows = [
+                a for a in reference_assets
+                if a.id != candidate_id
+                and a.status in (AssetStatus.RELEVANCE_PASSED, AssetStatus.PROMOTED)
+                and (use_cross_job or a.job_id == job_id)
+                and (exclude_batch_id is None or a.batch_id != exclude_batch_id or a.batch_id is None)
+            ]
+        else:
+            if not hasattr(self, "_ref_cache"):
+                self._ref_cache = {}
+            cache_key = (job_id, exclude_batch_id, use_cross_job)
+            if cache_key not in self._ref_cache:
+                stmt = select(Asset).where(
+                    Asset.status.in_([AssetStatus.RELEVANCE_PASSED, AssetStatus.PROMOTED])
+                )
+                if not use_cross_job:
+                    stmt = stmt.where(Asset.job_id == job_id)
 
-        if exclude_batch_id is not None:
-            stmt = stmt.where((Asset.batch_id != exclude_batch_id) | (Asset.batch_id.is_(None)))
+                if exclude_batch_id is not None:
+                    stmt = stmt.where((Asset.batch_id != exclude_batch_id) | (Asset.batch_id.is_(None)))
 
-        rows = self.db.execute(stmt).scalars().all()
+                self._ref_cache[cache_key] = self.db.execute(stmt).scalars().all()
+            rows = [a for a in self._ref_cache[cache_key] if a.id != candidate_id]
         if not rows:
             return DuplicateCheckResult(
                 is_duplicate=False,
@@ -295,9 +320,16 @@ class CrossBatchDeduplicator:
         # If image bytes are available, run SSIM and ORB RANSAC to avoid false positives
         if candidate_file_or_buffer is not None and matched_asset.nas_path:
             try:
-                ref_local_path = local_path_for_read(str(matched_asset.nas_path))
+                ref_local_path = Path(local_path_for_read(str(matched_asset.nas_path)))
+                cand_file_path = Path(candidate_file_or_buffer) if isinstance(candidate_file_or_buffer, (str, Path)) else None
+                if not ref_local_path.exists() or (cand_file_path is not None and not cand_file_path.exists()):
+                    return DuplicateCheckResult(
+                        is_duplicate=False,
+                        category=DuplicateCategory.UNIQUE,
+                        reason="file_missing_retained",
+                    )
                 category, details = self.structural_verifier.verify_pair(
-                    candidate_file_or_buffer, Path(ref_local_path)
+                    candidate_file_or_buffer, ref_local_path
                 )
 
                 if category == DuplicateCategory.CONFIRMED_NEAR_DUPLICATE:

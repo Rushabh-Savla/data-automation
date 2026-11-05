@@ -24,6 +24,7 @@ from typing import Any, Protocol
 
 import requests
 
+from app.connectors.archive_handler import discover_valid_images, is_archive, safe_extract_archive
 from app.core.exceptions import FatalConnectorError, TransientConnectorError
 from app.domain.enums import SourceType
 

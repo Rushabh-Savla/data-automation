@@ -55,7 +55,16 @@ dependencies = [
     "clip @ git+https://github.com/ultralytics/CLIP.git",
     "imagehash>=4.3.1",
     "numpy>=1.26.0",
-    # SmolVLM-256M second-opinion visual check (app/filtering/smolvlm_filter.py)
+    "timm>=1.0.17",
+    "iopath>=0.1.10",
+    "einops>=0.8.0",
+    "pycocotools>=2.0.7",
+    "hydra-core>=1.3.0",
+    "omegaconf>=2.3.0",
+    "ftfy==6.1.1",
+    "setuptools<72",
+    "sam3",
+    # Transformers / vision backbones
     "transformers>=4.45.0",
     # torch/torchvision are pinned to a CUDA 12.4 build rather than left to
     # whatever ultralytics resolves. PyPI's default torch wheel is currently
@@ -83,6 +92,7 @@ dependencies = [
 [tool.uv.sources]
 torch = [{ index = "pytorch-cu124" }]
 torchvision = [{ index = "pytorch-cu124" }]
+sam3 = { path = "sam3", editable = true }
 
 # explicit = true: only the packages named in [tool.uv.sources] above are
 # pulled from this index. Without it every dependency would be resolved

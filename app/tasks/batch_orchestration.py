@@ -37,6 +37,8 @@ from app.domain.enums import (
     JobStatus,
     SourceType,
 )
+import app.tasks.discovery_tasks
+import app.tasks.ingest_tasks
 from app.filtering.cross_batch_dedup import CrossBatchDeduplicator
 from app.services.cancellation_service import CancellationService
 from app.services.job_service import _SOURCE_DISCOVERY_TASKS, JobService
@@ -66,17 +68,20 @@ class BatchOrchestrator:
         if job is None:
             return None
 
-        active = self.batch_repo.get_active_batch(self.job_id)
-        if active is not None:
-            return active
-
-        # Compute total accepted images across completed batches
+        # Compute total accepted images across completed / uploading batches
         existing_batches = self.batch_repo.list_for_job(self.job_id)
-        total_accepted = sum(b.accepted_image_count for b in existing_batches if b.status == BatchStatus.COMPLETED)
+        total_accepted = sum(
+            b.accepted_image_count for b in existing_batches
+            if b.status in (BatchStatus.COMPLETED, BatchStatus.READY_FOR_UPLOAD, BatchStatus.UPLOADING, BatchStatus.VERIFYING)
+        )
         
         target = job.target_count or self.settings.batch_accepted_target
         if total_accepted >= target:
             return None  # All batches fulfilled
+
+        active = self.batch_repo.get_active_batch(self.job_id)
+        if active is not None and active.status not in (BatchStatus.READY_FOR_UPLOAD, BatchStatus.UPLOADING, BatchStatus.VERIFYING):
+            return active
 
         next_index = len(existing_batches) + 1
         remaining_needed = target - total_accepted
@@ -148,19 +153,27 @@ class BatchOrchestrator:
         candidates = self.db.execute(stmt).scalars().all()
         duplicates_found = 0
 
+        use_cross_job = (dedup.dedup_scope == "global")
+        ref_stmt = select(Asset).where(
+            Asset.status.in_([AssetStatus.RELEVANCE_PASSED, AssetStatus.PROMOTED])
+        )
+        if not use_cross_job:
+            ref_stmt = ref_stmt.where(Asset.job_id == self.job_id)
+        if batch_id is not None:
+            ref_stmt = ref_stmt.where((Asset.batch_id != batch_id) | (Asset.batch_id.is_(None)))
+        reference_assets = self.db.execute(ref_stmt).scalars().all()
+        ref_by_id = {a.id: a for a in reference_assets}
+        sha_map = {a.checksum_sha256: a for a in reference_assets if a.checksum_sha256}
+
         for asset in candidates:
             # 1. Exact SHA256 check
-            dup_id = dedup.check_exact_duplicate(self.job_id, asset.checksum_sha256)
-            if dup_id and dup_id != asset.id:
-                canonical = self.asset_repo.get(dup_id)
-                if canonical:
+            if asset.checksum_sha256 and asset.checksum_sha256 in sha_map:
+                canonical = sha_map[asset.checksum_sha256]
+                if canonical.id != asset.id:
                     winner, loser = CanonicalSelector.select_canonical(canonical, asset)
                     CanonicalSelector.apply_duplicate_relationship(winner, loser)
-                else:
-                    asset.status = AssetStatus.DUPLICATE
-                    asset.is_duplicate_of = dup_id
-                duplicates_found += 1
-                continue
+                    duplicates_found += 1
+                    continue
 
             # 2. Multi-Level Perceptual, Semantic & Structural Verification
             local_cand_path = None
@@ -177,9 +190,10 @@ class BatchOrchestrator:
                 candidate_embedding=asset.embedding,
                 exclude_batch_id=batch_id,
                 candidate_file_or_buffer=local_cand_path,
+                reference_assets=reference_assets,
             )
             if result.is_duplicate and result.duplicate_of_id and result.duplicate_of_id != asset.id:
-                canonical = self.asset_repo.get(result.duplicate_of_id)
+                canonical = ref_by_id.get(result.duplicate_of_id) or self.asset_repo.get(result.duplicate_of_id)
                 if canonical:
                     winner, loser = CanonicalSelector.select_canonical(canonical, asset)
                     CanonicalSelector.apply_duplicate_relationship(winner, loser)
@@ -278,10 +292,35 @@ class BatchOrchestrator:
             Asset.batch_id == batch_id,
             Asset.status.in_([AssetStatus.RELEVANCE_PASSED, AssetStatus.READY_FOR_UPLOAD]),
         )
-        assets = self.db.execute(stmt).scalars().all()
+        assets = list(self.db.execute(stmt).scalars().all())
         if not assets:
             logger.info(f"[BATCH MANIFEST] No unuploaded accepted assets for Batch #{batch.batch_index}")
             return None
+
+        # Enforce strict count consistency: accepted assets must NEVER exceed batch.target_image_count
+        stmt_already = select(Asset).where(
+            Asset.batch_id == batch_id,
+            Asset.status.in_([AssetStatus.COMPLETED, AssetStatus.NAS_VERIFIED]),
+        )
+        already_completed_count = len(list(self.db.execute(stmt_already).scalars().all()))
+        total_accepted = already_completed_count + len(assets)
+
+        if batch.target_image_count and total_accepted > batch.target_image_count:
+            excess = total_accepted - batch.target_image_count
+            logger.info(
+                f"[BATCH MANIFEST] Batch #{batch.batch_index} has {total_accepted} accepted assets against target "
+                f"{batch.target_image_count}. Trimming {excess} surplus asset(s) with lowest confidence scores."
+            )
+            from app.services.standardization_service import delete_asset_files
+            surplus = sorted(assets, key=lambda a: (a.relevance_score is not None, a.relevance_score or 0.0))[:excess]
+            for a in surplus:
+                a.status = AssetStatus.RELEVANCE_REJECTED
+                delete_asset_files(a)
+                assets.remove(a)
+            self.db.flush()
+
+        # Update batch accepted_image_count to match exact kept assets across the batch
+        self.batch_repo.reconcile_batch_counters(batch_id)
 
         # Transition valid assets from RELEVANCE_PASSED to READY_FOR_UPLOAD
         for a in assets:
@@ -343,7 +382,16 @@ def process_active_batch(self, job_id: str):
             return {"job_id": job_id, "status": "completed"}
 
         batch_id = active_batch.id
-        orchestrator.batch_repo.set_status(batch_id, BatchStatus.PROCESSING)
+        if active_batch.status not in (
+            BatchStatus.READY_FOR_UPLOAD,
+            BatchStatus.UPLOADING,
+            BatchStatus.NAS_UPLOADING,
+            BatchStatus.NAS_PENDING,
+            BatchStatus.VERIFYING,
+            BatchStatus.NAS_VERIFIED,
+            BatchStatus.COMPLETED,
+        ):
+            orchestrator.batch_repo.set_status(batch_id, BatchStatus.PROCESSING)
 
         # 1. Associate any promoted assets with this batch
         orchestrator.associate_unbatched_assets(batch_id)
@@ -372,7 +420,7 @@ def process_active_batch(self, job_id: str):
         with session_scope() as db:
             orchestrator = BatchOrchestrator(db, job_uuid)
             next_batch = orchestrator.get_or_create_active_batch()
-            if next_batch is not None:
+            if next_batch is not None and next_batch.id != batch_id:
                 # Dispatch candidate discovery/download for the next batch
                 dispatch_batch_candidate_window.delay(job_id, str(next_batch.id))
 
@@ -510,6 +558,24 @@ def dispatch_batch_candidate_window(
             clear_job_context()
             return {"error": "job or batch not found"}
 
+        if batch.status in (
+            BatchStatus.READY_FOR_UPLOAD,
+            BatchStatus.UPLOADING,
+            BatchStatus.VERIFYING,
+            BatchStatus.COMPLETED,
+            BatchStatus.PARTIAL,
+        ):
+            logger.info(
+                f"[BATCH ORCHESTRATION] Batch {batch_id} is already in state '{batch.status.value}'. "
+                "Skipping candidate window dispatch."
+            )
+            clear_job_context()
+            return {
+                "status": "skipped",
+                "reason": f"batch_already_{batch.status.value}",
+                "batch_id": str(batch_id),
+            }
+
         if candidate_count is not None:
             window_size = int(candidate_count)
         else:
@@ -535,6 +601,10 @@ def dispatch_batch_candidate_window(
 
         batch_repo.set_status(batch_uuid, BatchStatus.DOWNLOADING)
 
+        # Clear prior target reached flags in redis so new window admissions and discoveries proceed
+        from app.services.cancellation_service import CancellationService
+        CancellationService(get_redis()).clear_target_reached(job_id)
+
         # The batch row is already locked above. Create/reuse its candidate
         # window in this transaction so all source workers share one window.
         from app.services.candidate_reservation_service import ensure_candidate_window
@@ -548,11 +618,12 @@ def dispatch_batch_candidate_window(
             s.value for s in SourceType if s != SourceType.NAS_SHARE
         ]
         excluded_sources = {"youtube", "kitti", "nuscenes"}
-        sources = [
+        candidate_sources = [
             str(getattr(source, "value", source))
             for source in raw_sources
             if str(getattr(source, "value", source)).lower() not in excluded_sources
         ]
+        sources = candidate_sources or [str(getattr(s, "value", s)) for s in raw_sources]
         dispatched_tasks = []
 
         for source_str in sources:
@@ -569,11 +640,18 @@ def dispatch_batch_candidate_window(
                 task_repo.create(new_task)
                 db.flush()
                 task_id = new_task.id
+                JobService._dispatch(task_path, str(job_uuid), str(task_id))
             else:
                 task_id = existing_task.id
+                task_repo.set_status(existing_task.id, JobSourceTaskStatus.DOWNLOADING)
+                task_repo.heartbeat(existing_task.id)
+                from app.services.job_service import _resume_pending_items
+                if _resume_pending_items(source_type, str(job_uuid), str(task_id), existing_task.checkpoint):
+                    dispatched_tasks.append((source_str, str(task_id)))
+                    continue
                 task_repo.set_status(existing_task.id, JobSourceTaskStatus.PENDING)
+                JobService._dispatch(task_path, str(job_uuid), str(task_id))
 
-            JobService._dispatch(task_path, str(job_uuid), str(task_id))
             dispatched_tasks.append((source_str, str(task_id)))
 
         batch_index = batch.batch_index

@@ -8,20 +8,32 @@ from app.services.cancellation_service import CancellationService
 
 class _FakeRedis:
     """Minimal in-memory stand-in for the handful of redis-py calls
-    CancellationService makes (set/delete/exists) — avoids pulling in a new
+    CancellationService makes (set/delete/exists/sets) — avoids pulling in a new
     test dependency (fakeredis) for what's a tiny surface."""
 
     def __init__(self):
         self._store: set[str] = set()
+        self._sets: dict[str, set[str]] = {}
 
-    def set(self, key, value):
+    def set(self, key, value, **kwargs):
         self._store.add(key)
 
     def delete(self, key):
         self._store.discard(key)
+        self._sets.pop(key, None)
 
     def exists(self, key):
-        return 1 if key in self._store else 0
+        return 1 if (key in self._store or key in self._sets) else 0
+
+    def sadd(self, key, member):
+        self._sets.setdefault(key, set()).add(member)
+
+    def srem(self, key, member):
+        if key in self._sets:
+            self._sets[key].discard(member)
+
+    def smembers(self, key):
+        return set(self._sets.get(key, set()))
 
 
 class TestSourceCapReached:
@@ -72,3 +84,29 @@ class TestShouldStopWithSourceTaskId:
         svc = CancellationService(_FakeRedis())
         svc.mark_source_cap_reached("job-1", "task-1")
         assert svc.should_stop("job-1") is False
+
+
+class TestRevokeActiveTasks:
+    def test_revoke_active_tasks_calls_celery_and_clears(self, monkeypatch):
+        revoked_ids = []
+
+        class _FakeControl:
+            def revoke(self, task_id, terminate=True, signal="SIGTERM"):
+                revoked_ids.append((task_id, terminate, signal))
+
+        class _FakeCelery:
+            control = _FakeControl()
+
+        monkeypatch.setattr("app.tasks.celery_app.celery_app", _FakeCelery())
+
+        svc = CancellationService(_FakeRedis())
+        svc.register_active_task("job-1", "task-a")
+        svc.register_active_task("job-1", "task-b")
+
+        assert len(svc.list_active_tasks("job-1")) == 2
+        revoked = svc.revoke_active_tasks("job-1")
+
+        assert set(revoked) == {"task-a", "task-b"}
+        assert len(revoked_ids) == 2
+        assert all(t[1] is True and t[2] == "SIGTERM" for t in revoked_ids)
+        assert len(svc.list_active_tasks("job-1")) == 0

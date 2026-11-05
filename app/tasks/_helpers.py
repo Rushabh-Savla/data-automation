@@ -113,6 +113,7 @@ def build_on_progress(
     db: Session, job_id: uuid.UUID, job_source_task_id: uuid.UUID
 ) -> Callable[[dict], None]:
     import time
+    from collections import defaultdict
     from sqlalchemy.exc import OperationalError
 
     task_repo = JobSourceTaskRepository(db)
@@ -122,43 +123,26 @@ def build_on_progress(
 
     update_count = 0
     last_commit_time = time.monotonic()
+    pending_job = defaultdict(int)
+    pending_task = defaultdict(int)
+    pending_checkpoint = None
 
     def on_progress(delta: dict) -> None:
-        nonlocal update_count, last_commit_time
+        nonlocal update_count, last_commit_time, pending_checkpoint
 
         checkpoint_delta = delta.get("checkpoint")
         if checkpoint_delta is not None:
-            # Shallow-merge into the existing checkpoint dict rather than
-            # overwrite it wholesale — a JobSourceTask can have several items
-            # (e.g. Kaggle datasets) in flight concurrently within the same
-            # chord, each namespaced under its own top-level key, and a plain
-            # overwrite would let them clobber each other's progress.
-            task = task_repo.get(job_source_task_id)
-            merged = dict(task.checkpoint or {}) if task else {}
-            merged.update(checkpoint_delta)
-            task_repo.heartbeat(job_source_task_id, checkpoint=merged)
-        else:
-            task_repo.heartbeat(job_source_task_id)
+            if pending_checkpoint is None:
+                pending_checkpoint = {}
+            pending_checkpoint.update(checkpoint_delta)
 
-        # STRICT LOCK ORDERING: ALWAYS update Job first, then JobSourceTask.
-        # Consistent lock acquisition order eliminates deadlock (Postgres 40P01)
-        # under concurrent worker execution.
-        job_repo.increment_counts(
-            job_id,
-            discovered=delta.get("discovered", 0),
-            downloaded=delta.get("downloaded", 0),
-            accepted=delta.get("accepted", 0),
-            rejected=delta.get("rejected", 0),
-            duplicate=delta.get("duplicate", 0),
-        )
-        task_repo.increment_counts(
-            job_source_task_id,
-            discovered=delta.get("discovered", 0),
-            downloaded=delta.get("downloaded", 0),
-            accepted=delta.get("accepted", 0),
-            rejected=delta.get("rejected", 0),
-            errors=delta.get("errors", 0),
-        )
+        for k in ("discovered", "downloaded", "accepted", "rejected", "duplicate"):
+            if v := delta.get(k, 0):
+                pending_job[k] += v
+
+        for k in ("discovered", "downloaded", "accepted", "rejected", "errors"):
+            if v := delta.get(k, 0):
+                pending_task[k] += v
 
         update_count += 1
         now = time.monotonic()
@@ -169,16 +153,39 @@ def build_on_progress(
             or (now - last_commit_time) >= 2.0
         )
 
-        if should_commit:
+        if should_commit and (pending_job or pending_task or pending_checkpoint is not None):
             update_count = 0
             last_commit_time = now
-            for attempt in range(3):
+            for attempt in range(5):
                 try:
+                    if pending_checkpoint is not None:
+                        task = task_repo.get(job_source_task_id)
+                        merged = dict(task.checkpoint or {}) if task else {}
+                        for cp_k, cp_v in pending_checkpoint.items():
+                            if isinstance(cp_v, dict) and isinstance(merged.get(cp_k), dict):
+                                merged[cp_k] = {**merged[cp_k], **cp_v}
+                            else:
+                                merged[cp_k] = cp_v
+                        task_repo.heartbeat(job_source_task_id, checkpoint=merged)
+                        pending_checkpoint = None
+                    else:
+                        task_repo.heartbeat(job_source_task_id)
+
+                    # STRICT LOCK ORDERING: ALWAYS update Job first, then JobSourceTask.
+                    # Consistent lock acquisition order eliminates deadlock (Postgres 40P01)
+                    # under concurrent worker execution.
+                    if pending_job:
+                        job_repo.increment_counts(job_id, **pending_job)
+                        pending_job.clear()
+                    if pending_task:
+                        task_repo.increment_counts(job_source_task_id, **pending_task)
+                        pending_task.clear()
+
                     db.commit()
                     break
                 except OperationalError as exc:
                     db.rollback()
-                    if attempt == 2:
+                    if attempt == 4:
                         logger.warning(f"Failed to commit progress for task {job_source_task_id}: {exc}")
                         raise
                     time.sleep(0.05 * (2 ** attempt))

@@ -69,13 +69,31 @@ def get_db() -> Iterator[Session]:
 
 @contextmanager
 def session_scope() -> Iterator[Session]:
-    """Context manager for Celery tasks / scripts: commits on success, rolls back on error."""
+    """Context manager for Celery tasks / scripts: commits on success, rolls back on error.
+
+    Catches BaseException (e.g. SoftTimeLimitExceeded) as well as standard exceptions.
+    If rollback or close encounters an OperationalError or fails because a command is in progress,
+    invalidates the connection so a corrupted socket is evicted from the pool instead of
+    poisoning subsequent tasks.
+    """
     db = SessionLocal()
     try:
         yield db
         db.commit()
-    except Exception:
-        db.rollback()
+    except BaseException:
+        try:
+            db.rollback()
+        except Exception:
+            try:
+                db.invalidate()
+            except Exception:
+                pass
         raise
     finally:
-        db.close()
+        try:
+            db.close()
+        except Exception:
+            try:
+                db.invalidate()
+            except Exception:
+                pass

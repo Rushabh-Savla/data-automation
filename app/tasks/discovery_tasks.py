@@ -60,8 +60,7 @@ def _should_skip_discovery(task_repo: JobSourceTaskRepository, job_uuid: uuid.UU
         logger.info(f"Job {job_uuid} should_stop active; skipping discovery for {source_type}")
         task_repo.set_status(
             task_uuid,
-            JobSourceTaskStatus.COMPLETED_PARTIAL,
-            error_message="Candidate window target reached; discovery skipped",
+            JobSourceTaskStatus.COMPLETED,
         )
         return True
     return False
@@ -306,16 +305,20 @@ def discover_roboflow(self, job_id: str, job_source_task_id: str):
             return
 
         task_repo.increment_counts(task_uuid, discovered=len(items))
-        db.flush()
 
-    item_dicts = [
-        {
-            "external_ref": {"workspace": it["workspace"], "project": it["project"], "version": it["version"]},
-            "license_hint": it["license"],
-            "dataset_identifier": f"{it['workspace']}/{it['project']}",
-        }
-        for it in items
-    ]
+        item_dicts = [
+            {
+                "external_ref": {"workspace": it["workspace"], "project": it["project"], "version": it["version"]},
+                "license_hint": it["license"],
+                "dataset_identifier": f"{it['workspace']}/{it['project']}",
+            }
+            for it in items
+        ]
+
+        pending = {**(task.checkpoint or {}).get("_pending_items", {})}
+        pending.update({f"{it['workspace']}/{it['project']}": item for it, item in zip(items, item_dicts)})
+        task_repo.heartbeat(task_uuid, checkpoint={**(task.checkpoint or {}), "_pending_items": pending})
+        db.flush()
 
     download_group = [download_roboflow_item.s(job_id, job_source_task_id, item) for item in item_dicts]
     chord(download_group)(on_source_finished.s(job_id, job_source_task_id))
@@ -419,16 +422,20 @@ def discover_youtube(self, job_id: str, job_source_task_id: str):
             return
 
         task_repo.increment_counts(task_uuid, discovered=len(items))
-        db.flush()
 
-    item_dicts = [
-        {
-            "external_ref": {"url": it["url"], "video_id": it["video_id"]},
-            "license_hint": it["license"],
-            "dataset_identifier": it["video_id"],
-        }
-        for it in items
-    ]
+        item_dicts = [
+            {
+                "external_ref": {"url": it["url"], "video_id": it["video_id"]},
+                "license_hint": it["license"],
+                "dataset_identifier": it["video_id"],
+            }
+            for it in items
+        ]
+
+        pending = {**(task.checkpoint or {}).get("_pending_items", {})}
+        pending.update({it["video_id"]: item for it, item in zip(items, item_dicts)})
+        task_repo.heartbeat(task_uuid, checkpoint={**(task.checkpoint or {}), "_pending_items": pending})
+        db.flush()
 
     download_group = [download_youtube_video.s(job_id, job_source_task_id, item) for item in item_dicts]
     chord(download_group)(on_source_finished.s(job_id, job_source_task_id))

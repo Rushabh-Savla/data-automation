@@ -89,4 +89,6 @@ class Asset(Base):
         Index("ix_assets_window_id", "window_id"),
         Index("ix_assets_checksum_sha256", "checksum_sha256"),
         Index("ix_assets_phash", "phash"),
+        Index("ix_assets_job_id_status", "job_id", "status"),
+        Index("ix_assets_status", "status"),
     )

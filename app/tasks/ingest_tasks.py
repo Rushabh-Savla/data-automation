@@ -14,6 +14,7 @@ doesn't mean re-implementing that machinery (DRY).
 
 import hashlib
 import logging
+import shutil
 import uuid
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -124,6 +125,32 @@ def _run_item_download(
         task_repo.heartbeat(task_uuid)
         db.commit()
 
+        # Fast-skip check: if candidate window is already FULL, don't waste
+        # bandwidth/IO downloading a dataset/video only to discard it during frame extraction.
+        from sqlalchemy import select
+        from app.db.models.candidate_window import CandidateWindow
+        active_win = db.execute(
+            select(CandidateWindow)
+            .where(CandidateWindow.job_id == job_uuid)
+            .order_by(CandidateWindow.created_at.desc())
+            .limit(1)
+        ).scalar_one_or_none()
+        if active_win is not None and active_win.status == "FULL":
+            logger.info(
+                f"[WINDOW] Active candidate window {active_win.id} (index {active_win.window_index}) "
+                f"is already FULL. Fast-skipping download for {checkpoint_key}."
+            )
+            unbind_context()
+            return {
+                "item": checkpoint_key,
+                "accepted": 0,
+                "rejected": 0,
+                "window_full": True,
+                "window_id": str(active_win.id),
+                "window_index": active_win.window_index,
+                "checkpoint_index": 0,
+            }
+
         should_stop = build_should_stop(job_uuid, task_uuid)
         base_on_progress = build_on_progress(db, job_uuid, task_uuid)
 
@@ -161,7 +188,6 @@ def _run_item_download(
                     )
                     downloaded += 1
                     accepted += 1
-                    on_progress({"downloaded": 1})
                 except AssetRejected:
                     mark_draft_reservation_failed(draft)
                     rejected += 1
@@ -330,6 +356,18 @@ def download_kaggle_dataset(self, job_id: str, job_source_task_id: str, item_dic
 
 
 register_source_download_task(SourceType.KAGGLE, "app.tasks.ingest_tasks.download_kaggle_dataset")
+register_source_download_task(SourceType.ROBOFLOW, "app.tasks.ingest_tasks.download_roboflow_item")
+register_source_download_task(SourceType.YOUTUBE, "app.tasks.ingest_tasks.download_youtube_video")
+register_source_download_task(SourceType.WEB, "app.tasks.ingest_tasks.download_web_batch")
+register_source_download_task(SourceType.COCO, "app.tasks.ingest_tasks.download_coco_shard")
+register_source_download_task(SourceType.OPEN_IMAGES, "app.tasks.ingest_tasks.download_open_images_shard")
+register_source_download_task(SourceType.PASCAL_VOC, "app.tasks.ingest_tasks.download_pascal_voc_shard")
+register_source_download_task(SourceType.VISUAL_GENOME, "app.tasks.ingest_tasks.download_visual_genome_shard")
+register_source_download_task(SourceType.DAVIS, "app.tasks.ingest_tasks.download_davis_shard")
+register_source_download_task(SourceType.SUN_RGBD, "app.tasks.ingest_tasks.download_sun_rgbd_shard")
+register_source_download_task(SourceType.NUSCENES, "app.tasks.ingest_tasks.download_nuscenes_shard")
+register_source_download_task(SourceType.KITTI, "app.tasks.ingest_tasks.download_kitti_shard")
+register_source_download_task(SourceType.NAS_SHARE, "app.tasks.ingest_tasks.download_nas_share_shard")
 
 
 @celery_app.task(
@@ -450,10 +488,24 @@ def download_youtube_video(self, job_id: str, job_source_task_id: str, item_dict
         cc_only=yt_config.get("cc_only", False),
     )
 
-    def fetch(checkpoint, should_stop, on_progress):
-        yield from connector.fetch(item, workdir, checkpoint, should_stop, on_progress)
+    admit_candidate = _make_admit_candidate(job_source_task_id, SourceType.YOUTUBE)
 
-    return _run_item_download(job_id, job_source_task_id, SourceType.YOUTUBE, checkpoint_key, fetch, bound_task=self)
+    def fetch(checkpoint, should_stop, on_progress):
+        yield from connector.fetch(
+            item,
+            workdir,
+            checkpoint,
+            should_stop,
+            on_progress,
+            admit_candidate=admit_candidate,
+        )
+
+    try:
+        return _run_item_download(job_id, job_source_task_id, SourceType.YOUTUBE, checkpoint_key, fetch, bound_task=self)
+    finally:
+        # Clean up temporary video workdir (the .mp4 video and raw extracted frames)
+        # immediately; admitted frames have already been standardized and moved into staging/.
+        shutil.rmtree(workdir, ignore_errors=True)
 
 
 @celery_app.task(

@@ -22,6 +22,7 @@ import zipfile
 from collections.abc import Iterator
 from pathlib import Path
 
+from app.connectors.archive_handler import is_archive, safe_extract_archive
 from app.connectors.base import (
     DiscoveryPage,
     OnProgressFn,
@@ -193,38 +194,17 @@ class KaggleConnector:
     def _recursive_unzip(self, directory: Path, depth: int = 0):
         if depth > 4:
             return
-        for zip_path in list(directory.rglob("*.zip")):
-            extract_dir = zip_path.parent / zip_path.stem
-            if extract_dir.exists():
-                zip_path.unlink(missing_ok=True)
-                continue
-            logger.info(f"  Extracting: {zip_path.name}")
-            try:
-                extract_dir.mkdir(exist_ok=True)
-                total_uncompressed = 0
-                total_files = 0
-                with zipfile.ZipFile(zip_path, "r") as zf:
-                    for member in zf.infolist():
-                        total_files += 1
-                        total_uncompressed += member.file_size
-                        if total_files > 2000:
-                            logger.warning(f"  Archive exceeded file count limit (2000): {zip_path.name}")
-                            break
-                        if total_uncompressed > 10 * 1024 * 1024 * 1024:
-                            logger.warning(f"  Archive exceeded 10GB uncompressed size limit: {zip_path.name}")
-                            break
-                        member_path = (extract_dir / member.filename).resolve()
-                        if not str(member_path).startswith(str(extract_dir.resolve())):
-                            logger.warning(f"  Zip-slip blocked: {member.filename}")
-                            continue
-                        zf.extract(member, extract_dir)
-                zip_path.unlink(missing_ok=True)
-                self._recursive_unzip(extract_dir, depth + 1)
-            except zipfile.BadZipFile:
-                logger.warning(f"  Bad ZIP (skipped): {zip_path.name}")
-                zip_path.unlink(missing_ok=True)
-            except Exception as e:
-                logger.error(f"  ZIP extraction error {zip_path.name}: {e}")
+        for file_path in list(directory.rglob("*")):
+            if file_path.is_file() and is_archive(file_path):
+                extract_dir = file_path.parent / f"{file_path.stem}_extracted"
+                if extract_dir.exists():
+                    file_path.unlink(missing_ok=True)
+                    continue
+                logger.info(f"  Extracting archive: {file_path.name}")
+                try:
+                    safe_extract_archive(file_path, extract_dir, remove_archive=True, max_depth=4)
+                except Exception as e:
+                    logger.error(f"  Archive extraction error {file_path.name}: {e}")
 
     def _walk_and_yield(
         self,
@@ -240,7 +220,8 @@ class KaggleConnector:
         from PIL import Image
 
         image_files = sorted(
-            f for f in root.rglob("*") if f.is_file() and f.suffix.lower() in IMAGE_EXTENSIONS
+            f for f in root.rglob("*")
+            if f.is_file() and f.suffix.lower() in IMAGE_EXTENSIONS and not f.name.startswith(".")
         )
         logger.info(f"  Found {len(image_files)} image file(s) in dataset")
 
@@ -258,8 +239,8 @@ class KaggleConnector:
                     w, h = img.size
                 if w < self.min_w or h < self.min_h:
                     continue
-            except Exception:
-                on_progress({"rejected": 1})
+            except Exception as e:
+                logger.debug(f"Skipping corrupt or unreadable image {src_img}: {e}")
                 continue
 
             rel_path = src_img.relative_to(root)

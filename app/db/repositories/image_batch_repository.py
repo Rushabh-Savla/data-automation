@@ -225,6 +225,19 @@ class NasTransferBatchRepository:
     ) -> NasTransferBatch:
         existing = self.get_by_batch_id(batch_id)
         if existing is not None:
+            if existing.transfer_status == TransferStatus.FAILED or (
+                existing.transfer_status == TransferStatus.COMPLETED and total_files > 0
+            ):
+                existing.transfer_status = TransferStatus.PENDING
+                existing.attempt_count = 0
+                existing.failed_files = 0
+                existing.uploaded_files = 0
+                existing.total_files = total_files or existing.total_files
+                existing.pending_files = total_files or existing.total_files
+                existing.last_error = None
+                if asset_ids is not None:
+                    existing.transfer_metadata = {"asset_ids": asset_ids}
+                self.db.flush()
             return existing
 
         transfer = NasTransferBatch(

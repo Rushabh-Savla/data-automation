@@ -97,3 +97,17 @@ class CancellationService:
 
     def clear_active_tasks(self, job_id: str) -> None:
         self.redis.delete(_ACTIVE_TASKS_KEY.format(job_id=job_id))
+
+    def revoke_active_tasks(self, job_id: str) -> list[str]:
+        """Revokes all actively tracked Celery tasks for this job with SIGTERM and clears active task list."""
+        import logging
+        from app.tasks.celery_app import celery_app
+
+        task_ids = self.list_active_tasks(job_id)
+        for task_id in task_ids:
+            try:
+                celery_app.control.revoke(task_id, terminate=True, signal="SIGTERM")
+            except Exception as e:
+                logging.getLogger(__name__).warning(f"Failed to revoke task {task_id}: {e}")
+        self.clear_active_tasks(job_id)
+        return task_ids

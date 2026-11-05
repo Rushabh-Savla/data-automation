@@ -158,13 +158,16 @@ def run_relevance_filter(self, job_id: str):
     # its finalize was swallowed as a "duplicate". Nothing then ended the job
     # until the watchdog re-drove it filtering_stall_threshold_s (30 min) later.
     redis_client.delete(_FINALIZE_GUARD_KEY.format(job_id=job_id))
+    redis_client.delete(f"job:{job_id}:finalize_relevance_scheduled")
 
     if not candidate_ids:
         # Nothing left to classify — still go through finalize so a job whose
         # assets were all filtered by a previous (crashed) pass reaches dedup
         # and completion instead of stopping here.
         redis_client.delete(in_progress_key)
-        finalize_relevance_filter.delay(job_id)
+        schedule_key = f"job:{job_id}:finalize_relevance_scheduled"
+        if redis_client.set(schedule_key, "1", nx=True, ex=300):
+            finalize_relevance_filter.delay(job_id)
         return
 
     batches = _chunk([str(asset_id) for asset_id in candidate_ids], batch_size)
@@ -197,77 +200,53 @@ _ERROR = "error"
 
 def _classify_batch(
     job_query: str,
-    items: list[tuple[str, str]],
+    items: list[tuple[str, str] | tuple[str, str, str | None]],
+    threshold: float = 0.40,
 ) -> list[tuple[str, str, float | None]]:
-    """Decides relevance for (asset_id, nas_path) pairs using TinyVLM.
+    """Decides relevance for (asset_id, nas_path, [fingerprint]) pairs using Meta SAM 3.1.
 
     Returns (asset_id, outcome, score) where outcome is _ACCEPT / _REJECT / _REVIEW / _ERROR.
-    `score` is 1.0 (accept) / 0.0 (reject) / 0.5 (review) / None (error).
+    `score` is the genuine model confidence score from SAM 3 (or None on error).
     """
-    from app.filtering import query_expansion
-    from app.filtering.vlm_filter import VisualVerifier, VlmVerdict
+    import math
+    from app.filtering.sam3_filter import Sam3Verifier
 
     if not items:
         return []
 
     try:
-        verifier = VisualVerifier()
+        threshold = float(threshold)
+        if math.isnan(threshold) or threshold < 0.0 or threshold > 1.0:
+            threshold = 0.40
+    except (TypeError, ValueError):
+        threshold = 0.40
+
+    try:
+        verifier = Sam3Verifier(default_threshold=threshold)
         logger.info(
-            f"[TinyVLM RELEVANCY] Using model '{verifier.model_id}' to evaluate {len(items)} asset(s) for query: {job_query!r}"
+            f"[SAM 3.1 RELEVANCY] Using model '{verifier.model_id}' to evaluate {len(items)} asset(s) for query: {job_query!r} at threshold: {threshold:.2f}"
         )
     except Exception:
-        # The gate itself is unusable. Every asset becomes _ERROR (RETRY_PENDING) so it stays
-        # preserved for a later pass, rather than being deleted because a model failed to load.
-        logger.exception(f"[TinyVLM RELEVANCY] Model unavailable; deferring {len(items)} asset(s) to RETRY_PENDING")
-        return [(asset_id, _ERROR, None) for asset_id, _ in items]
+        logger.exception(f"[SAM 3.1 RELEVANCY] Model unavailable; deferring {len(items)} asset(s) to RETRY_PENDING")
+        return [(item[0], _ERROR, None) for item in items]
 
-    paths = [item[1] for item in items]
-    fingerprints = [item[2] if len(item) > 2 else None for item in items]
+    decisions: list[tuple[str, str, float | None]] = []
+    for item in items:
+        asset_id = item[0]
+        path = item[1]
+        fingerprint = item[2] if len(item) > 2 else None
 
-    # Explicit boolean query parsing (AND / OR) vs standard subject expansion
-    if " AND " in job_query or " OR " in job_query:
-        verdicts = verifier.verify_query_complex(paths, job_query)
-        decisions: list[tuple[str, str, float | None]] = []
-        for item, v in zip(items, verdicts):
-            asset_id = item[0]
-            if v == VlmVerdict.YES:
-                decisions.append((asset_id, _ACCEPT, 1.0))
-            elif v == VlmVerdict.NO:
-                decisions.append((asset_id, _REJECT, 0.0))
-            elif v == VlmVerdict.UNCERTAIN:
-                decisions.append((asset_id, _REVIEW, 0.5))
-            else:
-                decisions.append((asset_id, _ERROR, None))
-    else:
-        subjects = query_expansion.query_subjects(job_query)
-        if len(subjects) == 1:
-            verdicts = verifier.verify_batch_verdicts(paths, subjects[0], fingerprints=fingerprints)
-            decisions = []
-            for item, v in zip(items, verdicts):
-                asset_id = item[0]
-                if v == VlmVerdict.YES:
-                    decisions.append((asset_id, _ACCEPT, 1.0))
-                elif v == VlmVerdict.NO:
-                    decisions.append((asset_id, _REJECT, 0.0))
-                elif v == VlmVerdict.UNCERTAIN:
-                    decisions.append((asset_id, _REVIEW, 0.5))
-                else:
-                    decisions.append((asset_id, _ERROR, None))
-        else:
-            verdicts = verifier.verify_batch_any(paths, subjects)
-            decisions = []
-            for item, verdict in zip(items, verdicts):
-                asset_id = item[0]
-                if verdict is None:
-                    decisions.append((asset_id, _REVIEW, 0.5))
-                elif verdict:
-                    decisions.append((asset_id, _ACCEPT, 1.0))
-                else:
-                    decisions.append((asset_id, _REJECT, 0.0))
+        outcome, score = verifier.evaluate_asset(
+            image_item=path,
+            query=job_query,
+            threshold=threshold,
+            fingerprint=fingerprint,
+        )
+        decisions.append((asset_id, outcome, score))
 
     accepted = sum(1 for _, o, _ in decisions if o == _ACCEPT)
     logger.info(
-        f"[TinyVLM RELEVANCY] Model '{verifier.model_id}' completed evaluation: {accepted}/{len(decisions)} accepted"
+        f"[SAM 3.1 RELEVANCY] Model '{verifier.model_id}' completed evaluation: {accepted}/{len(decisions)} accepted (threshold: {threshold:.2f})"
     )
     return decisions
 
@@ -369,7 +348,22 @@ def relevance_filter_batch(self, job_id: str, asset_ids: list[str]) -> dict:
                 return {"passed": 0, "rejected": 0, "review_pending": 0, "retry_pending": 0}
 
             query = job.query
-            items: list[tuple[str, str]] = []
+            job_cfg = getattr(job, "config", None) or {}
+            raw_threshold = (
+                job_cfg.get("relevance_threshold")
+                if "relevance_threshold" in job_cfg
+                else job_cfg.get("yolo_world_conf_threshold")
+            )
+            if raw_threshold is None:
+                raw_threshold = 0.40
+            try:
+                threshold = float(raw_threshold)
+                if not (0.0 <= threshold <= 1.0):
+                    threshold = 0.40
+            except (TypeError, ValueError):
+                threshold = 0.40
+
+            items: list[tuple[str, str, str | None]] = []
             for asset_id_str in asset_ids:
                 asset = asset_repo.get(uuid.UUID(asset_id_str))
                 if asset is None or not asset.nas_path:
@@ -397,7 +391,10 @@ def relevance_filter_batch(self, job_id: str, asset_ids: list[str]) -> dict:
                     errored += 1
 
         # -- Inference phase: NO session held. -----------------------------
-        decisions = _classify_batch(query, items)
+        try:
+            decisions = _classify_batch(query, items, threshold=threshold)
+        except TypeError:
+            decisions = _classify_batch(query, items)
 
         # -- Write-back phase: short transactions, chunked so a kill keeps
         #    whatever was already decided. ---------------------------------
@@ -502,7 +499,9 @@ def relevance_filter_batch(self, job_id: str, asset_ids: list[str]) -> dict:
         # asset does get judged, but the killed ones never decremented, so the counter never
         # reached zero and the job sat idle until the watchdog's timer ended it.
         if last_batch_out or _all_assets_judged(job_id):
-            finalize_relevance_filter.delay(job_id)
+            schedule_key = f"job:{job_id}:finalize_relevance_scheduled"
+            if get_redis().set(schedule_key, "1", nx=True, ex=300):
+                finalize_relevance_filter.delay(job_id)
 
     if errored or review_pending:
         logger.info(
@@ -541,6 +540,7 @@ def finalize_relevance_filter(self, job_id: str):
 
     FanIn(redis_client).clear(job_id, _FANIN_NAME)
     redis_client.delete(f"job:{job_id}:filtering_in_progress")
+    redis_client.delete(f"job:{job_id}:finalize_relevance_scheduled")
 
     job_uuid = uuid.UUID(job_id)
     with session_scope() as db:
@@ -599,30 +599,42 @@ def run_deduplication(self, job_id: str):
                 sha_map[a.checksum_sha256] = a
 
         # Level 3/4/5: Perceptual, Semantic and Structural Verification
-        active_assets = [a for a in assets if a.status != AssetStatus.DUPLICATE]
-        for a in active_assets:
-            local_path = None
-            if a.nas_path:
-                try:
-                    local_path = Path(local_path_for_read(str(a.nas_path)))
-                except Exception:
-                    local_path = None
+        from app.filtering.structural_verifier import DuplicateCategory
 
-            res = cross_dedup.deduplicate_candidate(
-                job_id=job_uuid,
-                candidate_id=a.id,
-                candidate_phash=a.phash,
-                candidate_embedding=a.embedding,
-                candidate_file_or_buffer=local_path,
-            )
-            if res.is_duplicate and res.duplicate_of_id and res.duplicate_of_id != a.id:
-                canonical = asset_repo.get(res.duplicate_of_id)
-                if canonical:
-                    winner, loser = CanonicalSelector.select_canonical(canonical, a)
+        active_assets = [a for a in assets if a.status != AssetStatus.DUPLICATE]
+        asset_map = {str(a.id): a for a in active_assets}
+        items = [(str(a.id), a.phash, a.embedding) for a in active_assets]
+
+        groups = cross_dedup.deduplicator.find_duplicate_groups(items)
+        for group in groups:
+            canonical_asset = asset_map.get(group.keep_asset_id)
+            if canonical_asset is None or canonical_asset.status == AssetStatus.DUPLICATE:
+                continue
+
+            for dup_id_str in group.duplicate_asset_ids:
+                dup_asset = asset_map.get(dup_id_str)
+                if dup_asset is None or dup_asset.status == AssetStatus.DUPLICATE:
+                    continue
+
+                # Level 5: Structural Verification if local files exist
+                is_confirmed_duplicate = True
+                if dup_asset.nas_path and canonical_asset.nas_path:
+                    try:
+                        cand_local = Path(local_path_for_read(str(dup_asset.nas_path)))
+                        ref_local = Path(local_path_for_read(str(canonical_asset.nas_path)))
+                        if cand_local.exists() and ref_local.exists():
+                            cat, _ = cross_dedup.structural_verifier.verify_pair(cand_local, ref_local)
+                            if cat != DuplicateCategory.CONFIRMED_NEAR_DUPLICATE:
+                                is_confirmed_duplicate = False
+                    except Exception:
+                        pass
+
+                if is_confirmed_duplicate:
+                    winner, loser = CanonicalSelector.select_canonical(canonical_asset, dup_asset)
                     CanonicalSelector.apply_duplicate_relationship(winner, loser)
-                    if loser.id == a.id:
-                        delete_asset_files(loser)
-                        duplicate_count += 1
+                    canonical_asset = winner
+                    delete_asset_files(loser)
+                    duplicate_count += 1
 
         db.flush()
         # Derived rather than hand-decremented: the DUPLICATE status written
@@ -692,11 +704,19 @@ def trim_excess_assets(job_id: str) -> None:
         # list — trimming every relevance-passed asset instead of just the
         # surplus, leaving only the undecided leftovers as the job's
         # "accepted" total once reconcile() ran again.
-        kept = asset_repo.list_for_job(job_uuid, status=AssetStatus.RELEVANCE_PASSED, limit=100_000)
-        excess = len(kept) - job.target_count
+        kept = asset_repo.list_for_job(
+            job_uuid,
+            status=[AssetStatus.RELEVANCE_PASSED, AssetStatus.READY_FOR_UPLOAD],
+            limit=100_000,
+        )
+        if not kept:
+            return
+
+        excess = job.accepted_count - job.target_count
         if excess <= 0:
             return
 
+        excess = min(excess, len(kept))
         trim_ids = _select_trim_candidates([(str(a.id), a.relevance_score) for a in kept], excess)
         if not trim_ids:
             return

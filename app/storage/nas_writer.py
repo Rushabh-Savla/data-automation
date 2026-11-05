@@ -750,7 +750,7 @@ class NasBatchWriter:
         self.transfer_repo.mark_uploading(transfer_id, owner_token=owner_token)
         if (
             transfer.window_id is None
-            and batch.status != BatchStatus.UPLOADING
+            and batch.status in (BatchStatus.READY_FOR_UPLOAD, BatchStatus.UPLOADING)
         ):
             self.batch_repo.set_status(batch.id, BatchStatus.UPLOADING)
         self.db.commit()
@@ -805,9 +805,32 @@ class NasBatchWriter:
         uploaded_count = 0
         total_bytes = 0
         failed_count = 0
-        total_items = len(items)
 
-        for i, item in enumerate(items):
+        # Filter items to only include assets that are actively retained and ready for upload.
+        # Assets trimmed by trim_excess_assets (or rejected/deduplicated) are not transfer failures;
+        # they were intentionally removed from the kept set.
+        active_items = []
+        for item in items:
+            asset_id_str = item.get("asset_id")
+            if not asset_id_str:
+                continue
+            asset = self.asset_repo.get(uuid.UUID(asset_id_str))
+            if asset and asset.status in (
+                AssetStatus.RELEVANCE_PASSED,
+                AssetStatus.READY_FOR_UPLOAD,
+                AssetStatus.UPLOADING,
+                AssetStatus.NAS_VERIFIED,
+            ):
+                active_items.append(item)
+            else:
+                logger.info(
+                    f"[NAS WRITER] Skipping item {asset_id_str} with status "
+                    f"{asset.status if asset else 'MISSING'} from upload manifest."
+                )
+
+        total_items = len(active_items)
+
+        for i, item in enumerate(active_items):
             if self.lock:
                 self.lock.extend(DEFAULT_LOCK_TTL_S)
 
@@ -1008,8 +1031,9 @@ class NasBatchWriter:
             }
 
         self.transfer_repo.mark_verified(transfer_id, owner_token=owner_token)
-        if batch.status != BatchStatus.VERIFYING:
-            self.batch_repo.set_status(batch.id, BatchStatus.VERIFYING)
+        if batch.status not in (BatchStatus.REPLENISHING, BatchStatus.DOWNLOADING, BatchStatus.PROCESSING):
+            if batch.status != BatchStatus.VERIFYING:
+                self.batch_repo.set_status(batch.id, BatchStatus.VERIFYING)
         # Step 3: Commit verification transaction
         self.db.commit()
 
@@ -1218,8 +1242,22 @@ class NasBatchWriter:
         for a in self.db.execute(stmt).scalars():
             a.status = AssetStatus.COMPLETED
 
-        self.batch_repo.set_status(batch.id, BatchStatus.COMPLETED)
+        # Only complete the batch if it's not currently replenishing or downloading shortfall replacements
+        batch_completed = False
+        if batch.status not in (BatchStatus.REPLENISHING, BatchStatus.DOWNLOADING, BatchStatus.PROCESSING):
+            if batch.accepted_image_count >= batch.target_image_count or batch.status == BatchStatus.PARTIAL:
+                self.batch_repo.set_status(batch.id, BatchStatus.COMPLETED)
+                batch_completed = True
         self.db.commit()
+
+        if batch_completed:
+            try:
+                from app.tasks.orchestration_tasks import check_and_advance_job
+                from app.tasks.batch_orchestration import process_active_batch
+                check_and_advance_job(str(batch.job_id))
+                process_active_batch.delay(str(batch.job_id))
+            except Exception as e:
+                logger.warning(f"[NAS WRITER] Error triggering job advance after batch completion: {e}")
 
         logger.info(
             f"[NAS WRITER] Successfully uploaded and verified Batch #{batch.batch_index} "

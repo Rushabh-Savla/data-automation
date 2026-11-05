@@ -1,4 +1,6 @@
+"""Asset repository — data access for Asset models."""
 import uuid
+from collections.abc import Iterable
 from datetime import datetime, timezone
 
 from sqlalchemy import func, or_, select
@@ -78,13 +80,16 @@ class AssetRepository:
     @staticmethod
     def _filters(
         job_id: uuid.UUID,
-        status: AssetStatus | None,
+        status: AssetStatus | Iterable[AssetStatus] | None,
         source_type: SourceType | None,
         search: str | None,
     ) -> list[ColumnElement]:
         conditions: list[ColumnElement] = [Asset.job_id == job_id]
         if status is not None:
-            conditions.append(Asset.status == status)
+            if isinstance(status, (list, tuple, set, frozenset)):
+                conditions.append(Asset.status.in_(status))
+            else:
+                conditions.append(Asset.status == status)
         if source_type is not None:
             conditions.append(Asset.source_type == source_type)
         if search:
@@ -101,7 +106,7 @@ class AssetRepository:
     def list_for_job(
         self,
         job_id: uuid.UUID,
-        status: AssetStatus | None = None,
+        status: AssetStatus | tuple[AssetStatus, ...] | set[AssetStatus] | frozenset[AssetStatus] | None = None,
         source_type: SourceType | None = None,
         search: str | None = None,
         limit: int = 100,
@@ -115,7 +120,7 @@ class AssetRepository:
     def count_for_job(
         self,
         job_id: uuid.UUID,
-        status: AssetStatus | None = None,
+        status: AssetStatus | tuple[AssetStatus, ...] | set[AssetStatus] | frozenset[AssetStatus] | None = None,
         source_type: SourceType | None = None,
         search: str | None = None,
     ) -> int:

@@ -1,11 +1,14 @@
 """Job CRUD + control (start/pause/resume/cancel) + progress endpoints."""
 
+import shutil
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
 from app.api.deps import get_db, get_redis
+from app.core.config import get_settings
 from app.core.security import require_api_key
 from app.db.models.job import Job
 from app.db.repositories.asset_repository import AssetRepository
@@ -93,6 +96,44 @@ def delete_job(job_id: uuid.UUID, db: Session = Depends(get_db)):
     deletable = set(JOB_TERMINAL_STATUSES) | {JobStatus.DRAFT, JobStatus.SCHEDULED}
     if job.status not in deletable:
         raise HTTPException(409, "Only scheduled, terminal or draft jobs can be deleted; cancel it first")
+
+    # Collect task IDs and asset files before DB cascade removes them
+    task_repo = JobSourceTaskRepository(db)
+    task_ids = [str(t.id) for t in task_repo.list_for_job(job_id)]
+
+    from app.db.models.asset import Asset
+    assets = db.execute(select(Asset).where(Asset.job_id == job_id)).scalars().all()
+    asset_file_paths = []
+    for a in assets:
+        if a.nas_path:
+            asset_file_paths.append(a.nas_path)
+        if a.annotation_nas_path:
+            asset_file_paths.append(a.annotation_nas_path)
+
+    # 1. Clean local task scratch workdirs and staging folders immediately
+    settings = get_settings()
+    for tid in task_ids:
+        workdir = settings.work_root / tid
+        if workdir.exists():
+            shutil.rmtree(workdir, ignore_errors=True)
+
+    staging_dir = settings.work_root / "staging" / f"job_{job_id}"
+    if staging_dir.exists():
+        shutil.rmtree(staging_dir, ignore_errors=True)
+
+    # 2. Clean remote/promoted files from NAS or local storage
+    if asset_file_paths:
+        from app.tasks.cleanup_tasks import cleanup_job_storage
+        try:
+            cleanup_job_storage.delay(str(job_id), asset_file_paths)
+        except Exception:
+            from app.storage import asset_files
+            for p in asset_file_paths:
+                try:
+                    asset_files.delete(p)
+                except Exception:
+                    pass
+
     db.delete(job)
     db.commit()
 

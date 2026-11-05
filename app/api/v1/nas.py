@@ -95,12 +95,16 @@ def test_nas_connection(body: NasConfigInput | None = None, db: Session = Depend
     service = NasConfigService(db)
     try:
         if body is not None:
-            params, require_write = service.params_from_input(body), body.use_as_storage
+            params = service.params_from_input(body)
+            st_path = (body.storage_path or "").strip()
+            require_write = bool(body.use_as_storage and st_path and st_path != "data_automation")
         else:
             saved = service.get()
             if saved is None:
                 raise HTTPException(404, "No NAS is configured yet")
-            params, require_write = service.params_for(saved), saved.use_as_storage
+            params = service.params_for(saved)
+            st_path = (saved.storage_path or "").strip()
+            require_write = bool(saved.use_as_storage and st_path and st_path != "data_automation")
     except RuntimeError as e:
         logger.error(f"Cannot read stored NAS password: {e}")
         raise HTTPException(

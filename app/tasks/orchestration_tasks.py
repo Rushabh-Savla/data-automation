@@ -14,6 +14,7 @@ from sqlalchemy import select
 from app.core.config import get_settings
 from app.core.logging import bind_job_context, clear_job_context
 from app.core.redis_client import get_redis
+from app.db.models.candidate_window import CandidateWindow
 from app.db.models.job_source_task import JobSourceTask
 from app.db.repositories.asset_repository import AssetRepository
 from app.db.repositories.job_repository import JobRepository
@@ -21,6 +22,7 @@ from app.db.repositories.job_source_task_repository import JobSourceTaskReposito
 from app.db.session import session_scope
 from app.domain.completion import JobCompletionEvaluator, JobSnapshot
 from app.domain.enums import (
+    ASSET_ACCEPTED_STATUSES,
     AssetStatus,
     JOB_SOURCE_TASK_TERMINAL_STATUSES,
     JobSourceTaskStatus,
@@ -192,7 +194,7 @@ def check_and_advance_job(job_id: str) -> None:
         active_window = db.execute(
             select(CandidateWindow)
             .where(CandidateWindow.job_id == job_uuid)
-            .order_by(CandidateWindow.window_index.desc())
+            .order_by(CandidateWindow.created_at.desc())
             .limit(1)
         ).scalar_one_or_none()
 
@@ -216,6 +218,13 @@ def check_and_advance_job(job_id: str) -> None:
         )
 
         if not all_terminal and not window_ready:
+            if all_waiting_or_terminal and promoted_count == 0:
+                logger.info(
+                    f"Job {job_id}: all sources waiting/terminal and 0 promoted assets remaining. "
+                    "Triggering process_active_batch to evaluate progress or replenish shortfall."
+                )
+                from app.tasks.batch_orchestration import process_active_batch
+                process_active_batch.delay(str(job_uuid))
             return
 
         remaining_sources = job.config.get("_fast_path_remaining_sources") or []
@@ -345,7 +354,7 @@ def plan_topup_round(self, job_id: str):
             # column is incremented optimistically at promotion time and only
             # corrected once filtering has run. Sizing a round off it would
             # repeat the original mistake of reacting to a pre-filter number.
-            accepted = asset_repo.count_for_job(job_uuid, status=AssetStatus.RELEVANCE_PASSED)
+            accepted = asset_repo.count_for_job(job_uuid, status=ASSET_ACCEPTED_STATUSES)
             total_assets = asset_repo.count_for_job(job_uuid)
             # Assets the filter could not decide are still PROMOTED. Counting them as
             # rejections read a filter outage as a 2% yield (see filtering_incomplete).
@@ -508,13 +517,34 @@ def evaluate_job_completion(self, job_id: str):
                 JobStateMachine.transition(job.status, "finish_cancel"),
                 completion_reason=None,
             )
-            from app.domain.enums import JobCompletionReason
+            from app.domain.enums import JobCompletionReason, JOB_SOURCE_TASK_TERMINAL_STATUSES, JobSourceTaskStatus
+            from app.tasks.cleanup_tasks import cleanup_local
 
             job_repo.set_status(job_uuid, JobStatus.CANCELLED, completion_reason=JobCompletionReason.CANCELLED)
+            for t in task_repo.list_for_job(job_uuid):
+                if t.status not in JOB_SOURCE_TASK_TERMINAL_STATUSES:
+                    task_repo.set_status(t.id, JobSourceTaskStatus.CANCELLED)
+                    cleanup_local.delay(str(t.id))
+
+            staging_dir = get_settings().work_root / "staging" / f"job_{job_id}"
+            if staging_dir.exists():
+                import shutil
+                shutil.rmtree(staging_dir, ignore_errors=True)
+
             cancellation.clear_active_tasks(job_id)
             ProgressPublisher(get_redis()).publish(job_id, {"type": "job_status", "status": "cancelled"})
+            from app.tasks.cleanup_tasks import cleanup_shared_cache
+            cleanup_shared_cache.delay()
             clear_job_context()
             return
+
+        # Always enforce strict target consistency before making the completion snapshot:
+        # If accepted assets exceed target_count, trim the lowest confidence excess assets
+        # down to exactly target_count.
+        if job.target_count is not None and job.accepted_count > job.target_count:
+            from app.tasks.filtering_tasks import trim_excess_assets
+            trim_excess_assets(job_id)
+            db.refresh(job)
 
         snapshot = JobSnapshot(
             target_count=job.target_count,
@@ -531,8 +561,34 @@ def evaluate_job_completion(self, job_id: str):
         event = "complete" if success else ("fail" if job.accepted_count == 0 else "complete_partial")
         new_status = JobStateMachine.transition(job.status, event)
         job_repo.set_status(job_uuid, new_status, completion_reason=reason)
-        cancellation.clear_target_reached(job_id)
-        cancellation.clear_active_tasks(job_id)
+
+        from app.domain.enums import JOB_SOURCE_TASK_TERMINAL_STATUSES, JobSourceTaskStatus
+        from app.tasks.cleanup_tasks import cleanup_local
+        non_terminal_tasks = [
+            t for t in task_repo.list_for_job(job_uuid)
+            if t.status not in JOB_SOURCE_TASK_TERMINAL_STATUSES
+        ]
+        target_task_status = (
+            JobSourceTaskStatus.COMPLETED
+            if new_status == JobStatus.COMPLETED
+            else JobSourceTaskStatus.COMPLETED_PARTIAL
+        )
+        for t in non_terminal_tasks:
+            task_repo.set_status(t.id, target_task_status)
+            cleanup_local.delay(str(t.id))
+
+        if new_status == JobStatus.FAILED:
+            staging_dir = get_settings().work_root / "staging" / f"job_{job_id}"
+            if staging_dir.exists():
+                import shutil
+                shutil.rmtree(staging_dir, ignore_errors=True)
+
+        # Actively revoke any lingering discovery or download tasks still executing for this job
+        cancellation.revoke_active_tasks(job_id)
+        if new_status in (JobStatus.COMPLETED, JobStatus.COMPLETED_PARTIAL):
+            cancellation.mark_target_reached(job_id)
+        else:
+            cancellation.clear_target_reached(job_id)
         ProgressPublisher(get_redis()).publish(
             job_id, {"type": "job_status", "status": new_status.value, "completion_reason": reason.value}
         )
@@ -551,6 +607,9 @@ def evaluate_job_completion(self, job_id: str):
         from app.tasks.nas_tasks import schedule_offload_for_job
 
         schedule_offload_for_job(job_id)
+
+    from app.tasks.cleanup_tasks import cleanup_shared_cache
+    cleanup_shared_cache.delay()
 
     clear_job_context()
 
@@ -685,7 +744,23 @@ def watchdog_scan():
                     )
                     or (
                         AssetRepository(db).count_for_job(job.id, status=AssetStatus.PROMOTED) > 0
-                        and CancellationService(get_redis()).is_target_reached(str(job.id))
+                        and (
+                            CancellationService(get_redis()).is_target_reached(str(job.id))
+                            or db.execute(
+                                select(CandidateWindow.status)
+                                .where(CandidateWindow.job_id == job.id)
+                                .order_by(CandidateWindow.created_at.desc())
+                                .limit(1)
+                            ).scalar_one_or_none() == "FULL"
+                        )
+                    )
+                    or (
+                        AssetRepository(db).count_for_job(job.id, status=AssetStatus.PROMOTED) == 0
+                        and bool(task_repo.list_for_job(job.id))
+                        and all(
+                            t.status in JOB_SOURCE_TASK_TERMINAL_STATUSES or t.status == JobSourceTaskStatus.WINDOW_WAITING
+                            for t in task_repo.list_for_job(job.id)
+                        )
                     )
                 )
                 and not get_redis().exists(f"job:{job.id}:filtering_in_progress")
@@ -693,27 +768,26 @@ def watchdog_scan():
                 # to bump updated_at: without this it would be re-driven every scan.
                 and get_redis().set(f"watchdog:redrive:{job.id}", "1", nx=True, ex=300)
             ):
-                # Post-ingestion stall: either every source finished, or an eligible batch of
-                # PROMOTED assets is waiting while sources are slow/exhausted, but the
-                # filtering -> dedup -> completion chain died or was never dispatched.
-                #
-                # Re-driving is safe to repeat: run_relevance_filter only
-                # selects PROMOTED assets, so already-classified assets are
-                # not reconsidered, and finalize_relevance_filter derives its
-                # counts from the DB. A job whose assets are all already
-                # classified therefore passes straight through to dedup and
-                # completion rather than redoing any inference.
                 promoted_count = AssetRepository(db).count_for_job(job.id, status=AssetStatus.PROMOTED)
-                logger.warning(
-                    f"Watchdog: job {job.id} has {promoted_count} PROMOTED assets waiting "
-                    f"(all_terminal={task_repo.all_terminal_for_job(job.id)}) and is idle since {job.updated_at}; "
-                    f"re-driving filtering"
-                )
-                redis_client = get_redis()
-                redis_client.delete(f"job:{job.id}:filtering_dispatched")
-                from app.tasks.filtering_tasks import run_relevance_filter
+                if promoted_count > 0 or task_repo.all_terminal_for_job(job.id):
+                    logger.warning(
+                        f"Watchdog: job {job.id} has {promoted_count} PROMOTED assets waiting "
+                        f"(all_terminal={task_repo.all_terminal_for_job(job.id)}) and is idle since {job.updated_at}; "
+                        f"re-driving filtering"
+                    )
+                    redis_client = get_redis()
+                    redis_client.delete(f"job:{job.id}:filtering_dispatched")
+                    from app.tasks.filtering_tasks import run_relevance_filter
 
-                run_relevance_filter.delay(str(job.id))
+                    run_relevance_filter.delay(str(job.id))
+                else:
+                    logger.warning(
+                        f"Watchdog: job {job.id} sources waiting/terminal with 0 PROMOTED assets, "
+                        f"re-driving process_active_batch"
+                    )
+                    from app.tasks.batch_orchestration import process_active_batch
+
+                    process_active_batch.delay(str(job.id))
 
 
 def _resume_task(job_id: str, job_source_task_id: str, source_type, checkpoint: dict) -> None:
@@ -752,6 +826,9 @@ def _resume_task(job_id: str, job_source_task_id: str, source_type, checkpoint: 
 
     if _resume_pending_items(source, job_id, job_source_task_id, checkpoint):
         return
+
+    if not _SOURCE_DISCOVERY_TASKS:
+        import app.tasks.discovery_tasks  # defensive: populate _SOURCE_DISCOVERY_TASKS
 
     task_path = _SOURCE_DISCOVERY_TASKS.get(source)
     if task_path is None:

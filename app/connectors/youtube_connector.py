@@ -51,7 +51,13 @@ from app.connectors.base import (
     register_connector,
 )
 from app.core.config import get_settings
-from app.core.exceptions import FatalConnectorError, JobStopped, RateLimitedError, TransientConnectorError
+from app.core.exceptions import (
+    CandidateWindowFull,
+    FatalConnectorError,
+    JobStopped,
+    RateLimitedError,
+    TransientConnectorError,
+)
 from app.domain.enums import SourceType
 
 logger = logging.getLogger(__name__)
@@ -375,6 +381,8 @@ def build_ytdlp_options(
             "/best[vcodec!=none][acodec!=none][height<=1080]"
             "/bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]"
             "/bestvideo[height<=1080]+bestaudio"
+            "/bestvideo[height<=1080]"
+            "/bestvideo"
             "/best"
         ),
         "merge_output_format": "mp4",
@@ -614,6 +622,7 @@ class YouTubeConnector:
         checkpoint: dict,
         should_stop: ShouldStopFn,
         on_progress: OnProgressFn,
+        admit_candidate=None,
     ) -> Iterator[RawAssetDraft]:
         import yt_dlp
 
@@ -712,11 +721,21 @@ class YouTubeConnector:
             raise FatalConnectorError(f"No local video file to extract frames from for {url}")
 
         start_index = checkpoint.get("frame_index", 0) if stage == "extracting" else 0
-        yield from self._extract_frames(
-            video_id, video_path, url, license_name, frames_dir, start_index, should_stop, on_progress
-        )
-
-        self._cleanup_video_files(video_dir, video_id)
+        try:
+            yield from self._extract_frames(
+                video_id,
+                video_path,
+                url,
+                license_name,
+                frames_dir,
+                start_index,
+                should_stop,
+                on_progress,
+                admit_candidate=admit_candidate,
+            )
+        finally:
+            self._cleanup_video_files(video_dir, video_id)
+            shutil.rmtree(frames_dir / video_id, ignore_errors=True)
 
     def _extract_frames(
         self,
@@ -728,6 +747,7 @@ class YouTubeConnector:
         start_index,
         should_stop,
         on_progress,
+        admit_candidate=None,
     ) -> Iterator[RawAssetDraft]:
         out_dir = frames_dir / video_id
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -754,6 +774,37 @@ class YouTubeConnector:
                 continue
 
             source_item_id = f"{video_id}_f{i:07d}"
+
+            admission = None
+            if admit_candidate is not None:
+                admission = admit_candidate(source_item_id)
+                raw_status = getattr(admission, "status", "")
+                status = str(getattr(raw_status, "value", raw_status)).upper()
+                if status == "DUPLICATE":
+                    on_progress({"checkpoint": {"stage": "extracting", "frame_index": i + 1}})
+                    continue
+                if status == "WINDOW_FULL":
+                    on_progress({"checkpoint": {"stage": "extracting", "frame_index": i}})
+                    raise CandidateWindowFull(
+                        getattr(admission, "window_id", None),
+                        getattr(admission, "window_index", None),
+                        i,
+                    )
+                if status != "ADMITTED":
+                    raise FatalConnectorError(
+                        f"Candidate admission failed for {source_item_id}: {status}"
+                    )
+
+            metadata = {
+                "frame_number": frame_number,
+                "timestamp_sec": timestamp_sec,
+                "scene_number": scene_number,
+            }
+            if admission is not None:
+                metadata["candidate_reservation_id"] = str(admission.reservation_id)
+                metadata["candidate_window_id"] = str(admission.window_id)
+                metadata["candidate_window_index"] = int(admission.window_index)
+
             draft = RawAssetDraft(
                 source_item_id=source_item_id,
                 source_url=video_url,
@@ -763,11 +814,7 @@ class YouTubeConnector:
                 original_name=frame_path.name,
                 width=w,
                 height=h,
-                metadata={
-                    "frame_number": frame_number,
-                    "timestamp_sec": timestamp_sec,
-                    "scene_number": scene_number,
-                },
+                metadata=metadata,
             )
             on_progress({"checkpoint": {"stage": "extracting", "frame_index": i + 1}, "downloaded": 1})
             yield draft
@@ -932,4 +979,6 @@ class YouTubeConnector:
             # Connection cut early, mid-transfer — same rate-limit signature as 403/429.
             _start_rate_limit_cooldown(get_settings().youtube_rate_limit_cooldown_s)
             return TransientConnectorError(f"YouTube CDN cut the download short for {ref} (likely rate-limited): {e}")
+        if "requested format is not available" in msg:
+            return FatalConnectorError(f"Requested video format unavailable for {ref}: {e}")
         return TransientConnectorError(f"yt-dlp failed for {ref}: {e}")

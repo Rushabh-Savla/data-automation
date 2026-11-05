@@ -26,8 +26,8 @@ class NasConfig(Base):
     # Folder scanned when the NAS is used as an image *source*.
     base_path: Mapped[str] = mapped_column(String(1024), nullable=False, default="")
     # Folder filtered images are moved into when the NAS is used as *storage*.
-    storage_path: Mapped[str] = mapped_column(String(1024), nullable=False, default="data_automation")
-    use_as_storage: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    storage_path: Mapped[str] = mapped_column(String(1024), nullable=False, default="")
+    use_as_storage: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
     auth_mode: Mapped[str] = mapped_column(String(16), nullable=False, default="anonymous")
     username: Mapped[str] = mapped_column(String(255), nullable=False, default="")

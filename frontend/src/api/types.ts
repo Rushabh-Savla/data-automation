@@ -180,6 +180,7 @@ export interface JobConfig {
   nuscenes?: NuscenesConfig
   kitti?: KittiConfig
   min_resolution?: [width: number, height: number]
+  relevance_threshold?: number
   yolo_world_conf_threshold?: number
   dedup_hamming_threshold?: number
   dedup_cosine_threshold?: number
@@ -277,6 +278,7 @@ export interface JobResponse {
   last_run_at: string | null
   /** Set on a run that a template spawned; points at the template. */
   parent_job_id: string | null
+  config?: JobConfig | null
 }
 
 export interface JobDetailResponse extends JobResponse {

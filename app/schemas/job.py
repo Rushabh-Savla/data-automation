@@ -49,6 +49,26 @@ class JobCreateRequest(BaseModel):
     config: dict = Field(default_factory=dict)
 
     @model_validator(mode="after")
+    def _validate_config(self):
+        import math
+        if self.config is not None:
+            thresh = self.config.get("relevance_threshold")
+            if thresh is None:
+                thresh = self.config.get("yolo_world_conf_threshold")
+
+            if thresh is not None:
+                try:
+                    thresh_float = float(thresh)
+                    if math.isnan(thresh_float) or not (0.0 <= thresh_float <= 1.0):
+                        raise ValueError("Relevance threshold must be a number between 0.00 and 1.00")
+                    self.config["relevance_threshold"] = thresh_float
+                except (TypeError, ValueError) as e:
+                    raise ValueError("Relevance threshold must be a valid number between 0.00 and 1.00") from e
+            else:
+                self.config["relevance_threshold"] = 0.40
+        return self
+
+    @model_validator(mode="after")
     def _require_count_or_deadline(self):
         if self.target_count is None and self.deadline_at is None:
             raise ValueError(
@@ -78,6 +98,7 @@ class JobCreateRequest(BaseModel):
         return self
 
 
+
 class JobUpdateRequest(BaseModel):
     name: str | None = None
     target_count: int | None = Field(default=None, gt=0)
@@ -98,6 +119,25 @@ class JobUpdateRequest(BaseModel):
         except InvalidCronError as e:
             raise ValueError(str(e)) from e
         return self
+
+    @model_validator(mode="after")
+    def _validate_config(self):
+        import math
+        if self.config is not None:
+            thresh = self.config.get("relevance_threshold")
+            if thresh is None:
+                thresh = self.config.get("yolo_world_conf_threshold")
+
+            if thresh is not None:
+                try:
+                    thresh_float = float(thresh)
+                    if math.isnan(thresh_float) or not (0.0 <= thresh_float <= 1.0):
+                        raise ValueError("Relevance threshold must be a number between 0.00 and 1.00")
+                    self.config["relevance_threshold"] = thresh_float
+                except (TypeError, ValueError) as e:
+                    raise ValueError("Relevance threshold must be a valid number between 0.00 and 1.00") from e
+        return self
+
 
 
 class JobSourceTaskResponse(BaseModel):
@@ -167,6 +207,7 @@ class JobResponse(BaseModel):
     next_run_at: datetime | None = None
     last_run_at: datetime | None = None
     parent_job_id: uuid.UUID | None = None
+    config: dict | None = None
 
     model_config = {"from_attributes": True}
 

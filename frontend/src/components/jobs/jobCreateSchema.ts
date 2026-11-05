@@ -135,6 +135,7 @@ export const jobCreateSchema = z
 
     minWidth: optionalNumberString,
     minHeight: optionalNumberString,
+    relevanceThreshold: optionalNumberString,
     yoloWorldConfThreshold: optionalNumberString,
     dedupHammingThreshold: optionalNumberString,
     dedupCosineThreshold: optionalNumberString,
@@ -181,6 +182,17 @@ export const jobCreateSchema = z
     }
     if (!data.useAutoSources && data.sources.length === 0) {
       ctx.addIssue({ code: 'custom', message: 'Pick at least one source, or use Auto', path: ['sources'] })
+    }
+    const relStr = data.relevanceThreshold ?? data.yoloWorldConfThreshold
+    if (relStr !== undefined && relStr !== '') {
+      const val = Number(relStr)
+      if (isNaN(val) || val < 0 || val > 1) {
+        ctx.addIssue({
+          code: 'custom',
+          message: 'Relevance threshold must be a number between 0.00 and 1.00',
+          path: ['relevanceThreshold'],
+        })
+      }
     }
   })
 
@@ -237,6 +249,7 @@ export const jobCreateDefaultValues: JobCreateFormValues = {
   kittiCategories: [],
   minWidth: undefined,
   minHeight: undefined,
+  relevanceThreshold: undefined,
   yoloWorldConfThreshold: undefined,
   dedupHammingThreshold: undefined,
   dedupCosineThreshold: undefined,
@@ -358,8 +371,11 @@ export function buildConfigPayload(values: JobCreateFormValues): JobConfig {
   const minHeight = toNumber(values.minHeight)
   if (minWidth && minHeight) config.min_resolution = [minWidth, minHeight]
 
-  const yoloWorldConfThreshold = toNumber(values.yoloWorldConfThreshold)
-  if (yoloWorldConfThreshold !== undefined) config.yolo_world_conf_threshold = yoloWorldConfThreshold
+  const relThresh = toNumber(values.relevanceThreshold ?? values.yoloWorldConfThreshold)
+  if (relThresh !== undefined) {
+    config.relevance_threshold = relThresh
+    config.yolo_world_conf_threshold = relThresh
+  }
 
   const dedupHammingThreshold = toNumber(values.dedupHammingThreshold)
   if (dedupHammingThreshold !== undefined) config.dedup_hamming_threshold = dedupHammingThreshold

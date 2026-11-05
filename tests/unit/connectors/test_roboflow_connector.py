@@ -98,3 +98,50 @@ class TestSdkDownloadSkipsVersionNotFound:
                     lambda _: None,
                 )
             )
+
+
+class TestClassificationAndCacheSupport:
+    def test_resolve_project_details_classification(self):
+        connector = RoboflowConnector(api_keys=["key1"])
+        resp = MagicMock()
+        resp.json.return_value = {
+            "project": {
+                "type": "classification",
+                "versions": [{"id": "tunjacv/cat-and-dog/1"}],
+            }
+        }
+        resp.raise_for_status = MagicMock()
+        with patch("app.connectors.roboflow_connector.requests.get", return_value=resp):
+            details = connector._resolve_project_details("tunjacv", "cat-and-dog")
+        assert details["type"] == "classification"
+        assert details["latest_version"] == 1
+
+    def test_walk_classification_folder_layout(self, tmp_path):
+        from PIL import Image
+
+        connector = RoboflowConnector(api_keys=["key1"], min_resolution=(10, 10))
+        export_dir = tmp_path / "roboflow_cache" / "tunjacv__cat-and-dog__v1"
+        cat_dir = export_dir / "train" / "cats"
+        cat_dir.mkdir(parents=True)
+
+        img_path = cat_dir / "cat1.jpg"
+        img = Image.new("RGB", (100, 100), color="red")
+        img.save(img_path)
+
+        drafts = list(
+            connector._walk_export_dir(
+                export_dir,
+                "tunjacv",
+                "cat-and-dog",
+                1,
+                "CC BY 4.0",
+                "https://universe.roboflow.com/tunjacv/cat-and-dog",
+                {},
+                lambda: False,
+                lambda _: None,
+            )
+        )
+        assert len(drafts) == 1
+        assert drafts[0].classes == ["cats"]
+        assert drafts[0].source_item_id.startswith("rf_tunjacv__cat-and-dog")
+

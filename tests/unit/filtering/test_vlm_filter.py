@@ -38,14 +38,14 @@ class TestIsAffirmative:
 
 class TestBuildQuestion:
     def test_asks_about_visibility_not_subject_matter(self):
-        """'clearly visible' is load-bearing.
+        """'clearly show' is load-bearing.
 
         Without it the model answers about what the scene is *about* rather
         than what is in the frame, so a conversation scene from an action film
         counts as a weapon scene.
         """
         q = build_question("a weapon")
-        assert "clearly visible" in q
+        assert "clearly show" in q
 
     def test_constrains_the_answer_format(self):
         assert "yes or no" in build_question("a weapon").lower()

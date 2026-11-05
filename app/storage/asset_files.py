@@ -161,6 +161,63 @@ def delete(path: str, strict: bool = False) -> None:
         logger.warning(f"Could not delete {path} from the NAS: {exc}")
 
 
+def delete_batch(paths: list[str], strict: bool = False) -> int:
+    """Remove a collection of stored files.
+
+    Local files are unlinked directly. Remote files reuse a single NAS session
+    rather than connecting per file, and if the NAS is unreachable, remote deletions
+    are aborted gracefully after logging once, rather than stalling on thousands of
+    failed connection timeouts.
+    """
+    local_paths: list[str] = []
+    remote_paths: list[str] = []
+
+    for p in paths:
+        if not p:
+            continue
+        if is_remote(p):
+            remote_paths.append(p)
+        else:
+            local_paths.append(p)
+
+    deleted = 0
+    for lp in local_paths:
+        try:
+            Path(lp).unlink(missing_ok=True)
+            deleted += 1
+        except OSError:
+            pass
+
+    if remote_paths:
+        # Always clean local cache / thumbnail files
+        for rp in remote_paths:
+            _cache_file(rp).unlink(missing_ok=True)
+            thumbnail_cache_file(rp).unlink(missing_ok=True)
+
+        try:
+            with _session() as client:
+                for rp in remote_paths:
+                    try:
+                        client.delete(remote_rel(rp))
+                        deleted += 1
+                    except Exception as exc:
+                        logger.warning(f"Could not delete {rp} from NAS: {exc}")
+        except (ConnectorError, NasUnreachable) as exc:
+            logger.warning(
+                f"NAS unreachable during batch deletion of {len(remote_paths)} files: {exc}. Skipping remaining remote deletions."
+            )
+            if strict:
+                raise
+        except Exception as exc:
+            logger.warning(
+                f"Error during remote batch deletion for {len(remote_paths)} files: {exc}"
+            )
+            if strict:
+                raise
+
+    return deleted
+
+
 def _evict_if_needed() -> None:
     limit = int(get_settings().nas_cache_max_gb * 1024**3)
     root = _cache_root()

@@ -37,6 +37,7 @@ from urllib.parse import urlparse
 
 import requests
 
+from app.connectors.archive_handler import is_archive, safe_extract_archive, SUPPORTED_IMAGE_EXTENSIONS
 from app.connectors.base import (
     DiscoveryPage,
     OnProgressFn,
@@ -349,6 +350,14 @@ class WebScrapeConnector:
 
         if not output_dir.exists():
             return
+
+        # Extract any downloaded archives discovered in output
+        for p in list(output_dir.rglob("*")):
+            if p.is_file() and is_archive(p):
+                try:
+                    safe_extract_archive(p, remove_archive=True)
+                except Exception as e:
+                    logger.warning(f"Could not extract web archive {p.name}: {e}")
 
         for json_path in sorted(output_dir.rglob("*.json")):
             img_path = json_path.with_suffix(".jpg")

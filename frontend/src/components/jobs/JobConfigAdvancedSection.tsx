@@ -198,9 +198,9 @@ export function JobConfigAdvancedSection({
                   type="number"
                   min={0}
                   max={1}
-                  step={0.05}
-                  placeholder="0.15"
-                  {...register('yoloWorldConfThreshold')}
+                  step={0.01}
+                  placeholder="0.40"
+                  {...register('relevanceThreshold')}
                 />
               </div>
               <div className="flex flex-col gap-1.5">

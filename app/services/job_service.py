@@ -84,6 +84,9 @@ def _resume_pending_items(
     if not remaining:
         return False
 
+    if not _SOURCE_DOWNLOAD_TASKS:
+        import app.tasks.ingest_tasks  # defensive: populate _SOURCE_DOWNLOAD_TASKS
+
     task_path = _SOURCE_DOWNLOAD_TASKS.get(source_type)
     if task_path is None:
         return False
@@ -320,9 +323,12 @@ class JobService:
 
         self._revoke_active_tasks(str(job_id))
 
+        from app.tasks.cleanup_tasks import cleanup_local
+
         for task in self.task_repo.list_for_job(job_id):
             if task.status not in JOB_SOURCE_TASK_TERMINAL_STATUSES:
                 self.task_repo.set_status(task.id, JobSourceTaskStatus.CANCELLED)
+            cleanup_local.delay(str(task.id))
 
         self.publisher.publish(str(job_id), {"type": "job_status", "status": job.status.value})
 
@@ -341,11 +347,4 @@ class JobService:
         celery_app.send_task(task_dotted_path, args=[job_id, job_source_task_id])
 
     def _revoke_active_tasks(self, job_id: str) -> None:
-        from app.tasks.celery_app import celery_app
-
-        task_ids = self.cancellation.list_active_tasks(job_id)
-        for task_id in task_ids:
-            try:
-                celery_app.control.revoke(task_id, terminate=True, signal="SIGTERM")
-            except Exception as e:
-                logger.warning(f"Failed to revoke task {task_id}: {e}")
+        self.cancellation.revoke_active_tasks(job_id)
