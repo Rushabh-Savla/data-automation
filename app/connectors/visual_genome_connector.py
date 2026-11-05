@@ -95,7 +95,8 @@ class VisualGenomeConnector:
     ) -> DiscoveryPage:
         try:
             objects_path, image_data_path = _ensure_metadata_cached()
-            objects_by_image = json.loads(objects_path.read_text())
+            with open(objects_path, "r", encoding="utf-8") as f:
+                objects_by_image = json.load(f)
         except Exception as e:
             logger.warning(f"Visual Genome metadata unavailable: {e}")
             return DiscoveryPage(
