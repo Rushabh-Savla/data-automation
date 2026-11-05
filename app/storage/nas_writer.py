@@ -1217,7 +1217,16 @@ class NasBatchWriter:
 
         # Step 6: Idempotent local staging cleanup with explicit verification
         staging_dir = self.staging_manager.get_batch_staging_dir(batch.job_id, batch.batch_index)
-        cleanup_success = self.staging_manager.cleanup_batch_staging(batch.job_id, batch.batch_index)
+        has_pending_windows = self.db.execute(
+            select(CandidateWindow)
+            .where(CandidateWindow.batch_id == batch.id, CandidateWindow.status != "COMPLETED")
+        ).scalars().first() is not None
+
+        if not has_pending_windows:
+            cleanup_success = self.staging_manager.cleanup_batch_staging(batch.job_id, batch.batch_index)
+        else:
+            cleanup_success = True
+            logger.info(f"[NAS WRITER] Preserving batch staging directory {staging_dir} because active candidate windows exist.")
 
         # Step 7: Record local staging cleanup as completed only when verified absent
         if cleanup_success:

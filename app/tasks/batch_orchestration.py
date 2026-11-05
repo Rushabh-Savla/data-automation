@@ -379,6 +379,8 @@ def process_active_batch(self, job_id: str):
         if active_batch is None:
             logger.info(f"[BATCH ORCHESTRATION] Job {job_id} has fulfilled all batches or reached target.")
             clear_job_context()
+            from app.tasks.orchestration_tasks import evaluate_job_completion
+            evaluate_job_completion.delay(job_id)
             return {"job_id": job_id, "status": "completed"}
 
         batch_id = active_batch.id
@@ -423,6 +425,9 @@ def process_active_batch(self, job_id: str):
             if next_batch is not None and next_batch.id != batch_id:
                 # Dispatch candidate discovery/download for the next batch
                 dispatch_batch_candidate_window.delay(job_id, str(next_batch.id))
+            else:
+                from app.tasks.orchestration_tasks import evaluate_job_completion
+                evaluate_job_completion.delay(job_id)
 
     elif outcome == "NEEDS_REPLACEMENTS":
         # Upload any newly accepted images from this round immediately to NAS

@@ -217,6 +217,13 @@ def check_and_advance_job(job_id: str) -> None:
             or (promoted_count >= active_batch_target and promoted_count > 0)
         )
 
+        target_reached = job.target_count is not None and job.accepted_count >= job.target_count
+        if target_reached and promoted_count == 0:
+            logger.info(f"Job {job_id}: Target count reached ({job.accepted_count}/{job.target_count}) and no promoted assets pending. Evaluating completion.")
+            from app.tasks.orchestration_tasks import evaluate_job_completion
+            evaluate_job_completion.delay(job_id)
+            return
+
         if not all_terminal and not window_ready:
             if all_waiting_or_terminal and promoted_count == 0:
                 logger.info(

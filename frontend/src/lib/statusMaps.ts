@@ -20,6 +20,7 @@ export const jobSourceTaskStatusVariant: Record<JobSourceTaskStatus, BadgeVarian
   pending: 'outline',
   discovering: 'secondary',
   downloading: 'secondary',
+  window_waiting: 'secondary',
   standardizing: 'secondary',
   completed: 'success',
   completed_partial: 'success',

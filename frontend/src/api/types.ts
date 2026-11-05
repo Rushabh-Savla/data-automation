@@ -48,6 +48,7 @@ export type JobSourceTaskStatus =
   | 'pending'
   | 'discovering'
   | 'downloading'
+  | 'window_waiting'
   | 'standardizing'
   | 'completed'
   | 'completed_partial'

@@ -67,12 +67,15 @@ export function JobPhaseBanner({
   // without the active-status check, a finished job keeps showing "still
   // collecting" forever.
   if (job.topup_round && job.topup_round > 1 && JOB_ACTIVE_STATUSES.includes(job.status)) {
-    return (
-      <div className="rounded-md border bg-muted/40 px-4 py-3 text-sm">
-        <span className="font-medium">Collecting more data</span> — round {job.topup_round}, because filtering
-        left the job short of its target.
-      </div>
-    )
+    const isTargetMet = job.target_count != null && job.accepted_count >= job.target_count
+    if (!isTargetMet) {
+      return (
+        <div className="rounded-md border bg-muted/40 px-4 py-3 text-sm">
+          <span className="font-medium">Collecting more data</span> — round {job.topup_round}, because filtering
+          left the job short of its target.
+        </div>
+      )
+    }
   }
 
   if (isFilteringPhase(job.status, job.source_tasks)) {

@@ -50,6 +50,7 @@ export const jobSourceTaskStatusLabels: Record<JobSourceTaskStatus, string> = {
   pending: 'Pending',
   discovering: 'Discovering',
   downloading: 'Downloading',
+  window_waiting: 'Waiting',
   standardizing: 'Standardizing',
   completed: 'Completed',
   completed_partial: 'Completed (partial)',
