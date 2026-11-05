@@ -89,7 +89,7 @@ def evaluate_transient_candidate(
             args=[str(path_obj.resolve()), query, threshold, fingerprint],
             queue="filtering",
         )
-        outcome, score = async_res.get(timeout=timeout)
+        outcome, score = async_res.get(timeout=timeout, disable_sync_subtasks=False)
         return outcome, score
 
     except Exception as exc:

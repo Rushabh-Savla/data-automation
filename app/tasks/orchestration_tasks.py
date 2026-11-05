@@ -604,6 +604,8 @@ def evaluate_job_completion(self, job_id: str):
             task_repo.set_status(t.id, target_task_status)
             cleanup_local.delay(str(t.id))
 
+        db.commit()
+
         if new_status == JobStatus.FAILED:
             staging_dir = get_settings().work_root / "staging" / f"job_{job_id}"
             if staging_dir.exists():

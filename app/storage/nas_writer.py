@@ -1199,6 +1199,14 @@ class NasBatchWriter:
                 f"Window staging cleanup pending: {staging_dir}"
             )
 
+        try:
+            from app.tasks.orchestration_tasks import check_and_advance_job
+            from app.tasks.batch_orchestration import process_active_batch
+            check_and_advance_job(str(batch.job_id))
+            process_active_batch.delay(str(batch.job_id))
+        except Exception as e:
+            logger.warning(f"[NAS WRITER] Error triggering job advance after window completion: {e}")
+
         return {
             "status": "completed",
             "batch_id": str(batch.id),

@@ -464,6 +464,7 @@ class NasTransferBatchRepository:
             .values(
                 transfer_status=TransferStatus.FAILED,
                 verification_status="failed",
+                attempt_count=NasTransferBatch.attempt_count + 1,
                 last_error=error,
                 updated_at=datetime.now(timezone.utc),
             )
