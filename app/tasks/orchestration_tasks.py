@@ -180,6 +180,9 @@ def check_and_advance_job(job_id: str) -> None:
         if job is None or job.status not in (JobStatus.RUNNING, JobStatus.DISCOVERING):
             return
 
+        job_target_count = job.target_count
+        job_accepted_count = job.accepted_count
+
         all_terminal = task_repo.all_terminal_for_job(job_uuid)
         tasks = task_repo.list_for_job(job_uuid)
         all_waiting_or_terminal = bool(tasks) and all(
@@ -202,32 +205,35 @@ def check_and_advance_job(job_id: str) -> None:
         window_limit = active_window.candidate_limit if active_window else None
 
         candidate_window = job.config.get("candidate_window", get_settings().download_candidate_window)
-        active_batch_target = min(candidate_window, job.target_count or candidate_window)
+        active_batch_target = min(candidate_window, job_target_count or candidate_window)
         window_buffered_target = buffered_target(active_batch_target, get_settings().target_overfetch_buffer)
 
         promoted_count = asset_repo.count_for_job(job_uuid, status=AssetStatus.PROMOTED)
+        relevance_passed_count = asset_repo.count_for_job(job_uuid, status=AssetStatus.RELEVANCE_PASSED)
+        candidate_count = promoted_count + relevance_passed_count
+        effective_accepted = job_accepted_count + relevance_passed_count
 
         window_ready = (
             cancellation.is_target_reached(str(job_id))
-            or (window_is_full and promoted_count > 0)
-            or (all_waiting_or_terminal and promoted_count > 0)
-            or (window_limit is not None and promoted_count >= window_limit and promoted_count > 0)
-            or job.accepted_count >= window_buffered_target
-            or promoted_count >= window_buffered_target
-            or (promoted_count >= active_batch_target and promoted_count > 0)
+            or (window_is_full and candidate_count > 0)
+            or (all_waiting_or_terminal and candidate_count > 0)
+            or (window_limit is not None and candidate_count >= window_limit and candidate_count > 0)
+            or effective_accepted >= window_buffered_target
+            or candidate_count >= window_buffered_target
+            or (candidate_count >= active_batch_target and candidate_count > 0)
         )
 
-        target_reached = job.target_count is not None and job.accepted_count >= job.target_count
-        if target_reached and promoted_count == 0:
-            logger.info(f"Job {job_id}: Target count reached ({job.accepted_count}/{job.target_count}) and no promoted assets pending. Evaluating completion.")
+        target_reached = job_target_count is not None and effective_accepted >= job_target_count
+        if target_reached and promoted_count == 0 and relevance_passed_count == 0:
+            logger.info(f"Job {job_id}: Target count reached ({job_accepted_count}/{job_target_count}) and no candidates pending. Evaluating completion.")
             from app.tasks.orchestration_tasks import evaluate_job_completion
             evaluate_job_completion.delay(job_id)
             return
 
         if not all_terminal and not window_ready:
-            if all_waiting_or_terminal and promoted_count == 0:
+            if all_waiting_or_terminal and candidate_count == 0:
                 logger.info(
-                    f"Job {job_id}: all sources waiting/terminal and 0 promoted assets remaining. "
+                    f"Job {job_id}: all sources waiting/terminal and 0 candidates remaining. "
                     "Triggering process_active_batch to evaluate progress or replenish shortfall."
                 )
                 from app.tasks.batch_orchestration import process_active_batch
@@ -236,7 +242,6 @@ def check_and_advance_job(job_id: str) -> None:
 
         pending_tiers = job.config.get("_orchestration_pending_tiers") or []
         remaining_sources = job.config.get("_fast_path_remaining_sources") or []
-        target_reached = job.target_count is not None and job.accepted_count >= job.target_count
 
         if (pending_tiers or remaining_sources) and not target_reached and all_terminal:
             current_tier = job.config.get("_orchestration_tier", 1)
@@ -282,7 +287,7 @@ def check_and_advance_job(job_id: str) -> None:
         tier_label = tier_names.get(next_tier_num, f"Tier {next_tier_num}")
         logger.info(
             f"[RESOURCE ORCHESTRATION] Escalating Job {job_id} to {tier_label} "
-            f"because target not yet met ({job.accepted_count}/{job.target_count}). Dispatching: {next_tier_sources}"
+            f"because target not yet met ({job_accepted_count}/{job_target_count}). Dispatching: {next_tier_sources}"
         )
         for source_value, task_id in new_tasks:
             task_path = _SOURCE_DISCOVERY_TASKS.get(SourceType(source_value))
