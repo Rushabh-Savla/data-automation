@@ -137,7 +137,7 @@ class Settings(BaseSettings):
     # ~2/3 of each round to dedup, so closing a gap takes a geometric series of
     # rounds -- 43, 32, 15, 5 short across rounds 2-5 on a 350-image job, which
     # a cap of 5 left 5 images short despite thousands of unused frames.
-    topup_max_rounds: int = 10
+    topup_max_rounds: int = 400
 
     # First-round prior only. Once a round has completed, the top-up planner
     # measures the query's actual post-filter yield and sizes the next round

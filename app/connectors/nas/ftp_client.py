@@ -171,6 +171,15 @@ class FtpClient(NasClient):
         except Exception as exc:
             raise self._translate(exc) from exc
 
+    def rmdir(self, rel: str) -> None:
+        try:
+            self._ftp.rmd(self._abs(rel))
+        except ftplib.error_perm as exc:
+            if str(exc)[:3] != "550":
+                raise self._translate(exc) from exc
+        except Exception as exc:
+            raise self._translate(exc) from exc
+
     def exists(self, rel: str) -> bool:
         return self.size(rel) is not None
 

@@ -5,6 +5,7 @@ block another source's chord from completing — the concrete mechanism for
 "failure in one source must not interrupt the remaining jobs."
 """
 
+import hashlib
 import logging
 import uuid
 from urllib.parse import parse_qs, urlparse
@@ -529,17 +530,35 @@ def discover_web(self, job_id: str, job_source_task_id: str):
             return
 
         total_urls = sum(len(s.external_ref["urls"]) for s in shards)
-        task_repo.increment_counts(task_uuid, discovered=total_urls)
-        db.flush()
 
-    item_dicts = [
-        {
-            "external_ref": {"urls": s.external_ref["urls"]},
-            "license_hint": None,
-            "dataset_identifier": s.dataset_identifier,
-        }
-        for s in shards
-    ]
+        item_dicts = [
+            {
+                "external_ref": {"urls": s.external_ref["urls"]},
+                "license_hint": None,
+                "dataset_identifier": s.dataset_identifier,
+            }
+            for s in shards
+        ]
+
+        # Persist pending shards in checkpoint so batch windows and resumes can
+        # redispatch them directly without re-running discovery and re-incrementing counters.
+        existing_pending = (task.checkpoint or {}).get("_pending_items", {})
+        pending = dict(existing_pending)
+        new_urls = 0
+        for item in item_dicts:
+            shard_id = hashlib.md5(",".join(item["external_ref"]["urls"]).encode()).hexdigest()[:12]
+            if shard_id not in pending:
+                pending[shard_id] = item
+                new_urls += len(item["external_ref"]["urls"])
+
+        if new_urls > 0:
+            task_repo.increment_counts(task_uuid, discovered=new_urls)
+        elif not existing_pending and total_urls > 0:
+            task_repo.increment_counts(task_uuid, discovered=total_urls)
+
+        task_repo.heartbeat(task_uuid, checkpoint={**(task.checkpoint or {}), "_pending_items": pending})
+        task_repo.set_status(task_uuid, JobSourceTaskStatus.DOWNLOADING)
+        db.commit()
 
     download_group = [download_web_batch.s(job_id, job_source_task_id, item) for item in item_dicts]
     chord(download_group)(on_source_finished.s(job_id, job_source_task_id))

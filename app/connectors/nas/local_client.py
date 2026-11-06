@@ -85,6 +85,16 @@ class LocalClient(NasClient):
         except OSError as exc:
             raise NasConnectionError(f"Could not delete '{rel}': {exc}") from exc
 
+    def rmdir(self, rel: str) -> None:
+        try:
+            p = self._abs(rel)
+            if p.exists() and p.is_dir():
+                p.rmdir()
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise NasConnectionError(f"Could not remove directory '{rel}': {exc}") from exc
+
     def exists(self, rel: str) -> bool:
         return self._abs(rel).exists()
 

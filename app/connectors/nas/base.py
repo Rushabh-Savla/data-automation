@@ -170,6 +170,32 @@ class NasClient(ABC):
         """Remove a file. Missing is not an error (deletes are idempotent)."""
 
     @abstractmethod
+    def rmdir(self, rel: str) -> None:
+        """Remove an empty directory. Missing is not an error (idempotent)."""
+
+    def rmtree(self, rel: str) -> None:
+        """Recursively remove a directory and all its contents."""
+        try:
+            entries = self.list_dir(rel)
+        except Exception:
+            return
+
+        for entry in entries:
+            child = f"{rel}/{entry.name}" if rel else entry.name
+            if entry.is_dir:
+                self.rmtree(child)
+            else:
+                try:
+                    self.delete(child)
+                except Exception:
+                    pass
+
+        try:
+            self.rmdir(rel)
+        except Exception:
+            pass
+
+    @abstractmethod
     def exists(self, rel: str) -> bool: ...
 
     @abstractmethod

@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import math
+import random
+import time
 import uuid
 from dataclasses import dataclass
 from enum import Enum
 from datetime import datetime, timezone
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import OperationalError
 
 from app.core.config import get_settings
 from app.db.models.candidate_reservation import CandidateReservation
@@ -17,7 +21,9 @@ from app.db.models.candidate_window import CandidateWindow
 from app.db.models.image_batch import ImageBatch
 from app.db.models.job_source_task import JobSourceTask
 from app.db.session import session_scope
-from app.domain.enums import BatchStatus
+from app.domain.enums import BatchStatus, JOB_SOURCE_TASK_TERMINAL_STATUSES, SourceType
+
+logger = logging.getLogger(__name__)
 
 MAX_CANDIDATES_PER_WINDOW = 600
 
@@ -172,153 +178,214 @@ def admit_candidate_for_task(
         BatchStatus.FAILED,
     )
 
-    with session_scope() as db:
-        task = db.get(JobSourceTask, task_uuid)
-        if task is None:
-            return CandidateAdmission(CandidateAdmissionStatus.INVALID_OWNER)
+    max_retries = 5
+    for attempt in range(max_retries):
+        try:
+            with session_scope() as db:
+                task = db.get(JobSourceTask, task_uuid)
+                if task is None:
+                    return CandidateAdmission(CandidateAdmissionStatus.INVALID_OWNER)
 
-        task_source = str(getattr(task.source_type, "value", task.source_type))
-        if task_source != source_value:
-            return CandidateAdmission(CandidateAdmissionStatus.INVALID_OWNER)
+                task_source = str(getattr(task.source_type, "value", task.source_type))
+                if task_source != source_value:
+                    return CandidateAdmission(CandidateAdmissionStatus.INVALID_OWNER)
 
-        # Enforce global target count stop: reject new admissions if target already reached
-        from app.db.models.job import Job
-        job = db.get(Job, task.job_id)
-        if job and job.target_count is not None and job.accepted_count >= job.target_count:
-            try:
-                from app.services.cancellation_service import CancellationService
-                from app.core.redis_client import get_redis
-                CancellationService(get_redis()).mark_target_reached(str(job.id))
-            except Exception:
-                pass
-            return CandidateAdmission(CandidateAdmissionStatus.WINDOW_FULL)
+                # Acquire KEY SHARE locks in strict universal order: Job -> JobSourceTask.
+                # This prevents lock ordering inversion with build_on_progress / orchestrator
+                # and satisfies foreign key constraints before acquiring batch and window locks.
+                from app.db.models.job import Job
+                db.execute(
+                    select(Job.id)
+                    .where(Job.id == task.job_id)
+                    .with_for_update(read=True, key_share=True)
+                )
+                db.execute(
+                    select(JobSourceTask.id)
+                    .where(JobSourceTask.id == task_uuid)
+                    .with_for_update(read=True, key_share=True)
+                )
 
-        batch = db.execute(
-            select(ImageBatch)
-            .where(
-                ImageBatch.job_id == task.job_id,
-                ~ImageBatch.status.in_(terminal_batches),
+                # Enforce global target count stop: reject new admissions if target already reached
+                job = db.get(Job, task.job_id)
+                if job and job.target_count is not None and job.accepted_count >= job.target_count:
+                    try:
+                        from app.services.cancellation_service import CancellationService
+                        from app.core.redis_client import get_redis
+                        CancellationService(get_redis()).mark_target_reached(str(job.id))
+                    except Exception:
+                        pass
+                    return CandidateAdmission(CandidateAdmissionStatus.WINDOW_FULL)
+
+                batch = db.execute(
+                    select(ImageBatch)
+                    .where(
+                        ImageBatch.job_id == task.job_id,
+                        ~ImageBatch.status.in_(terminal_batches),
+                    )
+                    .order_by(ImageBatch.batch_index.asc())
+                    .limit(1)
+                    .with_for_update()
+                ).scalar_one_or_none()
+
+                if batch is None:
+                    from app.tasks.batch_orchestration import BatchOrchestrator
+                    orchestrator = BatchOrchestrator(db, task.job_id)
+                    batch = orchestrator.get_or_create_active_batch()
+
+                if batch is None or batch.status == BatchStatus.PAUSED:
+                    return CandidateAdmission(CandidateAdmissionStatus.INACTIVE)
+
+                window = db.execute(
+                    select(CandidateWindow)
+                    .where(CandidateWindow.batch_id == batch.id)
+                    .order_by(CandidateWindow.window_index.desc())
+                    .limit(1)
+                    .with_for_update()
+                ).scalar_one_or_none()
+
+                if window is None:
+                    ensure_candidate_window(db, batch)
+                    window = db.execute(
+                        select(CandidateWindow)
+                        .where(CandidateWindow.batch_id == batch.id)
+                        .order_by(CandidateWindow.window_index.desc())
+                        .limit(1)
+                        .with_for_update()
+                    ).scalar_one_or_none()
+
+                if window is None:
+                    return CandidateAdmission(CandidateAdmissionStatus.INACTIVE)
+
+                context = {
+                    "window_id": window.id,
+                    "window_index": int(window.window_index),
+                }
+
+                if window.status not in ("OPEN", "ACQUIRING", "FULL"):
+                    return CandidateAdmission(
+                        CandidateAdmissionStatus.INACTIVE, **context
+                    )
+
+                # Skip assets already ingested by the legacy or current pipeline.
+                from app.db.models.asset import Asset
+
+                existing_asset = db.execute(
+                    select(Asset.id).where(
+                        Asset.job_id == window.job_id,
+                        Asset.source_type == source_value,
+                        Asset.source_item_id == item_key,
+                    ).limit(1)
+                ).scalar_one_or_none()
+
+                if existing_asset is not None:
+                    return CandidateAdmission(
+                        CandidateAdmissionStatus.DUPLICATE, **context
+                    )
+
+                # Also skip candidates reserved earlier in this batch.
+                existing = db.execute(
+                    select(CandidateReservation.id).where(
+                        CandidateReservation.batch_id == window.batch_id,
+                        CandidateReservation.source_type == source_value,
+                        CandidateReservation.source_item_id == item_key,
+                    )
+                ).scalar_one_or_none()
+
+                if existing is not None:
+                    return CandidateAdmission(
+                        CandidateAdmissionStatus.DUPLICATE, **context
+                    )
+
+                if window.status == "FULL":
+                    return CandidateAdmission(
+                        CandidateAdmissionStatus.WINDOW_FULL, **context
+                    )
+
+                used = db.execute(
+                    select(func.count(CandidateReservation.id)).where(
+                        CandidateReservation.window_id == window.id
+                    )
+                ).scalar_one()
+
+                limit = max(
+                    1, min(MAX_CANDIDATES_PER_WINDOW, int(window.candidate_limit))
+                )
+
+                if used >= limit:
+                    window.status = "FULL"
+                    db.commit()
+                    return CandidateAdmission(
+                        CandidateAdmissionStatus.WINDOW_FULL, **context
+                    )
+
+                # Multi-source candidate window fairness:
+                # If multiple non-NAS sources are configured, prevent any single fast source
+                # (e.g. pre-cached Roboflow datasets) from monopolizing 100% of the candidate
+                # window and starving slower network sources (e.g. Web).
+                job_sources = [
+                    str(getattr(s, "value", s))
+                    for s in (job.sources or [])
+                    if str(getattr(s, "value", s)) != SourceType.NAS_SHARE.value
+                ]
+                if len(job_sources) > 1:
+                    source_limit = max(1, math.ceil(limit * 0.70))
+                    source_used = db.execute(
+                        select(func.count(CandidateReservation.id)).where(
+                            CandidateReservation.window_id == window.id,
+                            CandidateReservation.source_type == source_value,
+                        )
+                    ).scalar_one()
+                    if source_used >= source_limit:
+                        other_active = db.execute(
+                            select(func.count(JobSourceTask.id)).where(
+                                JobSourceTask.job_id == job.id,
+                                JobSourceTask.source_type != source_value,
+                                ~JobSourceTask.status.in_([s.value for s in JOB_SOURCE_TASK_TERMINAL_STATUSES]),
+                            )
+                        ).scalar_one()
+                        if other_active > 0:
+                            return CandidateAdmission(
+                                CandidateAdmissionStatus.WINDOW_FULL, **context
+                            )
+
+                reservation = CandidateReservation(
+                    id=uuid.uuid4(),
+                    window_id=window.id,
+                    batch_id=window.batch_id,
+                    job_id=window.job_id,
+                    job_source_task_id=task_uuid,
+                    source_type=source_value,
+                    source_item_id=item_key,
+                    status="RESERVED",
+                )
+                db.add(reservation)
+
+                # The reservation that consumes the final slot closes admission.
+                window.status = "FULL" if used + 1 >= limit else "ACQUIRING"
+
+                db.flush()
+                reservation_id = reservation.id
+                db.commit()
+
+                return CandidateAdmission(
+                    CandidateAdmissionStatus.ADMITTED,
+                    reservation_id=reservation_id,
+                    **context,
+                )
+        except OperationalError as exc:
+            is_deadlock = (
+                "deadlock" in str(exc).lower()
+                or getattr(getattr(exc, "orig", None), "sqlstate", None) in ("40P01", "40001", "55P03")
             )
-            .order_by(ImageBatch.batch_index.asc())
-            .limit(1)
-            .with_for_update()
-        ).scalar_one_or_none()
-
-        if batch is None:
-            from app.tasks.batch_orchestration import BatchOrchestrator
-            orchestrator = BatchOrchestrator(db, task.job_id)
-            batch = orchestrator.get_or_create_active_batch()
-
-        if batch is None or batch.status == BatchStatus.PAUSED:
-            return CandidateAdmission(CandidateAdmissionStatus.INACTIVE)
-
-        window = db.execute(
-            select(CandidateWindow)
-            .where(CandidateWindow.batch_id == batch.id)
-            .order_by(CandidateWindow.window_index.desc())
-            .limit(1)
-            .with_for_update()
-        ).scalar_one_or_none()
-
-        if window is None:
-            ensure_candidate_window(db, batch)
-            window = db.execute(
-                select(CandidateWindow)
-                .where(CandidateWindow.batch_id == batch.id)
-                .order_by(CandidateWindow.window_index.desc())
-                .limit(1)
-                .with_for_update()
-            ).scalar_one_or_none()
-
-        if window is None:
-            return CandidateAdmission(CandidateAdmissionStatus.INACTIVE)
-
-        context = {
-            "window_id": window.id,
-            "window_index": int(window.window_index),
-        }
-
-        if window.status not in ("OPEN", "ACQUIRING", "FULL"):
-            return CandidateAdmission(
-                CandidateAdmissionStatus.INACTIVE, **context
-            )
-
-        # Skip assets already ingested by the legacy or current pipeline.
-        from app.db.models.asset import Asset
-
-        existing_asset = db.execute(
-            select(Asset.id).where(
-                Asset.job_id == window.job_id,
-                Asset.source_type == source_value,
-                Asset.source_item_id == item_key,
-            ).limit(1)
-        ).scalar_one_or_none()
-
-        if existing_asset is not None:
-            return CandidateAdmission(
-                CandidateAdmissionStatus.DUPLICATE, **context
-            )
-
-        # Also skip candidates reserved earlier in this batch.
-        existing = db.execute(
-            select(CandidateReservation.id).where(
-                CandidateReservation.batch_id == window.batch_id,
-                CandidateReservation.source_type == source_value,
-                CandidateReservation.source_item_id == item_key,
-            )
-        ).scalar_one_or_none()
-
-        if existing is not None:
-            return CandidateAdmission(
-                CandidateAdmissionStatus.DUPLICATE, **context
-            )
-
-        if window.status == "FULL":
-            return CandidateAdmission(
-                CandidateAdmissionStatus.WINDOW_FULL, **context
-            )
-
-        used = db.execute(
-            select(func.count(CandidateReservation.id)).where(
-                CandidateReservation.window_id == window.id
-            )
-        ).scalar_one()
-
-        limit = max(
-            1, min(MAX_CANDIDATES_PER_WINDOW, int(window.candidate_limit))
-        )
-
-        if used >= limit:
-            window.status = "FULL"
-            db.commit()
-            return CandidateAdmission(
-                CandidateAdmissionStatus.WINDOW_FULL, **context
-            )
-
-        reservation = CandidateReservation(
-            id=uuid.uuid4(),
-            window_id=window.id,
-            batch_id=window.batch_id,
-            job_id=window.job_id,
-            job_source_task_id=task_uuid,
-            source_type=source_value,
-            source_item_id=item_key,
-            status="RESERVED",
-        )
-        db.add(reservation)
-
-        # The reservation that consumes the final slot closes admission.
-        window.status = "FULL" if used + 1 >= limit else "ACQUIRING"
-
-        db.flush()
-        reservation_id = reservation.id
-        db.commit()
-
-        return CandidateAdmission(
-            CandidateAdmissionStatus.ADMITTED,
-            reservation_id=reservation_id,
-            **context,
-        )
+            if is_deadlock and attempt < max_retries - 1:
+                sleep_s = (0.05 * (2 ** attempt)) + random.uniform(0.01, 0.05)
+                logger.warning(
+                    f"Deadlock/concurrency collision in admit_candidate_for_task (attempt {attempt + 1}/{max_retries}), "
+                    f"retrying in {sleep_s:.3f}s: {exc}"
+                )
+                time.sleep(sleep_s)
+                continue
+            raise
 
 
 def reserve_candidate(

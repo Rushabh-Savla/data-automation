@@ -109,6 +109,12 @@ class NfsClient(NasClient):
         except Exception as exc:
             raise NasConnectionError(f"Could not delete '{rel}': {exc}") from exc
 
+    def rmdir(self, rel: str) -> None:
+        try:
+            self._nfs.rmdir(self._abs(rel))
+        except Exception as exc:
+            raise NasConnectionError(f"Could not remove directory '{rel}': {exc}") from exc
+
     def exists(self, rel: str) -> bool:
         return self.size(rel) is not None
 

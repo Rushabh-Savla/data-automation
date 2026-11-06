@@ -416,7 +416,7 @@ def plan_topup_round(self, job_id: str):
                     accepted_post_filter=accepted,
                     promoted_total=promoted_total,
                     round_number=round_number,
-                    max_rounds=settings.topup_max_rounds,
+                    max_rounds=job.config.get("topup_max_rounds", settings.topup_max_rounds) if job and job.config else settings.topup_max_rounds,
                     sources=sources,
                     gained_last_round=(
                         accepted - previous_accepted if previous_accepted is not None else None
@@ -498,7 +498,7 @@ def plan_topup_round(self, job_id: str):
             {
                 "type": "topup_round",
                 "round": plan.round_number,
-                "max_rounds": settings.topup_max_rounds,
+                "max_rounds": plan.max_rounds,
                 "shortfall": plan.shortfall,
                 "observed_yield": round(plan.observed_yield, 3),
             },

@@ -734,7 +734,6 @@ def consolidate_job_dataset_on_nas(job_id: str) -> dict:
 
     with open_client(params) as client:
         _ensure_dir(client, images_dir)
-        _ensure_dir(client, annotations_dir)
 
         all_entries = list(client.walk(remote_job_dir))
 
@@ -758,9 +757,6 @@ def consolidate_job_dataset_on_nas(job_id: str) -> dict:
                     logger.warning(f"[CONSOLIDATE] Could not delete batch manifest {path}: {e}")
                 continue
 
-            if len(parts) > 1:
-                subdirs_to_clean.add("/".join(parts[:-1]))
-
             # Move image files into unified images/ directory
             if "/images/" in path or any(filename.lower().endswith(ext) for ext in [".jpg", ".jpeg", ".png", ".webp"]):
                 target_rel = f"{images_dir}/{filename}"
@@ -773,6 +769,7 @@ def consolidate_job_dataset_on_nas(job_id: str) -> dict:
 
             # Move annotation files into unified annotations/ directory
             elif "/annotations/" in path or any(filename.lower().endswith(ext) for ext in [".json", ".xml", ".txt"]):
+                _ensure_dir(client, annotations_dir)
                 target_rel = f"{annotations_dir}/{filename}"
                 if target_rel != path:
                     try:
@@ -781,28 +778,52 @@ def consolidate_job_dataset_on_nas(job_id: str) -> dict:
                     except Exception as e:
                         logger.warning(f"[CONSOLIDATE] Failed to move annotation {path} -> {target_rel}: {e}")
 
-        # Clean up empty intermediate directories (deepest first)
-        for sdir in sorted(subdirs_to_clean, key=lambda s: len(s), reverse=True):
-            if sdir in (remote_job_dir, images_dir, annotations_dir):
-                continue
-            _rmdir_quiet(client, sdir)
+        # Recursively remove all intermediate staging directories (e.g. batch_*, window_*)
+        try:
+            top_entries = client.list_dir(remote_job_dir)
+            for top_entry in top_entries:
+                if not top_entry.is_dir:
+                    continue
+                # Preserve the consolidated images directory
+                if top_entry.name == "images":
+                    continue
+                # If annotations directory exists but has no annotations, purge it
+                if top_entry.name == "annotations":
+                    ann_files = list(client.walk(annotations_dir))
+                    if not ann_files:
+                        try:
+                            client.rmtree(annotations_dir)
+                        except Exception as e:
+                            logger.warning(f"[CONSOLIDATE] Could not remove empty annotations dir: {e}")
+                    continue
+                # Remove any intermediate batch or window directory
+                staging_subdir = f"{remote_job_dir}/{top_entry.name}"
+                try:
+                    client.rmtree(staging_subdir)
+                except Exception as e:
+                    logger.warning(f"[CONSOLIDATE] Could not rmtree staging subdir {staging_subdir}: {e}")
+        except Exception as e:
+            logger.warning(f"[CONSOLIDATE] Error while purging staging subdirs: {e}")
 
         # Re-walk final images and annotations
         final_images = list(client.walk(images_dir))
-        final_annots = list(client.walk(annotations_dir))
+        final_annots = list(client.walk(annotations_dir)) if client.exists(annotations_dir) else []
 
         # Write master manifest
+        structure_dict = {
+            "images_dir": "images/",
+            "manifest": "manifest.json",
+        }
+        if final_annots:
+            structure_dict["annotations_dir"] = "annotations/"
+
         manifest_payload = {
             "job_id": str(job_id),
             "job_name": job_name,
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "total_images": len(final_images),
             "total_annotations": len(final_annots),
-            "structure": {
-                "images_dir": "images/",
-                "annotations_dir": "annotations/",
-                "manifest": "manifest.json",
-            },
+            "structure": structure_dict,
             "images": [
                 {
                     "filename": Path(e.path).name,

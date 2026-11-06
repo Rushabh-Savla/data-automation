@@ -42,6 +42,9 @@ def test_concurrent_progress_updates(db_session, monkeypatch):
         progress_fn1({"downloaded": 1, "accepted": 1})
         progress_fn2({"downloaded": 1, "accepted": 1})
 
+    progress_fn1({"flush": True})
+    progress_fn2({"flush": True})
+
     db_session.commit()
     db_session.refresh(job)
 

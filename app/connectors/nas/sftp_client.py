@@ -188,6 +188,14 @@ class SftpClient(NasClient):
         except Exception as exc:
             raise self._translate(exc) from exc
 
+    def rmdir(self, rel: str) -> None:
+        try:
+            self._sftp.rmdir(self._abs(rel))
+        except FileNotFoundError:
+            return
+        except Exception as exc:
+            raise self._translate(exc) from exc
+
     def exists(self, rel: str) -> bool:
         return self.size(rel) is not None
 

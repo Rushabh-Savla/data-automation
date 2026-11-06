@@ -196,6 +196,15 @@ class SmbClient(NasClient):
         except Exception as exc:
             raise self._translate(exc) from exc
 
+    def rmdir(self, rel: str) -> None:
+        try:
+            smbclient.rmdir(self._unc(rel), **self._kw)
+        except SMBOSError as exc:
+            if exc.errno != _ENOENT:
+                raise self._translate(exc) from exc
+        except Exception as exc:
+            raise self._translate(exc) from exc
+
     def exists(self, rel: str) -> bool:
         return self.size(rel) is not None
 

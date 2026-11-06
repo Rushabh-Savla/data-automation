@@ -60,8 +60,8 @@ _VALIDATE_TIMEOUT_S = 3.0  # HEAD requests should be fast; 8s serial was the mai
 _VALIDATE_MAX_WORKERS = 16
 _DISCOVER_PAGE_SIZE = 100  # ddgs image engines cap out well under this per call regardless
 _DISCOVER_PAGES_PER_VARIANT = 6  # pages to walk for one query phrasing before moving to the next
-_DISCOVER_PAGE_RETRIES = 3  # per-page retries before treating that page as exhausted
-_DISCOVER_RETRY_DELAY_S = 2.0
+_DISCOVER_PAGE_RETRIES = 2  # per-page retries before treating that page as exhausted
+_DISCOVER_RETRY_DELAY_S = 1.0
 _DISCOVER_MIN_ATTEMPTS = 20
 _DISCOVER_MAX_ATTEMPTS_CAP = 200  # hard ceiling on (variant, page) fetches regardless of target size
 _DISCOVER_ATTEMPTS_PER_TARGET = 10  # scales attempt budget with how many validated URLs are wanted
@@ -217,6 +217,7 @@ class WebScrapeConnector:
                                     safesearch=self.safesearch,
                                     max_results=_DISCOVER_PAGE_SIZE,
                                     page=page,
+                                    backend="bing,duckduckgo",
                                 )
                             )
                         break

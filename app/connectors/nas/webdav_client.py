@@ -177,6 +177,13 @@ class WebDavClient(NasClient):
             return
         resp.close()
 
+    def rmdir(self, rel: str) -> None:
+        try:
+            resp = self._request("DELETE", rel)
+        except NasNotFoundError:
+            return
+        resp.close()
+
     def exists(self, rel: str) -> bool:
         return self.size(rel) is not None
 

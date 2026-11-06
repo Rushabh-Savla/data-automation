@@ -159,6 +159,12 @@ def build_on_progress(
             last_commit_time = now
             for attempt in range(5):
                 try:
+                    # STRICT LOCK ORDERING: ALWAYS update Job first, then JobSourceTask.
+                    # Consistent lock acquisition order eliminates deadlock (Postgres 40P01)
+                    # under concurrent worker execution.
+                    if pending_job:
+                        job_repo.increment_counts(job_id, **pending_job)
+
                     if pending_checkpoint is not None:
                         task = task_repo.get(job_source_task_id)
                         merged = dict(task.checkpoint or {}) if task else {}
@@ -168,21 +174,16 @@ def build_on_progress(
                             else:
                                 merged[cp_k] = cp_v
                         task_repo.heartbeat(job_source_task_id, checkpoint=merged)
-                        pending_checkpoint = None
                     else:
                         task_repo.heartbeat(job_source_task_id)
 
-                    # STRICT LOCK ORDERING: ALWAYS update Job first, then JobSourceTask.
-                    # Consistent lock acquisition order eliminates deadlock (Postgres 40P01)
-                    # under concurrent worker execution.
-                    if pending_job:
-                        job_repo.increment_counts(job_id, **pending_job)
-                        pending_job.clear()
                     if pending_task:
                         task_repo.increment_counts(job_source_task_id, **pending_task)
-                        pending_task.clear()
 
                     db.commit()
+                    pending_job.clear()
+                    pending_task.clear()
+                    pending_checkpoint = None
                     break
                 except OperationalError as exc:
                     db.rollback()

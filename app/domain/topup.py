@@ -136,6 +136,7 @@ class TopupPlan:
     observed_yield: float
     # source_type -> how many raw assets that source should aim to download.
     quota: dict[str, int]
+    max_rounds: int = 400
 
     @property
     def total_quota(self) -> int:
@@ -265,4 +266,5 @@ class TopupPlanner:
             shortfall=shortfall,
             observed_yield=observed,
             quota=quota,
+            max_rounds=snapshot.max_rounds,
         )

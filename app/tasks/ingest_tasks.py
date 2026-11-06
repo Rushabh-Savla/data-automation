@@ -136,31 +136,54 @@ def _run_item_download(
         task_repo.heartbeat(task_uuid)
         db.commit()
 
-        # Fast-skip check: if candidate window is already FULL, don't waste
+        # Fast-skip check: if all active candidate windows are already FULL, don't waste
         # bandwidth/IO downloading a dataset/video only to discard it during frame extraction.
         from sqlalchemy import select
         from app.db.models.candidate_window import CandidateWindow
-        active_win = db.execute(
-            select(CandidateWindow)
-            .where(CandidateWindow.job_id == job_uuid)
-            .order_by(CandidateWindow.created_at.desc())
-            .limit(1)
-        ).scalar_one_or_none()
-        if active_win is not None and active_win.status == "FULL":
-            logger.info(
-                f"[WINDOW] Active candidate window {active_win.id} (index {active_win.window_index}) "
-                f"is already FULL. Fast-skipping download for {checkpoint_key}."
+        from app.db.models.image_batch import ImageBatch
+        from app.domain.enums import BatchStatus
+
+        terminal_batches = (BatchStatus.COMPLETED, BatchStatus.PARTIAL, BatchStatus.FAILED)
+        active_batch_ids = db.execute(
+            select(ImageBatch.id)
+            .where(
+                ImageBatch.job_id == job_uuid,
+                ~ImageBatch.status.in_(terminal_batches),
             )
-            unbind_context()
-            return {
-                "item": checkpoint_key,
-                "accepted": 0,
-                "rejected": 0,
-                "window_full": True,
-                "window_id": str(active_win.id),
-                "window_index": active_win.window_index,
-                "checkpoint_index": 0,
-            }
+        ).scalars().all()
+
+        if active_batch_ids:
+            open_win = db.execute(
+                select(CandidateWindow)
+                .where(
+                    CandidateWindow.batch_id.in_(active_batch_ids),
+                    CandidateWindow.status.in_(("OPEN", "ACQUIRING")),
+                )
+                .limit(1)
+            ).scalar_one_or_none()
+            if open_win is None:
+                latest_win = db.execute(
+                    select(CandidateWindow)
+                    .where(CandidateWindow.batch_id.in_(active_batch_ids))
+                    .order_by(CandidateWindow.created_at.desc())
+                    .limit(1)
+                ).scalar_one_or_none()
+                win_id = str(latest_win.id) if latest_win else ""
+                win_idx = latest_win.window_index if latest_win else 0
+                logger.info(
+                    f"[WINDOW] Active candidate windows for job {job_uuid} are already FULL. "
+                    f"Fast-skipping download for {checkpoint_key}."
+                )
+                unbind_context()
+                return {
+                    "item": checkpoint_key,
+                    "accepted": 0,
+                    "rejected": 0,
+                    "window_full": True,
+                    "window_id": win_id,
+                    "window_index": win_idx,
+                    "checkpoint_index": 0,
+                }
 
         should_stop = build_should_stop(job_uuid, task_uuid)
         base_on_progress = build_on_progress(db, job_uuid, task_uuid)
