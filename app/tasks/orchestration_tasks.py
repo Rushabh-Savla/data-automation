@@ -644,9 +644,10 @@ def evaluate_job_completion(self, job_id: str):
     # uploads slowly (paced batches over one shared connection, see
     # nas_tasks.py).
     if new_status in (JobStatus.COMPLETED, JobStatus.COMPLETED_PARTIAL):
-        from app.tasks.nas_tasks import schedule_offload_for_job
+        from app.tasks.nas_tasks import consolidate_job_dataset_on_nas, schedule_offload_for_job
 
         schedule_offload_for_job(job_id)
+        consolidate_job_dataset_on_nas.apply_async((job_id,), countdown=2)
 
     from app.tasks.cleanup_tasks import cleanup_shared_cache
     cleanup_shared_cache.delay()

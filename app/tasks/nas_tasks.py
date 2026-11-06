@@ -18,9 +18,12 @@ of back-to-back connection churn even though each one individually honors the
 nas_sftp_max_concurrency cap (see base.limited_concurrency)."""
 
 import inspect
+import json
 import logging
+import tempfile
 import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 from sqlalchemy import or_, select
@@ -657,4 +660,213 @@ def reconcile_nas_transfers() -> dict:
         "status": "idle",
         "actionable_count": 0,
         "cleaned_count": 0,
+    }
+
+
+def _ensure_dir(client: NasClient, rel_dir: str) -> None:
+    if hasattr(client, "_mkdirs"):
+        client._mkdirs(rel_dir)
+    elif hasattr(client, "_abs"):
+        p = client._abs(rel_dir)
+        if hasattr(p, "mkdir"):
+            p.mkdir(parents=True, exist_ok=True)
+
+
+def _rmdir_quiet(client: NasClient, rel_dir: str) -> None:
+    try:
+        if hasattr(client, "_sftp"):
+            client._sftp.rmdir(client._abs(rel_dir))
+        elif hasattr(client, "_client") and hasattr(client._client, "_sftp"):
+            client._client._sftp.rmdir(client._client._abs(rel_dir))
+        elif hasattr(client, "_abs"):
+            p = client._abs(rel_dir)
+            if hasattr(p, "rmdir"):
+                p.rmdir()
+    except Exception:
+        pass
+
+
+@celery_app.task(name="app.tasks.nas_tasks.consolidate_job_dataset_on_nas")
+def consolidate_job_dataset_on_nas(job_id: str) -> dict:
+    """Consolidates distributed batches and windows on the remote NAS into a
+    unified, production-ready dataset layout:
+      <storage_path>/<job_folder>/images/<file>
+      <storage_path>/<job_folder>/annotations/<file>
+      <storage_path>/<job_folder>/manifest.json
+
+    Fast-renames remote files server-side without re-uploading bytes,
+    cleans up empty intermediate directories, builds a master manifest,
+    and updates all Asset.nas_path and Asset.annotation_nas_path records in PostgreSQL.
+    """
+    with session_scope() as db:
+        try:
+            job_uuid = uuid.UUID(str(job_id))
+        except (ValueError, TypeError):
+            return {"status": "skipped", "reason": "invalid_job_id"}
+
+        job = db.get(Job, job_uuid)
+        if job is None:
+            return {"status": "skipped", "reason": "job_not_found"}
+
+        cfg = job.config if isinstance(job.config, dict) else {}
+        storage_path = (cfg.get("nas_storage_path") or cfg.get("nas_folder") or "").strip()
+        if not storage_path:
+            return {"status": "skipped", "reason": "no_nas_storage_path"}
+
+        job_folder = _job_folder_for_asset(db, job_uuid)
+        job_name = job.name
+
+    if not is_storage_active():
+        return {"status": "skipped", "reason": "storage_inactive"}
+
+    params = get_active_storage_params()
+    if params is None:
+        return {"status": "skipped", "reason": "no_active_storage"}
+
+    remote_job_dir = join_relpath(storage_path, job_folder)
+    images_dir = f"{remote_job_dir}/images"
+    annotations_dir = f"{remote_job_dir}/annotations"
+
+    moved_images = 0
+    moved_annotations = 0
+    deleted_manifests = 0
+    subdirs_to_clean = set()
+
+    with open_client(params) as client:
+        _ensure_dir(client, images_dir)
+        _ensure_dir(client, annotations_dir)
+
+        all_entries = list(client.walk(remote_job_dir))
+
+        for entry in all_entries:
+            path = entry.path
+            parts = path.split("/")
+            filename = parts[-1]
+
+            # Skip top-level manifest or already consolidated files
+            if path == f"{remote_job_dir}/manifest.json":
+                continue
+            if path.startswith(f"{images_dir}/") or path.startswith(f"{annotations_dir}/"):
+                continue
+
+            # Remove intermediate batch or window manifest files
+            if filename == "manifest.json":
+                try:
+                    client.delete(path)
+                    deleted_manifests += 1
+                except Exception as e:
+                    logger.warning(f"[CONSOLIDATE] Could not delete batch manifest {path}: {e}")
+                continue
+
+            if len(parts) > 1:
+                subdirs_to_clean.add("/".join(parts[:-1]))
+
+            # Move image files into unified images/ directory
+            if "/images/" in path or any(filename.lower().endswith(ext) for ext in [".jpg", ".jpeg", ".png", ".webp"]):
+                target_rel = f"{images_dir}/{filename}"
+                if target_rel != path:
+                    try:
+                        client._rename(path, target_rel)
+                        moved_images += 1
+                    except Exception as e:
+                        logger.warning(f"[CONSOLIDATE] Failed to move image {path} -> {target_rel}: {e}")
+
+            # Move annotation files into unified annotations/ directory
+            elif "/annotations/" in path or any(filename.lower().endswith(ext) for ext in [".json", ".xml", ".txt"]):
+                target_rel = f"{annotations_dir}/{filename}"
+                if target_rel != path:
+                    try:
+                        client._rename(path, target_rel)
+                        moved_annotations += 1
+                    except Exception as e:
+                        logger.warning(f"[CONSOLIDATE] Failed to move annotation {path} -> {target_rel}: {e}")
+
+        # Clean up empty intermediate directories (deepest first)
+        for sdir in sorted(subdirs_to_clean, key=lambda s: len(s), reverse=True):
+            if sdir in (remote_job_dir, images_dir, annotations_dir):
+                continue
+            _rmdir_quiet(client, sdir)
+
+        # Re-walk final images and annotations
+        final_images = list(client.walk(images_dir))
+        final_annots = list(client.walk(annotations_dir))
+
+        # Write master manifest
+        manifest_payload = {
+            "job_id": str(job_id),
+            "job_name": job_name,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "total_images": len(final_images),
+            "total_annotations": len(final_annots),
+            "structure": {
+                "images_dir": "images/",
+                "annotations_dir": "annotations/",
+                "manifest": "manifest.json",
+            },
+            "images": [
+                {
+                    "filename": Path(e.path).name,
+                    "rel_path": f"images/{Path(e.path).name}",
+                    "size": e.size,
+                }
+                for e in sorted(final_images, key=lambda x: x.path)
+            ],
+            "annotations": [
+                {
+                    "filename": Path(e.path).name,
+                    "rel_path": f"annotations/{Path(e.path).name}",
+                    "size": e.size,
+                }
+                for e in sorted(final_annots, key=lambda x: x.path)
+            ],
+        }
+
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as tf:
+            json.dump(manifest_payload, tf, indent=2)
+            tmp_local_path = Path(tf.name)
+
+        try:
+            client.upload(tmp_local_path, f"{remote_job_dir}/manifest.json")
+        finally:
+            tmp_local_path.unlink(missing_ok=True)
+
+    # Update PostgreSQL Asset records
+    with session_scope() as db:
+        stmt = select(Asset).where(
+            Asset.job_id == job_uuid,
+            Asset.status.in_([AssetStatus.COMPLETED, AssetStatus.NAS_VERIFIED, AssetStatus.RELEVANCE_PASSED]),
+        )
+        updated_assets = 0
+        image_names_set = {Path(e.path).name for e in final_images}
+        annot_names_set = {Path(e.path).name for e in final_annots}
+
+        for asset in db.execute(stmt).scalars():
+            asset_fn = f"{asset.id}.jpg"
+            if asset.nas_path:
+                curr_fn = Path(asset.nas_path).name
+                if curr_fn in image_names_set:
+                    asset_fn = curr_fn
+            if asset_fn in image_names_set:
+                asset.nas_path = asset_files.make_remote_path(f"{images_dir}/{asset_fn}")
+                annot_fn = f"{Path(asset_fn).stem}.json"
+                if annot_fn in annot_names_set:
+                    asset.annotation_nas_path = asset_files.make_remote_path(f"{annotations_dir}/{annot_fn}")
+                asset.status = AssetStatus.COMPLETED
+                updated_assets += 1
+
+        db.commit()
+
+    logger.info(
+        f"[CONSOLIDATE] Job {job_id} dataset consolidated on NAS at {remote_job_dir}: "
+        f"{len(final_images)} images, {len(final_annots)} annotations, {updated_assets} DB assets updated."
+    )
+    return {
+        "status": "completed",
+        "remote_job_dir": remote_job_dir,
+        "total_images": len(final_images),
+        "total_annotations": len(final_annots),
+        "moved_images": moved_images,
+        "moved_annotations": moved_annotations,
+        "deleted_manifests": deleted_manifests,
+        "updated_assets": updated_assets,
     }

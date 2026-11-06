@@ -167,8 +167,17 @@ def limited_concurrency(
     handle = None
     started = time.monotonic()
     while handle is None:
+        lock_dir.mkdir(parents=True, exist_ok=True)
         for slot in random.sample(range(slots), slots):  # random order spreads contention
-            candidate = open(lock_dir / f".{name}.slot{slot}", "a")  # noqa: SIM115 - held for the slot's lifetime
+            slot_path = lock_dir / f".{name}.slot{slot}"
+            try:
+                candidate = open(slot_path, "a")  # noqa: SIM115 - held for the slot's lifetime
+            except FileNotFoundError:
+                lock_dir.mkdir(parents=True, exist_ok=True)
+                try:
+                    candidate = open(slot_path, "a")
+                except FileNotFoundError:
+                    continue
             try:
                 fcntl.flock(candidate, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:

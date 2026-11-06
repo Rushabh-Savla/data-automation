@@ -69,6 +69,7 @@ _CONTEXT_WORDS = {
     "video", "videos", "clip", "clips", "footage",
     "image", "images", "photo", "photos", "picture", "pictures",
     "shot", "shots", "frame", "frames",
+    "dataset", "datasets", "data", "model", "models",
 }
 
 # Words carrying no subject information on their own. Note what is NOT here:

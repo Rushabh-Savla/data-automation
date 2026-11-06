@@ -1270,15 +1270,10 @@ class NasBatchWriter:
                 "Retaining staging_cleanup_status as 'pending' for retry by recovery task."
             )
 
-        # Transition all verified/uploaded assets in this batch to COMPLETED
+        # Transition only verified/uploaded assets in this batch to COMPLETED
         stmt = select(Asset).where(
             Asset.batch_id == batch.id,
-            Asset.status.in_([
-                AssetStatus.NAS_VERIFIED,
-                AssetStatus.UPLOADING,
-                AssetStatus.READY_FOR_UPLOAD,
-                AssetStatus.RELEVANCE_PASSED,
-            ]),
+            Asset.status == AssetStatus.NAS_VERIFIED,
         )
         for a in self.db.execute(stmt).scalars():
             a.status = AssetStatus.COMPLETED

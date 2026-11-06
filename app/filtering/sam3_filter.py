@@ -147,8 +147,9 @@ def clean_concept_prompt(text: str) -> str:
     cleaned = query_expansion.normalize_query(text).strip()
     # Remove leading articles: 'a ', 'an ', 'the '
     cleaned = re.sub(r"^(a|an|the)\s+", "", cleaned, flags=re.IGNORECASE)
-    # Strip any dangling punctuation
-    cleaned = cleaned.strip(".,!?\"' ")
+    # Remove context words like dataset, image, photo that are not detectable physical objects
+    cleaned = re.sub(r"\b(dataset|datasets|photos?|images?|pictures?)\b", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(".,!?\"' ")
     return cleaned if cleaned else text.strip()
 
 
@@ -234,37 +235,38 @@ class Sam3Verifier:
         """
         import torch
 
-        # Prepare inference state
-        if isinstance(image_or_state, dict) and "backbone_out" in image_or_state:
-            state = image_or_state
-        else:
-            pil_img = self._load_pil(image_or_state)
-            state = self._processor.set_image(pil_img)
+        with torch.inference_mode():
+            # Prepare inference state
+            if isinstance(image_or_state, dict) and "backbone_out" in image_or_state:
+                state = image_or_state
+            else:
+                pil_img = self._load_pil(image_or_state)
+                state = self._processor.set_image(pil_img)
 
-        clean_prompt = clean_concept_prompt(concept)
-        output = self._processor.set_text_prompt(prompt=clean_prompt, state=state)
+            clean_prompt = clean_concept_prompt(concept)
+            output = self._processor.set_text_prompt(prompt=clean_prompt, state=state)
 
-        scores_t = output.get("scores")
-        boxes_t = output.get("boxes")
-        masks_t = output.get("masks")
+            scores_t = output.get("scores")
+            boxes_t = output.get("boxes")
+            masks_t = output.get("masks")
 
-        if scores_t is not None and len(scores_t) > 0:
-            scores_np = scores_t.detach().float().cpu().numpy()
-            # Filter non-finite scores (NaN, inf)
-            valid_mask = np.isfinite(scores_np)
-            scores_np = scores_np[valid_mask]
-            max_score = float(np.max(scores_np)) if len(scores_np) > 0 else 0.0
-        else:
-            scores_np = np.array([], dtype=np.float32)
-            max_score = 0.0
+            if scores_t is not None and len(scores_t) > 0:
+                scores_np = scores_t.detach().float().cpu().numpy()
+                # Filter non-finite scores (NaN, inf)
+                valid_mask = np.isfinite(scores_np)
+                scores_np = scores_np[valid_mask]
+                max_score = float(np.max(scores_np)) if len(scores_np) > 0 else 0.0
+            else:
+                scores_np = np.array([], dtype=np.float32)
+                max_score = 0.0
 
-        return {
-            "scores": scores_np,
-            "boxes": boxes_t,
-            "masks": masks_t,
-            "max_score": max_score,
-            "state": state,
-        }
+            return {
+                "scores": scores_np,
+                "boxes": boxes_t,
+                "masks": masks_t,
+                "max_score": max_score,
+                "state": state,
+            }
 
     def evaluate_asset(
         self,
@@ -305,72 +307,73 @@ class Sam3Verifier:
             return OUTCOME_ERROR, None
 
         try:
-            # Reusable image state across multi-class concepts
-            state = self._processor.set_image(pil_img)
+            with torch.inference_mode():
+                # Reusable image state across multi-class concepts
+                state = self._processor.set_image(pil_img)
 
-            # Complex query evaluation: AND / OR
-            if " AND " in query:
-                sub_queries = [q.strip() for q in query.split(" AND ") if q.strip()]
-                concept_scores: list[float] = []
-                concept_passes: list[bool] = []
-                for sub in sub_queries:
-                    res = self.infer_concept(state, sub)
-                    scores = res["scores"]
-                    top = res["max_score"]
-                    concept_scores.append(top)
-                    concept_passes.append(bool(np.any(scores >= threshold)))
-
-                all_passed = all(concept_passes)
-                winning_score = float(min(concept_scores)) if concept_scores else 0.0
-                outcome = OUTCOME_ACCEPT if all_passed else OUTCOME_REJECT
-
-            elif " OR " in query:
-                sub_queries = [q.strip() for q in query.split(" OR ") if q.strip()]
-                concept_scores: list[float] = []
-                concept_passes: list[bool] = []
-                for sub in sub_queries:
-                    res = self.infer_concept(state, sub)
-                    scores = res["scores"]
-                    top = res["max_score"]
-                    concept_scores.append(top)
-                    concept_passes.append(bool(np.any(scores >= threshold)))
-
-                any_passed = any(concept_passes)
-                winning_score = float(max(concept_scores)) if concept_scores else 0.0
-                outcome = OUTCOME_ACCEPT if any_passed else OUTCOME_REJECT
-
-            else:
-                # Single concept prompt or expanded concepts
-                subjects = query_expansion.derive_classes(query)
-                if not subjects:
-                    subjects = query_expansion.query_subjects(query)
-                if len(subjects) > 1:
-                    # Multi-subject expansion (treated as OR)
-                    concept_scores = []
-                    concept_passes = []
-                    for sub in subjects:
+                # Complex query evaluation: AND / OR
+                if " AND " in query:
+                    sub_queries = [q.strip() for q in query.split(" AND ") if q.strip()]
+                    concept_scores: list[float] = []
+                    concept_passes: list[bool] = []
+                    for sub in sub_queries:
                         res = self.infer_concept(state, sub)
                         scores = res["scores"]
                         top = res["max_score"]
                         concept_scores.append(top)
                         concept_passes.append(bool(np.any(scores >= threshold)))
+
+                    all_passed = all(concept_passes)
+                    winning_score = float(min(concept_scores)) if concept_scores else 0.0
+                    outcome = OUTCOME_ACCEPT if all_passed else OUTCOME_REJECT
+
+                elif " OR " in query:
+                    sub_queries = [q.strip() for q in query.split(" OR ") if q.strip()]
+                    concept_scores: list[float] = []
+                    concept_passes: list[bool] = []
+                    for sub in sub_queries:
+                        res = self.infer_concept(state, sub)
+                        scores = res["scores"]
+                        top = res["max_score"]
+                        concept_scores.append(top)
+                        concept_passes.append(bool(np.any(scores >= threshold)))
+
                     any_passed = any(concept_passes)
                     winning_score = float(max(concept_scores)) if concept_scores else 0.0
                     outcome = OUTCOME_ACCEPT if any_passed else OUTCOME_REJECT
+
                 else:
-                    target_concept = subjects[0] if subjects else query
-                    res = self.infer_concept(state, target_concept)
-                    scores = res["scores"]
-                    winning_score = res["max_score"]
-                    has_match = bool(np.any(scores >= threshold))
-                    outcome = OUTCOME_ACCEPT if has_match else OUTCOME_REJECT
+                    # Single concept prompt or expanded concepts
+                    subjects = query_expansion.derive_classes(query)
+                    if not subjects:
+                        subjects = query_expansion.query_subjects(query)
+                    if len(subjects) > 1:
+                        # Multi-subject expansion (treated as OR)
+                        concept_scores = []
+                        concept_passes = []
+                        for sub in subjects:
+                            res = self.infer_concept(state, sub)
+                            scores = res["scores"]
+                            top = res["max_score"]
+                            concept_scores.append(top)
+                            concept_passes.append(bool(np.any(scores >= threshold)))
+                        any_passed = any(concept_passes)
+                        winning_score = float(max(concept_scores)) if concept_scores else 0.0
+                        outcome = OUTCOME_ACCEPT if any_passed else OUTCOME_REJECT
+                    else:
+                        target_concept = subjects[0] if subjects else query
+                        res = self.infer_concept(state, target_concept)
+                        scores = res["scores"]
+                        winning_score = res["max_score"]
+                        has_match = bool(np.any(scores >= threshold))
+                        outcome = OUTCOME_ACCEPT if has_match else OUTCOME_REJECT
 
-            # Cache successful score in Redis
-            if fingerprint:
-                cache_key = compute_sam3_cache_key(fingerprint, query)
-                self._set_cached_score(cache_key, winning_score)
+                # Cache successful score in Redis
+                if fingerprint:
+                    cache_key = compute_sam3_cache_key(fingerprint, query)
+                    self._set_cached_score(cache_key, winning_score)
 
-            return outcome, winning_score
+                return outcome, winning_score
 
         except (torch.cuda.OutOfMemoryError, RuntimeError) as oom_err:
             if "out of memory" in str(oom_err).lower():

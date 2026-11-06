@@ -195,7 +195,7 @@ def _run_item_download(
                             threshold=relevance_thresh,
                             min_resolution=min_res,
                         )
-                        if outcome == "reject":
+                        if outcome != "accept":
                             draft.local_tmp_path.unlink(missing_ok=True)
                             if draft.annotation_tmp_path:
                                 draft.annotation_tmp_path.unlink(missing_ok=True)
@@ -203,7 +203,7 @@ def _run_item_download(
                             rejected += 1
                             on_progress({"rejected": 1})
                             continue
-                        elif outcome == "accept":
+                        else:
                             relevance_score = score
 
                     standardize_and_promote_sync(

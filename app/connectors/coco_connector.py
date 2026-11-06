@@ -103,7 +103,10 @@ def _ensure_annotations_cached(split: str) -> Path:
                     for chunk in r.iter_content(chunk_size=1 << 20):
                         f.write(chunk)
             if not zip_path.exists():
-                tmp_path.replace(zip_path)
+                try:
+                    tmp_path.replace(zip_path)
+                except FileNotFoundError:
+                    pass
         finally:
             tmp_path.unlink(missing_ok=True)
 
@@ -116,7 +119,10 @@ def _ensure_annotations_cached(split: str) -> Path:
             with zf.open(member) as src, open(tmp_json, "wb") as dst:
                 dst.write(src.read())
             if not json_path.exists():
-                tmp_json.replace(json_path)
+                try:
+                    tmp_json.replace(json_path)
+                except FileNotFoundError:
+                    pass
         finally:
             tmp_json.unlink(missing_ok=True)
 

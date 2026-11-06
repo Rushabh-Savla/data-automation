@@ -89,8 +89,20 @@ def cleanup_shared_cache(force: bool = False) -> dict:
     reclaimed_bytes = 0
     removed_items = 0
 
+    PROTECTED_DIRS = {
+        "nas_sftp",
+        "kaggle",
+        "coco",
+        "pascal_voc",
+        "sun_rgbd",
+        "davis",
+        "visual_genome",
+    }
+
     if shared_cache_dir.exists():
         for entry in shared_cache_dir.iterdir():
+            if entry.name in PROTECTED_DIRS or entry.name.startswith("nas_") or entry.name.startswith("."):
+                continue
             try:
                 if entry.is_dir():
                     size = sum(f.stat().st_size for f in entry.rglob("*") if f.is_file())
