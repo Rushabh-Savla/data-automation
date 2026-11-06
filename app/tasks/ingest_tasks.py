@@ -101,6 +101,17 @@ def _run_item_download(
     """
     job_uuid = uuid.UUID(job_id)
     task_uuid = uuid.UUID(job_source_task_id)
+
+    # Fast-check if job/source is already stopped/cancelled/target-reached:
+    # Avoid opening database sessions and executing heavy logic for stale queue tasks
+    try:
+        from app.core.redis_client import get_redis_client
+        from app.services.cancellation_service import CancellationService
+        if CancellationService(get_redis_client()).should_stop(job_id, job_source_task_id):
+            return {"item": checkpoint_key, "accepted": 0, "rejected": 0, "stopped": True}
+    except Exception:
+        pass
+
     bind_context(job_uuid, task_uuid)
 
     with session_scope() as db:
@@ -211,6 +222,7 @@ def _run_item_download(
                     )
                     downloaded += 1
                     accepted += 1
+                    on_progress({"accepted": 1, "downloaded": 1})
                 except AssetRejected:
                     if draft.local_tmp_path:
                         draft.local_tmp_path.unlink(missing_ok=True)
@@ -222,6 +234,7 @@ def _run_item_download(
                 except Exception:
                     mark_draft_reservation_failed(draft)
                     raise
+            on_progress({"flush": True})
         except CandidateWindowFull as exc:
             logger.info(
                 f"[WINDOW] {checkpoint_key} reached candidate window "

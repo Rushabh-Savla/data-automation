@@ -151,6 +151,7 @@ def build_on_progress(
             or delta.get("errors", 0) > 0
             or update_count >= 10
             or (now - last_commit_time) >= 2.0
+            or delta.get("flush", False)
         )
 
         if should_commit and (pending_job or pending_task or pending_checkpoint is not None):

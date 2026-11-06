@@ -18,6 +18,7 @@ wrapped with retry/backoff instead of failing outright on a transient error.
 
 import hashlib
 import logging
+import os
 import zipfile
 from collections.abc import Iterator
 from pathlib import Path
@@ -31,6 +32,7 @@ from app.connectors.base import (
     SourceItem,
     register_connector,
 )
+from app.core.config import get_settings
 from app.core.exceptions import CandidateWindowFull, FatalConnectorError, JobStopped, TransientConnectorError
 from app.domain.enums import SourceType
 

@@ -125,12 +125,12 @@ def test_cleanup_shared_cache(tmp_work_root, monkeypatch):
     from app.tasks.cleanup_tasks import cleanup_shared_cache
 
     cache_dir = tmp_work_root / "_shared_cache"
-    coco_dir = cache_dir / "coco"
-    coco_dir.mkdir(parents=True)
-    (coco_dir / "index.sqlite3").write_text("sqlite")
+    other_dir = cache_dir / "other"
+    other_dir.mkdir(parents=True)
+    (other_dir / "index.sqlite3").write_text("sqlite")
     (cache_dir / "dummy.txt").write_text("test")
 
-    assert (coco_dir / "index.sqlite3").exists()
+    assert (other_dir / "index.sqlite3").exists()
 
     mock_db = MagicMock()
     mock_db.execute.return_value.scalar.return_value = 0
@@ -144,5 +144,5 @@ def test_cleanup_shared_cache(tmp_work_root, monkeypatch):
     res = cleanup_shared_cache(force=False)
     assert res["status"] == "cleaned"
     assert res["items_removed"] == 2
-    assert not (coco_dir / "index.sqlite3").exists()
+    assert not (other_dir / "index.sqlite3").exists()
     assert not (cache_dir / "dummy.txt").exists()
