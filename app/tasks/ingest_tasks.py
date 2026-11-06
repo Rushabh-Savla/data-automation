@@ -198,7 +198,16 @@ def _run_item_download(
             for draft in fetch(checkpoint, should_stop, on_progress):
                 try:
                     relevance_score = None
-                    if draft.local_tmp_path and draft.local_tmp_path.exists():
+                    shared_cache_prefix = str(get_settings().work_root / "_shared_cache")
+
+                    if draft.local_tmp_path:
+                        if not draft.local_tmp_path.exists():
+                            logger.warning(f"Candidate image missing on disk: {draft.local_tmp_path}")
+                            mark_draft_reservation_failed(draft)
+                            rejected += 1
+                            on_progress({"rejected": 1})
+                            continue
+
                         from app.services.relevance_gate_service import evaluate_transient_candidate
                         outcome, score = evaluate_transient_candidate(
                             image_path=draft.local_tmp_path,
@@ -207,8 +216,10 @@ def _run_item_download(
                             min_resolution=min_res,
                         )
                         if outcome != "accept":
-                            draft.local_tmp_path.unlink(missing_ok=True)
-                            if draft.annotation_tmp_path:
+                            # Only delete ephemeral scratch files; never delete files from shared dataset cache
+                            if not str(draft.local_tmp_path).startswith(shared_cache_prefix):
+                                draft.local_tmp_path.unlink(missing_ok=True)
+                            if draft.annotation_tmp_path and not str(draft.annotation_tmp_path).startswith(shared_cache_prefix):
                                 draft.annotation_tmp_path.unlink(missing_ok=True)
                             mark_draft_reservation_failed(draft)
                             rejected += 1
@@ -224,9 +235,10 @@ def _run_item_download(
                     accepted += 1
                     on_progress({"accepted": 1, "downloaded": 1})
                 except AssetRejected:
-                    if draft.local_tmp_path:
+                    shared_cache_prefix = str(get_settings().work_root / "_shared_cache")
+                    if draft.local_tmp_path and not str(draft.local_tmp_path).startswith(shared_cache_prefix):
                         draft.local_tmp_path.unlink(missing_ok=True)
-                    if draft.annotation_tmp_path:
+                    if draft.annotation_tmp_path and not str(draft.annotation_tmp_path).startswith(shared_cache_prefix):
                         draft.annotation_tmp_path.unlink(missing_ok=True)
                     mark_draft_reservation_failed(draft)
                     rejected += 1
@@ -268,7 +280,8 @@ def _run_item_download(
                 # gating) via the existing error_message field instead of it
                 # only ever reaching the worker log — status is left
                 # unchanged (still DOWNLOADING), this is not a task failure.
-                err_repo.set_status(task_uuid, JobSourceTaskStatus.DOWNLOADING, error_message=str(e))
+                err_summary = str(e).splitlines()[0] if str(e) else "Connector error"
+                err_repo.set_status(task_uuid, JobSourceTaskStatus.DOWNLOADING, error_message=err_summary)
                 err_db.commit()
             unbind_context()
             logger.error(f"Fatal error downloading {checkpoint_key} (recorded as error, not task failure): {e}")
@@ -299,7 +312,8 @@ def _run_item_download(
             with session_scope() as err_db:
                 err_repo = JobSourceTaskRepository(err_db)
                 err_repo.increment_counts(task_uuid, errors=1)
-                err_repo.set_status(task_uuid, JobSourceTaskStatus.DOWNLOADING, error_message=str(e))
+                err_summary = str(e).splitlines()[0] if str(e) else "Connector error"
+                err_repo.set_status(task_uuid, JobSourceTaskStatus.DOWNLOADING, error_message=err_summary)
                 err_db.commit()
             unbind_context()
             logger.error(f"Exhausted retries downloading {checkpoint_key} (recorded as error, not task failure): {e}")
@@ -319,7 +333,8 @@ def _run_item_download(
             with session_scope() as err_db:
                 err_repo = JobSourceTaskRepository(err_db)
                 err_repo.increment_counts(task_uuid, errors=1)
-                err_repo.set_status(task_uuid, JobSourceTaskStatus.DOWNLOADING, error_message=str(e))
+                err_summary = str(e).splitlines()[0] if str(e) else "Connector error"
+                err_repo.set_status(task_uuid, JobSourceTaskStatus.DOWNLOADING, error_message=err_summary)
                 err_db.commit()
             unbind_context()
             logger.exception(f"Unexpected error downloading {checkpoint_key} (recorded as error, not task failure)")

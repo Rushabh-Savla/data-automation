@@ -39,6 +39,7 @@ services:
       REDIS_URL: redis://redis:6379/0
       NAS_ROOT: /nas
       WORK_ROOT: /work
+      KAGGLEHUB_CACHE: /work/_shared_cache/kaggle
       KAGGLEHUB_CACHE_DIR: /work/_shared_cache/kaggle
     ports:
       - "8010:8000"
@@ -72,6 +73,7 @@ services:
       REDIS_URL: redis://redis:6379/0
       NAS_ROOT: /nas
       WORK_ROOT: /work
+      KAGGLEHUB_CACHE: /work/_shared_cache/kaggle
       KAGGLEHUB_CACHE_DIR: /work/_shared_cache/kaggle
       PYTHONPATH: "/srv/sam3:/srv"
       CUDA_VISIBLE_DEVICES: ""
@@ -122,6 +124,7 @@ services:
       REDIS_URL: redis://redis:6379/0
       NAS_ROOT: /nas
       WORK_ROOT: /work
+      KAGGLEHUB_CACHE: /work/_shared_cache/kaggle
       KAGGLEHUB_CACHE_DIR: /work/_shared_cache/kaggle
       PYTHONPATH: "/srv/sam3:/srv"
       NVIDIA_VISIBLE_DEVICES: all
@@ -166,6 +169,7 @@ services:
       REDIS_URL: redis://redis:6379/0
       NAS_ROOT: /nas
       WORK_ROOT: /work
+      KAGGLEHUB_CACHE: /work/_shared_cache/kaggle
       KAGGLEHUB_CACHE_DIR: /work/_shared_cache/kaggle
     volumes:
       - ./app:/srv/app
