@@ -161,6 +161,10 @@ class KaggleConnector:
     ) -> Iterator[RawAssetDraft]:
         import kagglehub
 
+        shared_kaggle_cache = get_settings().work_root / "_shared_cache" / "kaggle"
+        shared_kaggle_cache.mkdir(parents=True, exist_ok=True)
+        os.environ["KAGGLEHUB_CACHE_DIR"] = str(shared_kaggle_cache)
+
         slug = item.external_ref["slug"]
         license_name = item.license_hint or "Unknown"
         logger.info(f"Downloading Kaggle dataset: {slug}")

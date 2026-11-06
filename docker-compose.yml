@@ -39,6 +39,7 @@ services:
       REDIS_URL: redis://redis:6379/0
       NAS_ROOT: /nas
       WORK_ROOT: /work
+      KAGGLEHUB_CACHE_DIR: /work/_shared_cache/kaggle
     ports:
       - "8010:8000"
     volumes:
@@ -71,7 +72,9 @@ services:
       REDIS_URL: redis://redis:6379/0
       NAS_ROOT: /nas
       WORK_ROOT: /work
+      KAGGLEHUB_CACHE_DIR: /work/_shared_cache/kaggle
       PYTHONPATH: "/srv/sam3:/srv"
+      CUDA_VISIBLE_DEVICES: ""
       # NAS offload runs on this worker (standardize queue) — its own
       # rotating log file, separate from the rest of the worker's stdout.
       NAS_LOG_FILE: /srv/logs/nas.log
@@ -119,6 +122,7 @@ services:
       REDIS_URL: redis://redis:6379/0
       NAS_ROOT: /nas
       WORK_ROOT: /work
+      KAGGLEHUB_CACHE_DIR: /work/_shared_cache/kaggle
       PYTHONPATH: "/srv/sam3:/srv"
       NVIDIA_VISIBLE_DEVICES: all
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
@@ -162,6 +166,7 @@ services:
       REDIS_URL: redis://redis:6379/0
       NAS_ROOT: /nas
       WORK_ROOT: /work
+      KAGGLEHUB_CACHE_DIR: /work/_shared_cache/kaggle
     volumes:
       - ./app:/srv/app
       - ./sam3:/srv/sam3

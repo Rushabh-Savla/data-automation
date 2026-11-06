@@ -110,12 +110,27 @@ def _load_sam3():
     ckpt_path = find_sam3_checkpoint()
     logger.info(f"[SAM 3.1] Initializing model on device '{device}', checkpoint: {ckpt_path}")
 
-    model = build_sam3_image_model(
-        checkpoint_path=ckpt_path,
-        load_from_HF=(ckpt_path is None),
-        device=device,
-        eval_mode=True,
-    )
+    try:
+        model = build_sam3_image_model(
+            checkpoint_path=ckpt_path,
+            load_from_HF=(ckpt_path is None),
+            device=device,
+            eval_mode=True,
+        )
+    except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+        if "out of memory" in str(e).lower() and device == "cuda":
+            logger.warning(f"[SAM 3.1] CUDA OOM during model load: {e}. Clearing cache and retrying...")
+            torch.cuda.empty_cache()
+            import time
+            time.sleep(1.0)
+            model = build_sam3_image_model(
+                checkpoint_path=ckpt_path,
+                load_from_HF=(ckpt_path is None),
+                device=device,
+                eval_mode=True,
+            )
+        else:
+            raise
 
     # Set confidence_threshold to 0.0 so the processor does not pre-filter
     # candidate detections; our evaluator compares each score >= configured threshold.
@@ -325,8 +340,10 @@ class Sam3Verifier:
                 outcome = OUTCOME_ACCEPT if any_passed else OUTCOME_REJECT
 
             else:
-                # Single concept prompt
-                subjects = query_expansion.query_subjects(query)
+                # Single concept prompt or expanded concepts
+                subjects = query_expansion.derive_classes(query)
+                if not subjects:
+                    subjects = query_expansion.query_subjects(query)
                 if len(subjects) > 1:
                     # Multi-subject expansion (treated as OR)
                     concept_scores = []
@@ -366,6 +383,8 @@ class Sam3Verifier:
         except Exception as e:
             logger.error(f"[SAM 3.1] Unexpected error during inference: {e}")
             return OUTCOME_ERROR, None
+        finally:
+            state = None
 
     # -- Backward Compatibility Interfaces -------------------------------------
 

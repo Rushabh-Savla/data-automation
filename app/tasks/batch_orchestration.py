@@ -634,6 +634,8 @@ def dispatch_batch_candidate_window(
         sources = candidate_sources or [str(getattr(s, "value", s)) for s in raw_sources]
         dispatched_tasks = []
 
+        tasks_to_dispatch: list[tuple[str, str, str]] = []
+
         for source_str in sources:
             source_type = SourceType(source_str)
             task_path = _SOURCE_DISCOVERY_TASKS.get(source_type)
@@ -648,7 +650,7 @@ def dispatch_batch_candidate_window(
                 task_repo.create(new_task)
                 db.flush()
                 task_id = new_task.id
-                JobService._dispatch(task_path, str(job_uuid), str(task_id))
+                tasks_to_dispatch.append((task_path, str(job_uuid), str(task_id)))
             else:
                 task_id = existing_task.id
                 task_repo.set_status(existing_task.id, JobSourceTaskStatus.DOWNLOADING)
@@ -658,12 +660,16 @@ def dispatch_batch_candidate_window(
                     dispatched_tasks.append((source_str, str(task_id)))
                     continue
                 task_repo.set_status(existing_task.id, JobSourceTaskStatus.PENDING)
-                JobService._dispatch(task_path, str(job_uuid), str(task_id))
+                tasks_to_dispatch.append((task_path, str(job_uuid), str(task_id)))
 
             dispatched_tasks.append((source_str, str(task_id)))
 
         batch_index = batch.batch_index
         db.commit()
+
+        # Dispatch Celery tasks only AFTER durable commit so workers never see task is None
+        for t_path, j_id, s_task_id in tasks_to_dispatch:
+            JobService._dispatch(t_path, j_id, s_task_id)
 
     logger.info(
         f"[BATCH WINDOW] Job {job_id} Batch #{batch_index}: "

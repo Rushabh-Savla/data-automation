@@ -64,6 +64,8 @@ dependencies = [
     "ftfy==6.1.1",
     "setuptools<72",
     "sam3",
+    "numba>=0.60.0",
+    "python-rapidjson>=1.10",
     # Transformers / vision backbones
     "transformers>=4.45.0",
     # torch/torchvision are pinned to a CUDA 12.4 build rather than left to

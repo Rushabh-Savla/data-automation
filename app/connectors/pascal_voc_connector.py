@@ -69,12 +69,24 @@ def _ensure_dataset_cached() -> Path:
             download_with_retry(_ARCHIVE_URL, tmp_path, timeout=300, headers=HTTP_HEADERS)
         except requests.HTTPError as e:
             raise FatalConnectorError(f"Pascal VOC archive not accessible: {e}") from e
-        tmp_path.replace(tar_path)
+        if not tar_path.exists() and tmp_path.exists():
+            try:
+                tmp_path.replace(tar_path)
+            except OSError:
+                pass
+
+    if devkit_dir.exists():
+        return devkit_dir
 
     import tarfile
 
-    with tarfile.open(tar_path) as tf:
-        tf.extractall(cache_dir, filter="data")
+    try:
+        with tarfile.open(tar_path) as tf:
+            tf.extractall(cache_dir, filter="data")
+    except Exception as e:
+        if not devkit_dir.exists():
+            raise
+        logger.info(f"Devkit already extracted by another process: {e}")
 
     return devkit_dir
 

@@ -32,6 +32,8 @@ _SYNONYMS: dict[str, tuple[str, ...]] = {
     "bike": ("bicycle",), "cycle": ("bicycle",), "cyclist": ("bicycle", "person"),
     "motorbike": ("motorcycle",), "scooter": ("motorcycle",),
     "human": ("person",), "people": ("person",), "man": ("person",), "woman": ("person",),
+    "gender": ("person", "man", "woman", "human", "people"),
+    "male": ("man", "boy", "person"), "female": ("woman", "girl", "person"),
     "men": ("person",), "women": ("person",), "boy": ("person",), "girl": ("person",),
     "kid": ("person",), "child": ("person",), "baby": ("person",), "crowd": ("person",),
     "pedestrian": ("person",), "walker": ("person",), "rider": ("person",),
