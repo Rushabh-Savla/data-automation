@@ -37,7 +37,7 @@ _SYNONYMS: dict[str, tuple[str, ...]] = {
     "men": ("person",), "women": ("person",), "boy": ("person",), "girl": ("person",),
     "kid": ("person",), "child": ("person",), "baby": ("person",), "crowd": ("person",),
     "pedestrian": ("person",), "walker": ("person",), "rider": ("person",),
-    "plane": ("aeroplane", "airplane"), "jet": ("aeroplane", "airplane"), "aircraft": ("aeroplane", "airplane"),
+    "plane": ("aeroplane", "airplane", "aircraft", "fixed-wing aircraft"), "jet": ("aeroplane", "airplane", "aircraft", "fixed-wing aircraft"), "aircraft": ("aeroplane", "airplane", "fixed-wing aircraft", "plane"),
     "ship": ("boat",), "yacht": ("boat",), "canoe": ("boat",),
     "tv": ("tvmonitor", "tv", "television"), "television": ("tvmonitor", "tv"),
     "monitor": ("tvmonitor", "tv"), "screen": ("tvmonitor", "tv"),
@@ -51,7 +51,9 @@ _SYNONYMS: dict[str, tuple[str, ...]] = {
     "desk": ("dining table", "table", "diningtable"),
     "vehicle": ("car", "truck", "bus", "motorcycle", "bicycle", "van"),
     "person": ("pedestrian",),
-    "plant": ("pottedplant", "potted plant"), "motorcycle": ("motorbike",), "airplane": ("aeroplane",),
+    "plant": ("pottedplant", "potted plant"), "motorcycle": ("motorbike",),
+    "airplane": ("aeroplane", "aircraft", "fixed-wing aircraft", "plane"),
+    "aeroplane": ("airplane", "aircraft", "fixed-wing aircraft", "plane"),
 }
 
 

@@ -91,6 +91,7 @@ services:
       - ./nas_data:/nas
       - ./work_data:/work
       - ./logs:/srv/logs
+      - model_cache:/root/.cache
     depends_on:
       postgres:
         condition: service_healthy

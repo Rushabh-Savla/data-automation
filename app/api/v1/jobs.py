@@ -176,6 +176,10 @@ def get_job_progress(job_id: uuid.UUID, db: Session = Depends(get_db)):
     job = _get_job_or_404(db, job_id)
     tasks = JobSourceTaskRepository(db).list_for_job(job_id)
     counts = AssetRepository(db).counts_by_status_for_job(job_id)
+
+    from app.domain.source_priority import evaluate_sequential_execution_plan
+    plan = evaluate_sequential_execution_plan(job, tasks)
+
     return JobProgressResponse(
         job_id=job.id,
         status=job.status,
@@ -192,6 +196,12 @@ def get_job_progress(job_id: uuid.UUID, db: Session = Depends(get_db)):
         uploading_count=counts.get(AssetStatus.UPLOADING.value, 0),
         nas_verified_count=counts.get(AssetStatus.NAS_VERIFIED.value, 0),
         completed_count=counts.get(AssetStatus.COMPLETED.value, 0),
+        current_round=plan.current_round,
+        active_source=plan.active_source.value if plan.active_source else None,
+        active_source_position=plan.active_source_position,
+        completed_sources=plan.completed_sources,
+        next_source_in_queue=plan.next_source_in_queue,
+        sequential_waiting_reason=plan.waiting_reason,
         source_tasks=tasks,
     )
 
@@ -225,7 +235,25 @@ def _get_job_or_404(db: Session, job_id: uuid.UUID) -> Job:
 
 
 def _to_detail(job: Job, tasks, db: Session | None = None) -> JobDetailResponse:
+    from app.domain.source_priority import evaluate_sequential_execution_plan
+    plan = evaluate_sequential_execution_plan(job, tasks)
+
     data = JobResponse.model_validate(job).model_dump()
+    data["current_round"] = plan.current_round
+    data["active_source"] = plan.active_source.value if plan.active_source else None
+    data["active_source_position"] = plan.active_source_position
+    data["completed_sources"] = plan.completed_sources
+    data["next_source_in_queue"] = plan.next_source_in_queue
+    data["sequential_waiting_reason"] = plan.waiting_reason
+
+    # Attach per-source stats
+    for t in tasks:
+        st = plan.source_stats.get(t.source_type)
+        if st is not None:
+            setattr(t, "is_active", st.is_active)
+            setattr(t, "is_complete", st.is_complete)
+            setattr(t, "waiting_reason", st.waiting_reason)
+
     data["source_tasks"] = tasks
     if db is not None:
         counts = AssetRepository(db).counts_by_status_for_job(job.id)

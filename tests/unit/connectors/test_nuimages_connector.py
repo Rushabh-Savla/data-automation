@@ -66,7 +66,7 @@ def _build_fake_cache(tmp_path: Path) -> Path:
 @pytest.fixture
 def cache_dir(tmp_path, monkeypatch) -> Path:
     cache = _build_fake_cache(tmp_path)
-    monkeypatch.setattr(nu_mod, "_ensure_dataset_cached", lambda dataset: cache)
+    monkeypatch.setattr(nu_mod, "_ensure_dataset_cached", lambda dataset, *args, **kwargs: cache)
     return cache
 
 
@@ -260,7 +260,7 @@ class TestDiscover:
         assert "huge" in page.error_reason
 
     def test_insufficient_disk_is_reported_to_the_user(self, monkeypatch):
-        def refuse(dataset):
+        def refuse(dataset, *args, **kwargs):
             raise FatalConnectorError("Not enough free disk space to fetch nuImages")
 
         monkeypatch.setattr(nu_mod, "_ensure_dataset_cached", refuse)

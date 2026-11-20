@@ -43,19 +43,10 @@ class TestNasResolver:
         resolved = resolve_job_nas_destination(job, default_storage="custom_fallback")
         assert resolved == "custom_fallback"
 
-    def test_resolve_job_nas_destination_fallback_to_active_params(self):
+    def test_resolve_job_nas_destination_none_when_unspecified(self):
         job = MagicMock()
         job.config = {}
-        mock_params = MagicMock()
-        mock_params.storage_path = "nas_configured_root"
-        with patch("app.domain.nas_resolver.get_active_storage_params", return_value=mock_params):
-            resolved = resolve_job_nas_destination(job)
-            assert resolved == "nas_configured_root"
-
-    def test_resolve_job_nas_destination_hardcoded_fallback(self):
-        job = MagicMock()
-        job.config = {}
-        with patch("app.domain.nas_resolver.get_active_storage_params", return_value=None):
-            resolved = resolve_job_nas_destination(job)
-            assert resolved == DEFAULT_NAS_DESTINATION
+        # When no nas_storage_path is specified, should return None (local storage only, no automatic fallback)
+        resolved = resolve_job_nas_destination(job)
+        assert resolved is None
 

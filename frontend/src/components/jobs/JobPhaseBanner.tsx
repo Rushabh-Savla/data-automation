@@ -2,6 +2,7 @@ import type { FilteringProgress } from '@/hooks/useJobProgressSocket'
 import { JOB_ACTIVE_STATUSES, type JobDetailResponse } from '@/api/types'
 import { describeSourceActivity, isFilteringPhase } from '@/lib/jobPhase'
 import { formatRelative } from '@/lib/dateFormat'
+import { sourceTypeLabels } from '@/lib/enumLabels'
 
 /**
  * Says what the job is doing *right now*, at job level.
@@ -69,10 +70,11 @@ export function JobPhaseBanner({
   if (job.topup_round && job.topup_round > 1 && JOB_ACTIVE_STATUSES.includes(job.status)) {
     const isTargetMet = job.target_count != null && job.accepted_count >= job.target_count
     if (!isTargetMet) {
+      const remaining = job.target_count != null ? Math.max(0, job.target_count - job.accepted_count) : null
       return (
         <div className="rounded-md border bg-muted/40 px-4 py-3 text-sm">
-          <span className="font-medium">Collecting more data</span> — round {job.topup_round}, because filtering
-          left the job short of its target.
+          <span className="font-medium">Collecting more data</span> — replenishment round {job.topup_round}
+          {remaining != null ? ` (${remaining} images remaining of ${job.target_count} target)` : ''}.
         </div>
       )
     }
@@ -83,6 +85,32 @@ export function JobPhaseBanner({
       <div className="rounded-md border bg-muted/40 px-4 py-3 text-sm">
         <span className="font-medium">Processing</span> — all sources have finished downloading; filtering
         and deduplication are running.
+      </div>
+    )
+  }
+
+  // Strict Sequential Execution banner
+  if (JOB_ACTIVE_STATUSES.includes(job.status) && job.active_source) {
+    const activeLabel = sourceTypeLabels[job.active_source as keyof typeof sourceTypeLabels] ?? job.active_source
+    const nextLabel = job.next_source_in_queue
+      ? (sourceTypeLabels[job.next_source_in_queue as keyof typeof sourceTypeLabels] ?? job.next_source_in_queue)
+      : null
+
+    return (
+      <div className="rounded-md border bg-muted/40 px-4 py-3 text-sm flex flex-col gap-1.5">
+        <div className="flex items-center justify-between">
+          <span className="font-medium text-foreground">
+            Strict Sequential Ingestion &bull; Round {job.current_round ?? 1}
+          </span>
+          <span className="tabular-nums text-xs font-semibold px-2 py-0.5 rounded bg-primary/10 text-primary">
+            Source {job.active_source_position ?? '1/10'}
+          </span>
+        </div>
+        <p className="text-xs text-muted-foreground">
+          Active source: <strong className="text-foreground">{activeLabel}</strong>
+          {nextLabel && <span> &bull; Next in queue: <span className="font-medium text-foreground">{nextLabel}</span></span>}
+          {job.sequential_waiting_reason && <span> &bull; Status: {job.sequential_waiting_reason}</span>}
+        </p>
       </div>
     )
   }

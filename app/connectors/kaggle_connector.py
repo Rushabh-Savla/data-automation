@@ -268,10 +268,10 @@ class KaggleConnector:
                         getattr(admission, "window_index", None),
                         i,
                     )
+                if status == "INACTIVE":
+                    raise JobStopped(f"Candidate admission closed for {source_item_id}")
                 if status != "ADMITTED":
-                    raise FatalConnectorError(
-                        f"Candidate admission failed for {source_item_id}: {status}"
-                    )
+                    continue
 
             ann_path = self._find_annotation(src_img, root)
             metadata = {"original_path": str(rel_path)}

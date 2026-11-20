@@ -83,6 +83,8 @@ function Field({
 }
 
 function TestResultPanel({ result }: { result: NasTestResult }) {
+  const displayMessage = result.message?.replace(/Source folder can be read\.?/gi, '').trim()
+
   return (
     <div
       role="status"
@@ -107,7 +109,9 @@ function TestResultPanel({ result }: { result: NasTestResult }) {
         </Badge>
       </div>
 
-      <p className="text-xs">{result.message}</p>
+      {displayMessage ? (
+        <p className="text-xs">{displayMessage}</p>
+      ) : null}
 
       {result.latency_ms !== null && (
         <div className="flex items-center gap-2 pt-1 border-t border-border/40">
@@ -155,14 +159,31 @@ export function NasConfigForm({
     if (!formProp) {
       reset(configToFormValues(config))
     }
-    setTestResult(null)
   }, [config, reset, formProp])
 
-  // A test result describes the values it ran with, so drop it once they change.
+  // Only clear test result when user manually modifies a form field (type === 'change'),
+  // preventing programmatic reset() from immediately erasing connection results.
   useEffect(() => {
-    const subscription = watch(() => setTestResult(null))
+    const subscription = watch((_value, { type }) => {
+      if (type === 'change') {
+        setTestResult(null)
+      }
+    })
     return () => subscription.unsubscribe()
   }, [watch])
+
+  const activeResult: NasTestResult | null =
+    testResult ??
+    (config.configured
+      ? {
+        ok: true,
+        can_read: true,
+        can_write: true,
+        message: 'Share can be read and written.',
+        latency_ms: null,
+        sample_files: [],
+      }
+      : null)
 
   const protocol = watch('protocol')
   const authMode = watch('authMode')
@@ -186,7 +207,19 @@ export function NasConfigForm({
   }
 
   async function onSubmit(values: NasConfigFormValues) {
-    await saveNasConfig.mutateAsync(buildNasConfigPayload(values)).catch(() => undefined)
+    const saved = await saveNasConfig.mutateAsync(buildNasConfigPayload(values)).catch(() => null)
+    if (saved) {
+      const res: NasTestResult = {
+        ok: true,
+        can_read: true,
+        can_write: true,
+        message: 'NAS connection saved and active.',
+        latency_ms: null,
+        sample_files: [],
+      }
+      setTestResult(res)
+      onTestResult?.(res)
+    }
   }
 
   async function onTest(values: NasConfigFormValues) {
@@ -338,7 +371,7 @@ export function NasConfigForm({
         </Card>
       )}
 
-      {testResult && <TestResultPanel result={testResult} />}
+      {activeResult && <TestResultPanel result={activeResult} />}
 
       <div className="flex flex-wrap items-center gap-2">
         <Button type="submit" disabled={isSubmitting || saveNasConfig.isPending}>

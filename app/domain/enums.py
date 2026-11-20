@@ -69,6 +69,10 @@ class JobSourceTaskStatus(str, enum.Enum):
     DOWNLOADING = "downloading"
     WINDOW_WAITING = "window_waiting"
     STANDARDIZING = "standardizing"
+    DISCOVERY_COMPLETED = "discovery_completed"
+    PARTIALLY_PROCESSED = "partially_processed"
+    WAITING_FOR_DOWNLOAD = "waiting_for_download"
+    SOURCE_EXHAUSTED = "source_exhausted"
     COMPLETED = "completed"
     COMPLETED_PARTIAL = "completed_partial"
     FAILED = "failed"
@@ -78,10 +82,31 @@ class JobSourceTaskStatus(str, enum.Enum):
 
 JOB_SOURCE_TASK_TERMINAL_STATUSES = {
     JobSourceTaskStatus.COMPLETED,
-    JobSourceTaskStatus.COMPLETED_PARTIAL,
+    JobSourceTaskStatus.SOURCE_EXHAUSTED,
     JobSourceTaskStatus.FAILED,
     JobSourceTaskStatus.CANCELLED,
 }
+
+
+def is_source_task_exhausted(task) -> bool:
+    """A source is genuinely exhausted only when discovery is exhausted and all pending items are consumed."""
+    status = getattr(task, "status", None)
+    if status in (JobSourceTaskStatus.COMPLETED, JobSourceTaskStatus.SOURCE_EXHAUSTED):
+        return True
+    if status in (JobSourceTaskStatus.FAILED, JobSourceTaskStatus.CANCELLED):
+        return True
+    chk = getattr(task, "checkpoint", None) or {}
+    pending = chk.get("_pending_items") or {}
+    completed = set(chk.get("_completed_items", []))
+    if isinstance(pending, dict):
+        unconsumed = len(set(pending.keys()) - completed)
+    elif isinstance(pending, (list, set)):
+        unconsumed = len(set(pending) - completed)
+    else:
+        unconsumed = 0
+    discovery_exhausted = bool(chk.get("discovery_exhausted", False))
+    return discovery_exhausted and unconsumed == 0
+
 
 
 class AssetStatus(str, enum.Enum):
@@ -102,6 +127,7 @@ class AssetStatus(str, enum.Enum):
     COMPLETED = "completed"
     DUPLICATE = "duplicate"
     FAILED = "failed"
+    SURPLUS = "surplus"
 
 
 # Assets in these statuses count as "accepted" toward a job's target_count
@@ -126,6 +152,7 @@ REJECTED_STATUSES = {AssetStatus.RELEVANCE_REJECTED}
 DUPLICATE_STATUSES = {AssetStatus.DUPLICATE}
 REVIEW_PENDING_STATUSES = {AssetStatus.REVIEW_PENDING}
 RETRY_PENDING_STATUSES = {AssetStatus.RETRY_PENDING}
+SURPLUS_STATUSES = {AssetStatus.SURPLUS}
 
 
 class BatchStatus(str, enum.Enum):

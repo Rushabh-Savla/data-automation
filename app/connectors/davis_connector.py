@@ -44,7 +44,7 @@ from app.services.format_conversion import BBox, ClassRegistry, boxes_to_yolo_li
 logger = logging.getLogger(__name__)
 
 _ARCHIVE_URL = "https://data.vision.ee.ethz.ch/csergi/share/davis/DAVIS-2017-trainval-480p.zip"
-_SHARD_SIZE = 20
+_SHARD_SIZE = 50
 _LICENSE_NOTE = (
     "DAVIS 2017 (non-commercial research use only — "
     "see https://davischallenge.org/davis2017/code.html)"
@@ -307,10 +307,10 @@ class DavisConnector:
                         getattr(admission, "window_index", None),
                         i,
                     )
+                if status == "INACTIVE":
+                    raise JobStopped(f"Candidate admission closed for {source_item_id}")
                 if status != "ADMITTED":
-                    raise FatalConnectorError(
-                        f"Candidate admission failed for {source_item_id}: {status}"
-                    )
+                    continue
 
             src_img = davis_dir / "JPEGImages" / "480p" / seq / f"{frame}.jpg"
             src_mask = davis_dir / "Annotations" / "480p" / seq / f"{frame}.png"

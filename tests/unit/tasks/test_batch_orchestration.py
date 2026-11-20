@@ -107,7 +107,8 @@ def test_shortfall_calculation_and_replacements(db_session):
     progress = orchestrator.evaluate_batch_progress(b1.id)
     assert progress["accepted"] == 450
     assert progress["shortfall"] == 150
-    assert progress["outcome"] == "NEEDS_REPLACEMENTS"
+    # Under Flexible Batch Delivery, a finalized window with 450 accepted images is READY_FOR_UPLOAD
+    assert progress["outcome"] == "READY_FOR_UPLOAD"
 
     # Now add the 150 replacement assets that pass
     for i in range(150):
@@ -329,3 +330,225 @@ def test_manifest_strictly_excludes_rejected_and_duplicates(db_session, tmp_path
     item_ids = [item["asset_id"] for item in content["items"]]
     assert str(a_rej.id) not in item_ids
     assert str(a_dup.id) not in item_ids
+
+
+def test_25_pct_overfetch_buffer_sizing(db_session):
+    """Verifies that 25% overfetch buffer is applied by default (600 target -> 750 candidates)."""
+    from app.core.config import resolve_overfetch_buffer
+    import math
+
+    job_id = uuid.uuid4()
+    job = Job(id=job_id, query="containers", target_count=1200)
+    db_session.add(job)
+    db_session.commit()
+
+    buf = resolve_overfetch_buffer(job.config)
+    assert buf == 1.25
+
+    # 600 target with 25% buffer -> 750 candidates
+    batch_target = 600
+    candidates = math.ceil(batch_target * buf)
+    assert candidates == 750
+
+    # Custom override on job config
+    job.config = {"over_download_buffer_pct": 30.0}
+    db_session.commit()
+    buf_custom = resolve_overfetch_buffer(job.config)
+    assert buf_custom == 1.30
+    assert math.ceil(batch_target * buf_custom) == 780
+
+
+def test_batch_level_trim_excess_assets(db_session):
+    """Verifies that trim_excess_batch_assets trims a batch to its target_image_count."""
+    from app.tasks.filtering_tasks import trim_excess_batch_assets
+    from app.db.models.job_source_task import JobSourceTask
+
+    job_id = uuid.uuid4()
+    task_id = uuid.uuid4()
+    job = Job(id=job_id, query="cars", target_count=50)
+    task = JobSourceTask(id=task_id, job_id=job_id, source_type=SourceType.WEB.value)
+    db_session.add_all([job, task])
+    db_session.commit()
+
+    orchestrator = BatchOrchestrator(db_session, job_id)
+    b1 = orchestrator.get_or_create_active_batch()
+    b1.target_image_count = 10
+    db_session.commit()
+
+    # Add 15 accepted assets to batch 1
+    for i in range(15):
+        db_session.add(
+            Asset(
+                id=uuid.uuid4(),
+                job_id=job_id,
+                job_source_task_id=task_id,
+                batch_id=b1.id,
+                source_type=SourceType.WEB,
+                source_item_id=f"car_{i}",
+                status=AssetStatus.RELEVANCE_PASSED,
+                relevance_score=0.50 + (i * 0.02),
+            )
+        )
+    db_session.commit()
+
+    trimmed = trim_excess_batch_assets(b1.id, db=db_session)
+    assert trimmed == 5
+
+    # Refresh batch
+    db_session.refresh(b1)
+    assert b1.accepted_image_count == 10
+    surplus_count = sum(1 for a in b1.assets if a.status == AssetStatus.SURPLUS)
+    assert surplus_count == 5
+
+
+def test_ghost_batch_pruning_with_active_batch(db_session):
+    """Verifies that redundant empty ghost batches are pruned without deleting legitimate batches."""
+    from app.db.models.candidate_window import CandidateWindow
+
+    job_id = uuid.uuid4()
+    job = Job(id=job_id, query="planes", target_count=1800)
+    db_session.add(job)
+    db_session.commit()
+
+    orchestrator = BatchOrchestrator(db_session, job_id)
+    b1 = orchestrator.get_or_create_active_batch()
+    b1.accepted_image_count = 600
+    b1.status = BatchStatus.COMPLETED
+
+    b2 = ImageBatch(
+        id=uuid.uuid4(),
+        job_id=job_id,
+        batch_index=2,
+        target_image_count=600,
+        accepted_image_count=100,
+        status=BatchStatus.DOWNLOADING,
+    )
+    # Ghost batch with 0 assets
+    b3_ghost = ImageBatch(
+        id=uuid.uuid4(),
+        job_id=job_id,
+        batch_index=3,
+        target_image_count=600,
+        accepted_image_count=0,
+        status=BatchStatus.DOWNLOADING,
+    )
+    db_session.add_all([b2, b3_ghost])
+    db_session.commit()
+
+    # Triggering get_or_create_active_batch should prune b3_ghost and return b2
+    active = orchestrator.get_or_create_active_batch()
+    assert active.id == b2.id
+
+    remaining_batches = orchestrator.batch_repo.list_for_job(job_id)
+    batch_ids = [b.id for b in remaining_batches]
+    assert b3_ghost.id not in batch_ids
+    assert b2.id in batch_ids
+
+
+def test_overfetch_calculation_table():
+    """Verifies the exact table of required initial candidate calculations across target sizes."""
+    from app.core.config import calculate_initial_candidates
+
+    test_cases = [
+        (100, 25.0, 125),
+        (200, 25.0, 250),
+        (400, 25.0, 500),
+        (600, 25.0, 750),
+        (600, 30.0, 780),
+        (1000, 25.0, 1250),
+    ]
+    for required, pct, expected in test_cases:
+        calculated = calculate_initial_candidates(required, overfetch_percentage=pct)
+        assert calculated == expected, f"Failed for {required} at {pct}%: got {calculated}, expected {expected}"
+
+
+def test_overfetch_settings_validation():
+    """Verifies that invalid negative overfetch percentages are rejected by configuration validation."""
+    from pydantic import ValidationError
+    from app.core.config import Settings, resolve_overfetch_buffer
+
+    # Negative overfetch percentage must raise ValidationError in Settings
+    with pytest.raises(ValidationError):
+        Settings(overfetch_percentage=-10.0)
+
+    # In resolve_overfetch_buffer, negative job configs should be safely clamped to at least 1.0 (0% overfetch)
+    buf = resolve_overfetch_buffer({"overfetch_percentage": -15.0})
+    assert buf >= 1.0
+
+
+def test_window_capacity_and_candidate_limit(db_session):
+    """Verifies that ensure_candidate_window properly accommodates 750 candidates for 600-image batches."""
+    from app.services.candidate_reservation_service import (
+        ensure_candidate_window,
+        get_candidate_window_stats,
+        MAX_CANDIDATES_PER_WINDOW,
+    )
+    from app.db.models.candidate_window import CandidateWindow
+
+    job_id = uuid.uuid4()
+    job = Job(id=job_id, query="drones", target_count=600)
+    db_session.add(job)
+    db_session.commit()
+
+    orchestrator = BatchOrchestrator(db_session, job_id)
+    b1 = orchestrator.get_or_create_active_batch()
+
+    window_id = ensure_candidate_window(db_session, b1, candidate_limit=750)
+    db_session.commit()
+
+    window = db_session.get(CandidateWindow, window_id)
+    assert window is not None
+    assert window.candidate_limit == 750
+    assert window.candidate_limit <= MAX_CANDIDATES_PER_WINDOW
+    assert window.status == "OPEN"
+
+
+def test_batch_manifest_strict_target_and_surplus_exclusion(db_session, tmp_path):
+    """Verifies that manifest creation strictly trims excess assets to batch target and excludes surplus."""
+    from app.db.models.job_source_task import JobSourceTask
+
+    job_id = uuid.uuid4()
+    task_id = uuid.uuid4()
+    job = Job(id=job_id, query="trucks", target_count=10)
+    task = JobSourceTask(id=task_id, job_id=job_id, source_type=SourceType.WEB.value)
+    db_session.add_all([job, task])
+    db_session.commit()
+
+    orchestrator = BatchOrchestrator(db_session, job_id)
+    orchestrator.settings.local_staging_path = tmp_path
+    b1 = orchestrator.get_or_create_active_batch()
+    b1.target_image_count = 5
+    db_session.commit()
+
+    # Add 8 accepted assets (target is 5)
+    for i in range(8):
+        # Create dummy file in tmp_path
+        img_file = tmp_path / f"truck_{i}.jpg"
+        img_file.write_bytes(b"dummy image content")
+        db_session.add(
+            Asset(
+                id=uuid.uuid4(),
+                job_id=job_id,
+                job_source_task_id=task_id,
+                batch_id=b1.id,
+                source_type=SourceType.WEB,
+                source_item_id=f"truck_{i}",
+                status=AssetStatus.RELEVANCE_PASSED,
+                relevance_score=0.60 + (i * 0.05),
+                nas_path=str(img_file),
+            )
+        )
+    db_session.commit()
+
+    manifest_path = orchestrator.create_batch_manifest(b1.id)
+    assert manifest_path is not None
+    assert manifest_path.exists()
+
+    manifest_data = json.loads(manifest_path.read_text())
+    assert manifest_data["accepted_count"] == 5
+    assert len(manifest_data["items"]) == 5
+
+    # Check that the 3 lowest scored assets were transitioned to SURPLUS
+    surplus_assets = db_session.query(Asset).filter(Asset.batch_id == b1.id, Asset.status == AssetStatus.SURPLUS).all()
+    assert len(surplus_assets) == 3
+

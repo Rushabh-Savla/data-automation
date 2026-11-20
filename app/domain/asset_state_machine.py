@@ -92,6 +92,7 @@ _LEGAL_ASSET_TRANSITIONS: dict[AssetStatus, set[AssetStatus]] = {
         AssetStatus.COMPLETED,
         AssetStatus.DUPLICATE,  # Late cross-batch / near-duplicate dedup pass
         AssetStatus.RELEVANCE_REJECTED,  # Trim excess assets
+        AssetStatus.SURPLUS,  # Trimmed surplus beyond target
         AssetStatus.PROMOTED,  # Forced refilter pass
         AssetStatus.FAILED,
     },
@@ -99,20 +100,28 @@ _LEGAL_ASSET_TRANSITIONS: dict[AssetStatus, set[AssetStatus]] = {
         AssetStatus.UPLOADING,
         AssetStatus.NAS_VERIFIED,
         AssetStatus.COMPLETED,
+        AssetStatus.SURPLUS,
         AssetStatus.FAILED,
     },
     AssetStatus.UPLOADING: {
         AssetStatus.READY_FOR_UPLOAD,  # Retry upon upload interruption
         AssetStatus.NAS_VERIFIED,
         AssetStatus.COMPLETED,
+        AssetStatus.SURPLUS,
         AssetStatus.FAILED,
     },
     AssetStatus.NAS_VERIFIED: {
         AssetStatus.COMPLETED,
+        AssetStatus.SURPLUS,
         AssetStatus.PROMOTED,
         AssetStatus.FAILED,
     },
-    AssetStatus.COMPLETED: set(),
+    AssetStatus.COMPLETED: {
+        AssetStatus.SURPLUS,  # Surplus trimmed during consolidation
+    },
+    AssetStatus.SURPLUS: {
+        AssetStatus.PROMOTED,  # Refilter or job reopen reset
+    },
     AssetStatus.RELEVANCE_REJECTED: {
         AssetStatus.PROMOTED,  # Refilter reset
     },

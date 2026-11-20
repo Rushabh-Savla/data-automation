@@ -7,6 +7,7 @@ calls in.
 import logging
 import uuid
 from datetime import datetime
+from typing import Any
 
 from sqlalchemy.orm import Session
 
@@ -55,7 +56,8 @@ _EXPLICIT_ONLY_SOURCES: frozenset[SourceType] = frozenset({SourceType.NAS_SHARE}
 
 
 def _resume_pending_items(
-    source_type: SourceType, job_id: str, job_source_task_id: str, checkpoint: dict | None
+    source_type: SourceType, job_id: str, job_source_task_id: str, checkpoint: dict | None,
+    max_batch: int = 25,
 ) -> bool:
     """If the task's checkpoint records exactly which items a prior
     discovery round dispatched ("_pending_items", written by e.g.
@@ -80,7 +82,7 @@ def _resume_pending_items(
     if not pending_items:
         return False
     completed = set((checkpoint or {}).get("_completed_items", []))
-    remaining = {k: v for k, v in pending_items.items() if k not in completed}
+    remaining = [v for k, v in pending_items.items() if k not in completed]
     if not remaining:
         return False
 
@@ -96,7 +98,10 @@ def _resume_pending_items(
     from app.tasks.celery_app import celery_app
     from app.tasks.orchestration_tasks import on_source_finished
 
-    group = [celery_app.signature(task_path, args=[job_id, job_source_task_id, item]) for item in remaining.values()]
+    # Dispatch in paced batches to prevent Celery queue saturation and watchdog timeouts
+    batch_to_dispatch = remaining[:max_batch]
+
+    group = [celery_app.signature(task_path, args=[job_id, job_source_task_id, item]) for item in batch_to_dispatch]
     chord(group)(on_source_finished.s(job_id, job_source_task_id))
     return True
 
@@ -211,21 +216,25 @@ class JobService:
         except Exception as exc:
             logger.warning(f"Initial batch/window creation warning: {exc}")
 
+        # Strict Sequential Source Processing:
+        # Only the first active source in canonical priority order receives initial discovery!
+        from app.domain.source_priority import evaluate_sequential_execution_plan
+        plan = evaluate_sequential_execution_plan(job, self.task_repo.list_for_job(job_id))
         dispatched_any = False
-        allowed_sources = set(job.sources or [])
-        for task in self.task_repo.list_for_job(job_id):
-            if task.source_type not in allowed_sources:
-                continue
-            task_path = _SOURCE_DISCOVERY_TASKS.get(SourceType(task.source_type))
-            if task_path is None:
+
+        if plan.active_source is not None:
+            active_src = plan.active_source
+            task = self.task_repo.get_for_job_and_source(job_id, active_src)
+            task_path = _SOURCE_DISCOVERY_TASKS.get(active_src)
+            if task_path is None and task is not None:
                 self.task_repo.set_status(
                     task.id,
                     JobSourceTaskStatus.FAILED,
-                    error_message=f"No connector implemented yet for source '{task.source_type}'",
+                    error_message=f"No connector implemented yet for source '{active_src.value}'",
                 )
-                continue
-            self._dispatch(task_path, str(job_id), str(task.id))
-            dispatched_any = True
+            elif task_path is not None and task is not None:
+                self._dispatch(task_path, str(job_id), str(task.id))
+                dispatched_any = True
 
         if not dispatched_any:
             job.status = JobStateMachine.transition(job.status, "fail")
@@ -243,6 +252,7 @@ class JobService:
         job.status = JobStateMachine.transition(job.status, "pause")
         JobRepository.apply_status_timestamps(job, job.status)
         self.cancellation.mark_paused(str(job_id))
+        self.cancellation.revoke_active_tasks(str(job_id))
         self.db.flush()
         self.publisher.publish(str(job_id), {"type": "job_status", "status": job.status.value})
         return job
@@ -254,18 +264,16 @@ class JobService:
         self.cancellation.clear_paused(str(job_id))
         self.db.flush()
 
-        allowed_sources = set(job.sources or [])
-        for task in self.task_repo.list_for_job(job_id):
-            if task.status in JOB_SOURCE_TASK_TERMINAL_STATUSES:
-                continue
-            if task.source_type not in allowed_sources:
-                continue
-            source_type = SourceType(task.source_type)
-            if _resume_pending_items(source_type, str(job_id), str(task.id), task.checkpoint):
-                continue
-            task_path = _SOURCE_DISCOVERY_TASKS.get(source_type)
-            if task_path is not None:
-                self._dispatch(task_path, str(job_id), str(task.id))
+        from app.domain.source_priority import evaluate_sequential_execution_plan
+        plan = evaluate_sequential_execution_plan(job, self.task_repo.list_for_job(job_id))
+        if plan.active_source is not None:
+            active_src = plan.active_source
+            task = self.task_repo.get_for_job_and_source(job_id, active_src)
+            if task is not None and task.status not in JOB_SOURCE_TASK_TERMINAL_STATUSES:
+                if not _resume_pending_items(active_src, str(job_id), str(task.id), task.checkpoint):
+                    task_path = _SOURCE_DISCOVERY_TASKS.get(active_src)
+                    if task_path is not None:
+                        self._dispatch(task_path, str(job_id), str(task.id))
 
         self.publisher.publish(str(job_id), {"type": "job_status", "status": job.status.value})
         return job
@@ -342,11 +350,46 @@ class JobService:
         # which enqueues it once CANCELLING is durably persisted).
         return job
 
-    @staticmethod
-    def _dispatch(task_dotted_path: str, job_id: str, job_source_task_id: str) -> None:
+    def _dispatch(self_or_task: Any, task_dotted_path: str = None, job_id: str = None, job_source_task_id: str = None) -> None:
         from app.tasks.celery_app import celery_app
+        from sqlalchemy import event
 
-        celery_app.send_task(task_dotted_path, args=[job_id, job_source_task_id])
+        if isinstance(self_or_task, JobService):
+            self = self_or_task
+            path = task_dotted_path
+            jid = job_id
+            tid = job_source_task_id
+        else:
+            self = None
+            path = self_or_task
+            jid = task_dotted_path
+            tid = job_id
+
+        def send():
+            celery_app.send_task(path, args=[jid, tid])
+
+        session = getattr(self, "db", None) if self else None
+        in_tx = getattr(session, "in_transaction", lambda: False)() if (session and hasattr(session, "in_transaction")) else False
+        if session and in_tx and hasattr(session, "info"):
+            if "pending_dispatches" not in session.info:
+                session.info["pending_dispatches"] = []
+
+                @event.listens_for(session, "after_commit", once=True)
+                def _fire(s):
+                    tasks = s.info.pop("pending_dispatches", [])
+                    for t in tasks:
+                        try:
+                            t()
+                        except Exception as e:
+                            logger.error(f"Error dispatching task after commit: {e}")
+
+                @event.listens_for(session, "after_rollback", once=True)
+                def _clear(s):
+                    s.info.pop("pending_dispatches", None)
+
+            session.info["pending_dispatches"].append(send)
+        else:
+            send()
 
     def _revoke_active_tasks(self, job_id: str) -> None:
         self.cancellation.revoke_active_tasks(job_id)

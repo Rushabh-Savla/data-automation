@@ -118,13 +118,15 @@ class TopupSnapshot:
     # Everything filtering considered this round; the denominator of the yield.
     promoted_total: int
     round_number: int
-    max_rounds: int
+    max_rounds: int | None = None
     sources: list[SourceState] = field(default_factory=list)
     # Post-filter assets gained by the round that just finished. None on the
     # first evaluation, where there is no previous round to compare against.
     gained_last_round: int | None = None
     # Assets that round put through filtering: the denominator of its own yield.
     promoted_last_round: int | None = None
+    # Consecutive rounds that yielded zero progress across all sources.
+    consecutive_no_progress: int = 0
 
 
 @dataclass
@@ -136,7 +138,7 @@ class TopupPlan:
     observed_yield: float
     # source_type -> how many raw assets that source should aim to download.
     quota: dict[str, int]
-    max_rounds: int = 400
+    max_rounds: int | None = None
 
     @property
     def total_quota(self) -> int:
@@ -231,7 +233,9 @@ class TopupPlanner:
         if shortfall <= 0:
             return None
 
-        if snapshot.round_number >= snapshot.max_rounds:
+        # Only enforce a round cap if explicitly configured (non-None).
+        # Unbounded demand-driven replenishment has snapshot.max_rounds is None.
+        if snapshot.max_rounds is not None and snapshot.round_number >= snapshot.max_rounds:
             return None
 
         available = [s for s in snapshot.sources if not s.exhausted]

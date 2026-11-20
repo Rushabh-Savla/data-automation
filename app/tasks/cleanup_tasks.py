@@ -97,6 +97,10 @@ def cleanup_shared_cache(force: bool = False) -> dict:
         "sun_rgbd",
         "davis",
         "visual_genome",
+        "open_images",
+        "kitti",
+        "nuimages",
+        "youtube",
     }
 
     if shared_cache_dir.exists():
@@ -166,9 +170,8 @@ def purge_orphan_work_dirs() -> dict:
         if not entry.is_dir() or entry.name.startswith("_") or entry.name in ("staging", "nas_cache", "exports"):
             continue
         try:
-            # Completely empty directories can be considered immediately without waiting _ORPHAN_MIN_AGE_S
-            is_empty = not any(entry.iterdir())
-            if not is_empty and (now - entry.stat().st_mtime < _ORPHAN_MIN_AGE_S):
+            # Active tasks modify their workdir; ignore anything touched within the last 60 seconds
+            if now - entry.stat().st_mtime < 60:
                 continue
         except OSError:
             continue
@@ -205,7 +208,11 @@ def purge_orphan_work_dirs() -> dict:
                     select(Asset.job_source_task_id)
                     .where(
                         Asset.job_source_task_id.in_(list(task_ids.values())),
-                        Asset.status == AssetStatus.RELEVANCE_PASSED,
+                        Asset.status.in_([
+                            AssetStatus.RELEVANCE_PASSED,
+                            AssetStatus.READY_FOR_UPLOAD,
+                            AssetStatus.UPLOADING,
+                        ]),
                         Asset.nas_path.is_not(None),
                         ~Asset.nas_path.like(f"{asset_files.NAS_SCHEME}%"),
                     )
@@ -215,6 +222,11 @@ def purge_orphan_work_dirs() -> dict:
 
         for entry, task_id in task_ids.items():
             status = status_by_id.get(task_id)
+            # Absent => the task (or its whole job) was deleted; terminal => it is
+            # finished and will not resume. Anything else is still live and must NEVER be deleted.
+            if status is not None and status not in JOB_SOURCE_TASK_TERMINAL_STATUSES:
+                continue
+
             try:
                 files = [f for f in entry.rglob("*") if f.is_file()]
                 is_empty = (len(files) == 0)
@@ -223,16 +235,10 @@ def purge_orphan_work_dirs() -> dict:
                 is_empty = False
                 size = 0
 
-            # If completely empty of files, remove safely to keep work_data clean
-            if is_empty:
-                shutil.rmtree(entry, ignore_errors=True)
-                removed += 1
+            # If task is terminal and workdir is empty or older than _ORPHAN_MIN_AGE_S
+            if not is_empty and (now - entry.stat().st_mtime < _ORPHAN_MIN_AGE_S):
                 continue
 
-            # Absent => the task (or its whole job) was deleted; terminal => it is
-            # finished and will not resume. Anything else is still live.
-            if status is not None and status not in JOB_SOURCE_TASK_TERMINAL_STATUSES:
-                continue
             if task_id in pending_offload_task_ids:
                 skipped_pending_offload += 1
                 logger.warning(
@@ -257,6 +263,9 @@ def purge_orphan_work_dirs() -> dict:
         from app.domain.enums import JOB_TERMINAL_STATUSES
 
         with session_scope() as db:
+            from app.db.models.image_batch import NasTransferBatch, ImageBatch
+            from app.domain.enums import TransferStatus, BatchStatus
+
             for job_dir in staging_root.iterdir():
                 if not job_dir.is_dir() or not job_dir.name.startswith("job_"):
                     continue
@@ -267,6 +276,38 @@ def purge_orphan_work_dirs() -> dict:
                     continue
                 job_row = db.get(Job, j_uuid)
                 if job_row is None or job_row.status in JOB_TERMINAL_STATUSES:
+                    if job_row is not None:
+                        has_active = db.execute(
+                            select(NasTransferBatch.id).where(
+                                NasTransferBatch.job_id == j_uuid,
+                                NasTransferBatch.transfer_status.in_([
+                                    TransferStatus.PENDING,
+                                    TransferStatus.UPLOADING,
+                                    TransferStatus.VERIFIED,
+                                ]),
+                            ).limit(1)
+                        ).scalar_one_or_none() is not None
+
+                        has_in_flight = db.execute(
+                            select(ImageBatch.id).where(
+                                ImageBatch.job_id == j_uuid,
+                                ImageBatch.status.in_([
+                                    BatchStatus.READY_FOR_UPLOAD,
+                                    BatchStatus.UPLOADING,
+                                    BatchStatus.NAS_UPLOADING,
+                                    BatchStatus.NAS_PENDING,
+                                    BatchStatus.VERIFYING,
+                                ]),
+                            ).limit(1)
+                        ).scalar_one_or_none() is not None
+
+                        if has_active or has_in_flight:
+                            logger.info(
+                                f"purge_orphan_work_dirs: skipping {job_dir} — "
+                                "job is terminal but still has active NAS transfers or in-flight batches"
+                            )
+                            continue
+
                     try:
                         s_size = sum(f.stat().st_size for f in job_dir.rglob("*") if f.is_file())
                     except OSError:
@@ -276,31 +317,8 @@ def purge_orphan_work_dirs() -> dict:
                     reclaimed += s_size
                     logger.info(f"purge_orphan_work_dirs: removed stale staging dir {job_dir}")
 
-    # Sweep _shared_cache if no active jobs are running
-    from sqlalchemy import func
-    from app.domain.enums import JobStatus
-    with session_scope() as db:
-        active_jobs = db.execute(
-            select(func.count(Job.id)).where(Job.status.in_([JobStatus.DISCOVERING, JobStatus.RUNNING]))
-        ).scalar() or 0
-        if active_jobs == 0:
-            shared_cache_dir = work_root / "_shared_cache"
-            if shared_cache_dir.exists():
-                for entry in shared_cache_dir.iterdir():
-                    try:
-                        if entry.is_dir():
-                            s_size = sum(f.stat().st_size for f in entry.rglob("*") if f.is_file())
-                            shutil.rmtree(entry, ignore_errors=True)
-                            removed += 1
-                            reclaimed += s_size
-                        elif entry.is_file():
-                            s_size = entry.stat().st_size
-                            entry.unlink(missing_ok=True)
-                            removed += 1
-                            reclaimed += s_size
-                    except Exception as e:
-                        logger.warning(f"Failed to remove shared cache entry {entry}: {e}")
-
+    # Note: _shared_cache contains persistent indexed dataset assets (COCO, VOC, etc.)
+    # and is managed safely by cleanup_shared_cache() with PROTECTED_DIRS.
     return {
         "scanned": len(candidates),
         "removed": removed,

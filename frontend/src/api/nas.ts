@@ -3,11 +3,16 @@ import type {
   NasConfig,
   NasConfigInput,
   NasFoldersResponse,
+  NasStatus,
   NasTestResult,
   NasTransferInput,
   NasTransferResult,
   NasVerifyFolderResponse,
 } from '@/api/types'
+
+export function getNasStatus(): Promise<NasStatus> {
+  return apiFetch<NasStatus>('/nas/status')
+}
 
 export function getNasConfig(): Promise<NasConfig> {
   return apiFetch<NasConfig>('/nas/config')

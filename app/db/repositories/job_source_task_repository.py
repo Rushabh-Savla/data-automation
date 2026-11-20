@@ -64,6 +64,7 @@ class JobSourceTaskRepository:
                         JobSourceTaskStatus.DISCOVERING,
                         JobSourceTaskStatus.DOWNLOADING,
                         JobSourceTaskStatus.STANDARDIZING,
+                        JobSourceTaskStatus.STALLED,
                     ]
                 ),
                 Job.status.notin_(JOB_TERMINAL_STATUSES),
@@ -83,9 +84,12 @@ class JobSourceTaskRepository:
         task_id: uuid.UUID,
         status: JobSourceTaskStatus,
         error_message: str | None = None,
+        clear_error: bool = False,
     ) -> None:
         values: dict = {"status": status}
-        if error_message is not None:
+        if clear_error or status == JobSourceTaskStatus.COMPLETED:
+            values["error_message"] = None
+        elif error_message is not None:
             values["error_message"] = error_message
         if status == JobSourceTaskStatus.DISCOVERING:
             values.setdefault("started_at", datetime.now(timezone.utc))

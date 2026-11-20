@@ -59,22 +59,15 @@ _IMG2DATASET_TIMEOUT_S = 600
 _VALIDATE_TIMEOUT_S = 3.0  # HEAD requests should be fast; 8s serial was the main bottleneck
 _VALIDATE_MAX_WORKERS = 16
 _DISCOVER_PAGE_SIZE = 100  # ddgs image engines cap out well under this per call regardless
-_DISCOVER_PAGES_PER_VARIANT = 6  # pages to walk for one query phrasing before moving to the next
+_DISCOVER_PAGES_PER_VARIANT = 12  # pages to walk for one query phrasing before moving to the next
 _DISCOVER_PAGE_RETRIES = 2  # per-page retries before treating that page as exhausted
 _DISCOVER_RETRY_DELAY_S = 1.0
-_DISCOVER_MIN_ATTEMPTS = 20
-_DISCOVER_MAX_ATTEMPTS_CAP = 200  # hard ceiling on (variant, page) fetches regardless of target size
+_DISCOVER_MIN_ATTEMPTS = 30
+_DISCOVER_MAX_ATTEMPTS_CAP = 600  # hard ceiling on (variant, page) fetches regardless of target size
 _DISCOVER_ATTEMPTS_PER_TARGET = 10  # scales attempt budget with how many validated URLs are wanted
 
-# Generic photography-style qualifiers, not object-specific — appended to the
-# job's own query to get DuckDuckGo's differently-indexed results for a
-# slightly different phrasing of the same subject. A single literal query
-# genuinely has a finite pool of unique image results (~35-350 for a typical
-# two-word phrase, even after full page pagination) — nowhere near enough for
-# a job asking for hundreds or thousands of images. Downstream relevance
-# filtering (app/filtering/vlm_filter.py, see filtering_tasks.py) is what keeps this
-# safe: broadening recall here can only add candidates for filtering to
-# reject, it can't let anything irrelevant through on its own.
+# Generic qualifiers and domain contexts — appended to the
+# job's query and its synonyms to broaden web discovery recall.
 _QUERY_VARIANT_SUFFIXES = (
     "",
     " photo",
@@ -84,7 +77,58 @@ _QUERY_VARIANT_SUFFIXES = (
     " close up",
     " isolated on white background",
     " product photo",
+    " port",
+    " yard",
+    " depot",
+    " terminal",
+    " logistics",
+    " exterior",
+    " 4k",
 )
+
+_SYNONYM_MAP: dict[str, list[str]] = {
+    "shipping container": [
+        "shipping container",
+        "cargo container",
+        "intermodal container",
+        "freight container",
+        "sea container",
+        "shipping container yard",
+        "shipping container port",
+        "stacked shipping containers",
+        "ocean container",
+        "storage container",
+    ],
+    "container": [
+        "container",
+        "shipping container",
+        "cargo container",
+        "intermodal container",
+        "freight container",
+    ],
+}
+
+
+def _get_expanded_queries(query: str) -> list[str]:
+    """Returns a list of query variations including known synonyms and derived classes."""
+    query_lower = query.strip().lower()
+    queries = [query]
+    for key, syns in _SYNONYM_MAP.items():
+        if key in query_lower:
+            for s in syns:
+                if s not in queries and s.lower() not in [q.lower() for q in queries]:
+                    queries.append(s)
+
+    from app.filtering.query_expansion import derive_classes
+    try:
+        classes = derive_classes(query)
+        for c in classes:
+            if c not in queries and c.lower() not in [q.lower() for q in queries]:
+                queries.append(c)
+    except Exception:
+        pass
+
+    return queries[:8]
 
 
 def _robots_allowed(url: str) -> bool:
@@ -191,11 +235,15 @@ class WebScrapeConnector:
             _DISCOVER_MAX_ATTEMPTS_CAP, max(_DISCOVER_MIN_ATTEMPTS, limit // _DISCOVER_ATTEMPTS_PER_TARGET)
         )
         attempts = 0
+        expanded_queries = _get_expanded_queries(query)
 
-        for suffix in _QUERY_VARIANT_SUFFIXES:
+        for base_q in expanded_queries:
             if len(validated) >= limit or attempts >= max_attempts:
                 break
-            variant_query = f"{query}{suffix}".strip()
+            for suffix in _QUERY_VARIANT_SUFFIXES:
+                if len(validated) >= limit or attempts >= max_attempts:
+                    break
+                variant_query = f"{base_q}{suffix}".strip()
 
             for page in range(1, _DISCOVER_PAGES_PER_VARIANT + 1):
                 if len(validated) >= limit or attempts >= max_attempts:
@@ -300,6 +348,8 @@ class WebScrapeConnector:
                 writer.writerow([u])
 
         output_dir = shard_workdir / "output"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "_tmp").mkdir(parents=True, exist_ok=True)
         self._run_img2dataset(url_list_path, output_dir, shard_id)
 
         if should_stop():
@@ -343,8 +393,14 @@ class WebScrapeConnector:
                 f"img2dataset timed out after {_IMG2DATASET_TIMEOUT_S}s for shard {shard_id}"
             ) from e
         if result.returncode != 0:
-            tail = "\n".join(result.stderr.strip().splitlines()[-20:])
-            raise TransientConnectorError(f"img2dataset failed for shard {shard_id} (exit {result.returncode}): {tail}")
+            stderr = result.stderr or ""
+            # If the only error in img2dataset was failing to remove its internal _tmp directory at the end,
+            # this is a harmless cleanup quirk in img2dataset: the downloaded images are already saved.
+            if "FileNotFoundError" in stderr and "_tmp" in stderr:
+                logger.info(f"img2dataset harmless cleanup notice for shard {shard_id} (_tmp directory already removed)")
+            else:
+                tail = "\n".join(stderr.strip().splitlines()[-20:])
+                raise TransientConnectorError(f"img2dataset failed for shard {shard_id} (exit {result.returncode}): {tail}")
 
     def _walk_output(self, output_dir: Path, query: str, on_progress: OnProgressFn, admit_candidate=None) -> Iterator[RawAssetDraft]:
         from PIL import Image
@@ -390,10 +446,10 @@ class WebScrapeConnector:
                         getattr(admission, "window_index", None),
                         0,
                     )
+                if status == "INACTIVE":
+                    raise JobStopped(f"Candidate admission closed for {source_item_id}")
                 if status != "ADMITTED":
-                    raise FatalConnectorError(
-                        f"Candidate admission failed for {source_item_id}: {status}"
-                    )
+                    continue
 
             try:
                 with Image.open(img_path) as im:

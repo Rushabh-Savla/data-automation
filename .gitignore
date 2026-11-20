@@ -148,6 +148,7 @@ activemq-data/
 
 # Environments
 .env
+.env.*
 .envrc
 .venv
 env/
@@ -159,6 +160,8 @@ venv.bak/
 # Platform runtime data (local dev NAS/scratch paths, see app/core/config.py)
 /nas_data/
 /work_data/
+/logs/
+logs/
 
 # Auto-downloaded ML model weights (Ultralytics YOLO/YOLO-World, ~30-350MB each)
 weights/

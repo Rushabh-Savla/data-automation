@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Sequence
 
-from sqlalchemy import select
+from sqlalchemy import select, func, delete
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
@@ -63,28 +63,105 @@ class BatchOrchestrator:
 
     def _create_or_get_batch_unlocked(self) -> ImageBatch | None:
         job = self.db.execute(
-            select(Job).where(Job.id == self.job_id).with_for_update()
+            select(Job).where(Job.id == self.job_id)
         ).scalar_one_or_none()
         if job is None:
             return None
 
-        # Compute total accepted images across completed / uploading batches
+        # Reconcile batch and job counters so cross-batch deduplications/trims are reflected
         existing_batches = self.batch_repo.list_for_job(self.job_id)
-        total_accepted = sum(
-            b.accepted_image_count for b in existing_batches
-            if b.status in (BatchStatus.COMPLETED, BatchStatus.READY_FOR_UPLOAD, BatchStatus.UPLOADING, BatchStatus.VERIFYING)
+        has_assets = self.db.execute(
+            select(Asset.id).where(Asset.job_id == self.job_id).limit(1)
+        ).scalar_one_or_none() is not None
+
+        if has_assets:
+            for b in existing_batches:
+                self.batch_repo.reconcile_batch_counters(b.id)
+            self.db.expire_all()
+            existing_batches = self.batch_repo.list_for_job(self.job_id)
+
+            from app.services.job_counters import reconcile
+            reconcile(self.db, self.job_id)
+            self.db.refresh(job)
+        else:
+            total_accepted = sum(b.accepted_image_count or 0 for b in existing_batches)
+            job.accepted_count = total_accepted
+
+        # Prune redundant empty ghost batches with 0 assets that were created spuriously
+        from app.db.models.candidate_window import CandidateWindow
+        non_terminal = [
+            b for b in existing_batches
+            if b.status not in (BatchStatus.COMPLETED, BatchStatus.PARTIAL, BatchStatus.FAILED)
+        ]
+        if len(non_terminal) > 1:
+            # The lowest batch_index is the legitimate active batch
+            legit_active = sorted(non_terminal, key=lambda b: b.batch_index)[0]
+            cleaned_batches = []
+            for b in existing_batches:
+                if (
+                    b.id != legit_active.id
+                    and (b.accepted_image_count or 0) == 0
+                    and b.status not in (BatchStatus.COMPLETED, BatchStatus.PARTIAL)
+                ):
+                    asset_count = self.db.execute(
+                        select(func.count(Asset.id)).where(Asset.batch_id == b.id)
+                    ).scalar_one()
+                    if asset_count == 0:
+                        self.db.execute(delete(CandidateWindow).where(CandidateWindow.batch_id == b.id))
+                        self.db.delete(b)
+                        continue
+                cleaned_batches.append(b)
+            self.db.flush()
+            existing_batches = cleaned_batches
+
+        # Check if there is an existing incomplete batch that still needs processing/manifesting
+        non_terminal_batches = [
+            b for b in existing_batches
+            if b.status not in (BatchStatus.COMPLETED, BatchStatus.PARTIAL, BatchStatus.FAILED)
+        ]
+        active_in_flight = [
+            b for b in non_terminal_batches
+            if b.status not in (
+                BatchStatus.READY_FOR_UPLOAD,
+                BatchStatus.UPLOADING,
+                BatchStatus.NAS_UPLOADING,
+                BatchStatus.NAS_PENDING,
+                BatchStatus.VERIFYING,
+                BatchStatus.NAS_VERIFIED,
+            )
+        ]
+        if active_in_flight:
+            return active_in_flight[0]
+
+        # If any batch is currently uploading, return it rather than creating a new batch concurrently
+        if non_terminal_batches:
+            return non_terminal_batches[0]
+
+        # Dynamic final batch sizing: calculate confirmed completed images across all prior completed or uploading batches
+        completed_accepted = sum(
+            b.accepted_image_count or 0
+            for b in existing_batches
+            if b.status in (
+                BatchStatus.COMPLETED,
+                BatchStatus.READY_FOR_UPLOAD,
+                BatchStatus.UPLOADING,
+                BatchStatus.NAS_UPLOADING,
+                BatchStatus.NAS_PENDING,
+                BatchStatus.VERIFYING,
+                BatchStatus.NAS_VERIFIED,
+                BatchStatus.PARTIAL,
+            )
         )
-        
+        total_accepted = max(job.accepted_count or 0, completed_accepted)
         target = job.target_count or self.settings.batch_accepted_target
-        if total_accepted >= target:
+        if completed_accepted >= target or total_accepted >= target:
             return None  # All batches fulfilled
 
-        active = self.batch_repo.get_active_batch(self.job_id)
-        if active is not None and active.status not in (BatchStatus.READY_FOR_UPLOAD, BatchStatus.UPLOADING, BatchStatus.VERIFYING):
-            return active
-
         next_index = len(existing_batches) + 1
-        remaining_needed = target - total_accepted
+        remaining_needed = target - completed_accepted
+        if remaining_needed <= 0:
+            return None
+
         batch_target = min(self.settings.batch_accepted_target, remaining_needed)
 
         new_batch = ImageBatch(
@@ -108,13 +185,29 @@ class BatchOrchestrator:
         """
         redis = get_redis()
         lock_key = f"job:{self.job_id}:batch_create_lock"
+        lock = None
+        acquired = False
         try:
-            with redis.lock(lock_key, timeout=30):
-                return self._create_or_get_batch_unlocked()
+            lock = redis.lock(lock_key, timeout=60)
+            acquired = lock.acquire(blocking=True, blocking_timeout=15)
         except Exception as e:
-            # If Redis is unavailable or disconnected (e.g. offline unit tests), fail open
-            logger.warning(f"Redis lock unavailable ({e}), proceeding without lock.")
+            logger.warning(f"Redis lock acquisition error ({e}), proceeding without lock.")
+            acquired = False
+
+        try:
             return self._create_or_get_batch_unlocked()
+        except Exception:
+            try:
+                self.db.rollback()
+            except Exception:
+                pass
+            raise
+        finally:
+            if acquired and lock:
+                try:
+                    lock.release()
+                except Exception:
+                    pass
 
     def associate_unbatched_assets(self, batch_id: uuid.UUID) -> int:
         """Associates any newly standardized PROMOTED assets with the current batch."""
@@ -154,8 +247,9 @@ class BatchOrchestrator:
         duplicates_found = 0
 
         use_cross_job = (dedup.dedup_scope == "global")
+        from app.domain.enums import ASSET_ACCEPTED_STATUSES
         ref_stmt = select(Asset).where(
-            Asset.status.in_([AssetStatus.RELEVANCE_PASSED, AssetStatus.PROMOTED])
+            Asset.status.in_(list(ASSET_ACCEPTED_STATUSES) + [AssetStatus.PROMOTED])
         )
         if not use_cross_job:
             ref_stmt = ref_stmt.where(Asset.job_id == self.job_id)
@@ -172,6 +266,8 @@ class BatchOrchestrator:
                 if canonical.id != asset.id:
                     winner, loser = CanonicalSelector.select_canonical(canonical, asset)
                     CanonicalSelector.apply_duplicate_relationship(winner, loser)
+                    from app.services.standardization_service import delete_asset_files
+                    delete_asset_files(loser)
                     duplicates_found += 1
                     continue
 
@@ -197,14 +293,25 @@ class BatchOrchestrator:
                 if canonical:
                     winner, loser = CanonicalSelector.select_canonical(canonical, asset)
                     CanonicalSelector.apply_duplicate_relationship(winner, loser)
+                    from app.services.standardization_service import delete_asset_files
+                    delete_asset_files(loser)
                 else:
                     asset.status = AssetStatus.DUPLICATE
                     asset.is_duplicate_of = result.duplicate_of_id
+                    from app.services.standardization_service import delete_asset_files
+                    delete_asset_files(asset)
                 duplicates_found += 1
 
         if duplicates_found > 0:
             self.db.commit()
-            logger.info(f"[BATCH ORCHESTRATION] Batch {batch_id}: Detected {duplicates_found} cross-batch duplicate(s)")
+            for b in self.batch_repo.list_for_job(self.job_id):
+                self.batch_repo.reconcile_batch_counters(b.id)
+            from app.services.job_counters import reconcile
+            reconcile(self.db, self.job_id)
+            self.db.commit()
+            logger.info(
+                f"[BATCH ORCHESTRATION] Batch {batch_id}: Detected {duplicates_found} cross-batch duplicate(s) and reconciled all counters"
+            )
         return duplicates_found
 
     def evaluate_batch_progress(self, batch_id: uuid.UUID) -> dict:
@@ -258,23 +365,67 @@ class BatchOrchestrator:
                 "shortfall": 0,
             }
 
+        # Check candidate window and active reservations
+        from app.db.models.candidate_window import CandidateWindow
+        window = self.db.execute(
+            select(CandidateWindow)
+            .where(CandidateWindow.batch_id == batch_id)
+            .order_by(CandidateWindow.window_index.desc())
+            .limit(1)
+        ).scalar_one_or_none()
+
+        reserved_count = 0
+        if window is not None:
+            from app.db.models.candidate_reservation import CandidateReservation
+            from app.services.candidate_reservation_service import cleanup_stale_reservations
+            cleanup_stale_reservations(self.db, window.id, stale_seconds=60)
+            reserved_count = self.db.execute(
+                select(func.count(CandidateReservation.id)).where(
+                    CandidateReservation.window_id == window.id,
+                    CandidateReservation.status == "RESERVED",
+                )
+            ).scalar_one()
+
         # Check if candidate downloading/filtering is still in flight
-        if in_flight > 0:
+        if in_flight > 0 or reserved_count > 0:
             return {
                 "outcome": "IN_PROGRESS",
                 "accepted": accepted,
                 "shortfall": shortfall,
             }
 
-        # Check if source tasks have exhausted available items
-        all_terminal = self.task_repo.all_terminal_for_job(self.job_id)
-        if all_terminal:
+        if window is not None and window.status in ("OPEN", "ACQUIRING"):
+            tasks = self.task_repo.list_for_job(self.job_id)
+            has_unconsumed = False
+            for t in tasks:
+                cp = t.checkpoint or {}
+                pending = cp.get("_pending_items")
+                if pending:
+                    completed = set(cp.get("_completed_items", []))
+                    if not set(pending.keys()).issubset(completed):
+                        has_unconsumed = True
+                        break
+            if has_unconsumed or any(t.status == JobSourceTaskStatus.DOWNLOADING for t in tasks):
+                return {
+                    "outcome": "IN_PROGRESS",
+                    "accepted": accepted,
+                    "shortfall": shortfall,
+                }
+
+        # Flexible Batch Delivery:
+        # A batch does not need to contain 600 images before it can be uploaded.
+        # Once its candidate acquisition and filtering window is finalized, any non-empty
+        # batch (1, 50, 99, 460, 495, etc.) is eligible for manifest creation and NAS upload.
+        if accepted > 0:
             return {
-                "outcome": "SOURCES_EXHAUSTED",
+                "outcome": "READY_FOR_UPLOAD",
                 "accepted": accepted,
-                "shortfall": shortfall,
+                "shortfall": max(0, shortfall),
             }
 
+        # Check if source tasks have exhausted available items
+        # If shortfall exists, continue replenishment with multiple/infinite iterations.
+        # "No more data to be found" is never declared while shortfall remains and target count is set.
         return {
             "outcome": "NEEDS_REPLACEMENTS",
             "accepted": accepted,
@@ -306,8 +457,8 @@ class BatchOrchestrator:
         total_accepted = already_completed_count + len(assets)
 
         if batch.target_image_count and total_accepted > batch.target_image_count:
-            from app.tasks.filtering_tasks import trim_excess_assets
-            trim_excess_assets(str(self.job_id))
+            from app.tasks.filtering_tasks import trim_excess_batch_assets
+            trim_excess_batch_assets(batch_id, db=self.db)
             self.db.expire_all()
             assets = list(self.db.execute(stmt).scalars().all())
 
@@ -409,8 +560,9 @@ def process_active_batch(self, job_id: str):
 
     outcome = progress.get("outcome")
 
-    if outcome == "TARGET_MET":
-        # Target accepted images achieved! Build manifest and prepare for upload.
+    if outcome in ("TARGET_MET", "READY_FOR_UPLOAD"):
+        # Target accepted images achieved or candidate window processing finalized!
+        # Under Flexible Batch Delivery, any finalized batch with accepted images (>0) is uploaded to NAS.
         with session_scope() as db:
             orchestrator = BatchOrchestrator(db, job_uuid)
             manifest_path = orchestrator.create_batch_manifest(batch_id)
@@ -419,7 +571,7 @@ def process_active_batch(self, job_id: str):
                 from app.tasks.nas_tasks import process_nas_upload_queue
                 enqueue_nas_batch(batch_id, job_uuid, manifest_path)
                 process_nas_upload_queue.delay()
-        logger.info(f"[BATCH ORCHESTRATION] Batch {batch_id} complete with {progress['accepted']} images; enqueued for NAS upload.")
+        logger.info(f"[BATCH ORCHESTRATION] Batch {batch_id} finalized with {progress['accepted']} images; enqueued for NAS upload.")
 
         # Check if the overall job needs another batch
         with session_scope() as db:
@@ -433,18 +585,7 @@ def process_active_batch(self, job_id: str):
                 evaluate_job_completion.delay(job_id)
 
     elif outcome == "NEEDS_REPLACEMENTS":
-        # Upload any newly accepted images from this round immediately to NAS
-        with session_scope() as db:
-            orchestrator = BatchOrchestrator(db, job_uuid)
-            manifest_path = orchestrator.create_batch_manifest(batch_id, set_batch_status=False)
-            if manifest_path is not None:
-                from app.storage.nas_writer import enqueue_nas_batch
-                from app.tasks.nas_tasks import process_nas_upload_queue
-                enqueue_nas_batch(batch_id, job_uuid, manifest_path)
-                process_nas_upload_queue.delay()
-                logger.info(f"[BATCH ORCHESTRATION] Offloaded newly accepted assets to NAS for Batch {batch_id}")
-
-        # Shortfall detected! Request replacements for rejected/duplicate images using DB row locking and Redis lock
+        # Only reached when a window yielded 0 accepted images and sources have supply
         shortfall = progress.get("shortfall", 0)
         redis = get_redis()
         replenish_key = f"job:{job_id}:batch:{batch_id}:replenish_lock"
@@ -466,7 +607,7 @@ def process_active_batch(self, job_id: str):
 
                 if batch is not None:
                     md = dict(batch.batch_metadata or {})
-                    if batch.status == BatchStatus.REPLENISHING and md.get("active_replenishment_ticket"):
+                    if batch.status in (BatchStatus.REPLENISHING, BatchStatus.DOWNLOADING) and md.get("active_replenishment_ticket"):
                         logger.warning(
                             f"[BATCH ORCHESTRATION] Batch {batch_id} already has active replenishment ticket "
                             f"{md.get('active_replenishment_ticket')}. Skipping duplicate dispatch."
@@ -476,6 +617,7 @@ def process_active_batch(self, job_id: str):
                         md["active_replenishment_ticket"] = replenishment_ticket
                         md["replenishment_round"] = replenishment_round
                         md["replenishment_shortfall"] = shortfall
+                        md["last_accepted_count"] = progress.get("accepted", 0)
                         batch.batch_metadata = md
                         orchestrator.batch_repo.set_status(batch_id, BatchStatus.REPLENISHING)
                         db.commit()
@@ -487,13 +629,32 @@ def process_active_batch(self, job_id: str):
 
         if should_dispatch:
             settings = get_settings()
-            buffer = float(settings.target_overfetch_buffer or 1.5)
+            from app.core.config import resolve_overfetch_buffer
+
+            with session_scope() as db:
+                curr_j = db.get(Job, job_uuid)
+                curr_b = db.get(ImageBatch, batch_id)
+                buffer = resolve_overfetch_buffer(curr_j.config if curr_j else None)
+
+                # Adaptive replenishment: calculate observed yield rate
+                yield_rate = 1.0
+                b_accepted = curr_b.accepted_image_count if curr_b else 0
+                b_rejected = curr_b.rejected_image_count if curr_b else 0
+                b_duplicate = curr_b.duplicate_image_count if curr_b else 0
+                b_total = b_accepted + b_rejected + b_duplicate
+                if b_total >= 10 and b_accepted > 0:
+                    yield_rate = b_accepted / b_total
+                elif curr_j and (curr_j.downloaded_count or 0) >= 20 and (curr_j.accepted_count or 0) > 0:
+                    yield_rate = (curr_j.accepted_count or 0) / (curr_j.downloaded_count or 1)
+
+            yield_rate = max(0.05, min(1.0, yield_rate))
+            needed_raw = math.ceil((shortfall / yield_rate) * buffer)
             replenishment_candidates = min(
                 settings.download_candidate_window,
-                max(15, math.ceil(shortfall * buffer)),
+                max(15, needed_raw),
             )
             logger.info(
-                f"[BATCH ORCHESTRATION] Batch {batch_id} shortfall={shortfall}. "
+                f"[BATCH ORCHESTRATION] Batch {batch_id} shortfall={shortfall}, observed_yield={yield_rate:.2f}, buffer={buffer:.2f}. "
                 f"Transitioned to REPLENISHING (round={replenishment_round}, ticket={replenishment_ticket}), dispatching replacements ({replenishment_candidates} candidates)..."
             )
             dispatch_batch_candidate_window.delay(
@@ -501,17 +662,52 @@ def process_active_batch(self, job_id: str):
             )
 
     elif outcome == "SOURCES_EXHAUSTED":
-        # Sources dry before reaching target. Finalize partial batch
+        # Sources dry before reaching full target count.
+        accepted_cnt = progress.get("accepted", 0)
         with session_scope() as db:
             orchestrator = BatchOrchestrator(db, job_uuid)
-            manifest_path = orchestrator.create_batch_manifest(batch_id)
-            orchestrator.batch_repo.set_status(batch_id, BatchStatus.PARTIAL)
-            if manifest_path is not None:
-                from app.storage.nas_writer import enqueue_nas_batch
-                from app.tasks.nas_tasks import process_nas_upload_queue
-                enqueue_nas_batch(batch_id, job_uuid, manifest_path)
-                process_nas_upload_queue.delay()
-        logger.warning(f"[BATCH ORCHESTRATION] Batch {batch_id} partial ({progress['accepted']} images). Sources exhausted; enqueued for NAS upload.")
+            if accepted_cnt > 0:
+                # Under Flexible Batch Delivery: upload all accepted images collected before exhaustion
+                manifest_path = orchestrator.create_batch_manifest(batch_id)
+                if manifest_path is not None:
+                    from app.storage.nas_writer import enqueue_nas_batch
+                    from app.tasks.nas_tasks import process_nas_upload_queue
+                    enqueue_nas_batch(batch_id, job_uuid, manifest_path)
+                    process_nas_upload_queue.delay()
+                logger.info(
+                    f"[BATCH ORCHESTRATION] Sources exhausted for Batch {batch_id}, but {accepted_cnt} valid images collected. "
+                    "Enqueued finalized partial batch for NAS upload."
+                )
+            else:
+                orchestrator.batch_repo.set_status(batch_id, BatchStatus.PARTIAL)
+                logger.info(
+                    f"[BATCH ORCHESTRATION] Sources exhausted for Batch {batch_id} with 0 accepted images. "
+                    "Batch marked PARTIAL in database; no NAS upload needed."
+                )
+
+            # Update non-terminal source tasks: only mark terminal if unconsumed items are genuinely empty
+            task_repo = JobSourceTaskRepository(db)
+            for t in task_repo.list_for_job(job_uuid):
+                if t.status not in JOB_SOURCE_TASK_TERMINAL_STATUSES:
+                    cp = t.checkpoint or {}
+                    pending = cp.get("_pending_items") or {}
+                    completed = set(cp.get("_completed_items", []))
+                    has_remaining = bool(pending and not set(pending.keys()).issubset(completed))
+                    if has_remaining:
+                        new_t_status = JobSourceTaskStatus.PARTIALLY_PROCESSED
+                    elif t.accepted_count and t.discovered_count and t.accepted_count >= t.discovered_count:
+                        new_t_status = JobSourceTaskStatus.COMPLETED
+                    else:
+                        new_t_status = JobSourceTaskStatus.SOURCE_EXHAUSTED
+                    task_repo.set_status(t.id, new_t_status)
+            db.commit()
+
+        logger.warning(
+            f"[BATCH ORCHESTRATION] Batch {batch_id} partial ({accepted_cnt} images). "
+            "Sources exhausted; evaluating job completion."
+        )
+        from app.tasks.orchestration_tasks import evaluate_job_completion
+        evaluate_job_completion.delay(job_id)
 
     clear_job_context()
     return {"job_id": job_id, "batch_id": str(batch_id), "progress": progress}
@@ -587,11 +783,10 @@ def dispatch_batch_candidate_window(
         if candidate_count is not None:
             window_size = int(candidate_count)
         else:
-            if batch.target_image_count > settings.download_candidate_window:
-                window_size = settings.download_candidate_window
-            else:
-                shortfall = max(1, batch.target_image_count - (batch.accepted_image_count or 0))
-                window_size = min(settings.download_candidate_window, max(15, math.ceil(shortfall * buffer)))
+            from app.core.config import calculate_initial_candidates
+            shortfall = max(1, batch.target_image_count - (batch.accepted_image_count or 0))
+            max_win = max(settings.download_candidate_window, 5000)
+            window_size = min(max_win, max(1, calculate_initial_candidates(shortfall, job_config=job.config if job else None)))
 
         if ticket is not None:
             md = dict(batch.batch_metadata or {})
@@ -607,7 +802,8 @@ def dispatch_batch_candidate_window(
             md["consumed_replenishment_ticket"] = ticket
             batch.batch_metadata = md
 
-        batch_repo.set_status(batch_uuid, BatchStatus.DOWNLOADING)
+        if batch.status not in (BatchStatus.DOWNLOADING, BatchStatus.PROCESSING):
+            batch_repo.set_status(batch_uuid, BatchStatus.DOWNLOADING)
 
         # Clear prior target reached flags in redis so new window admissions and discoveries proceed
         from app.services.cancellation_service import CancellationService
@@ -621,36 +817,26 @@ def dispatch_batch_candidate_window(
             db, batch, candidate_limit=window_size, force_new=(ticket is not None)
         )
 
-        # Find non-terminal source tasks or create tasks if needed
-        raw_sources = job.sources or [
-            s.value for s in SourceType if s != SourceType.NAS_SHARE
-        ]
-        excluded_sources = {"youtube", "kitti", "nuscenes"}
-        candidate_sources = [
-            str(getattr(source, "value", source))
-            for source in raw_sources
-            if str(getattr(source, "value", source)).lower() not in excluded_sources
-        ]
-        sources = candidate_sources or [str(getattr(s, "value", s)) for s in raw_sources]
+        # Enforce strict sequential execution: only dispatch for the single active source
+        from app.domain.source_priority import evaluate_sequential_execution_plan
+        tasks = task_repo.list_for_job(job_uuid)
+        plan = evaluate_sequential_execution_plan(job, tasks)
         dispatched_tasks = []
-
         tasks_to_dispatch: list[tuple[str, str, str]] = []
 
-        for source_str in sources:
-            source_type = SourceType(source_str)
+        if plan.active_source is not None:
+            source_type = plan.active_source
+            source_str = source_type.value
             task_path = _SOURCE_DISCOVERY_TASKS.get(source_type)
-            if task_path is None:
-                continue
 
-            # Check if task already exists for this job and source
             existing_task = task_repo.get_for_job_and_source(job_uuid, source_type)
-
             if existing_task is None:
                 new_task = JobSourceTask(id=uuid.uuid4(), job_id=job_uuid, source_type=source_str)
                 task_repo.create(new_task)
                 db.flush()
                 task_id = new_task.id
-                tasks_to_dispatch.append((task_path, str(job_uuid), str(task_id)))
+                if task_path is not None:
+                    tasks_to_dispatch.append((task_path, str(job_uuid), str(task_id)))
             else:
                 task_id = existing_task.id
                 task_repo.set_status(existing_task.id, JobSourceTaskStatus.DOWNLOADING)
@@ -658,9 +844,9 @@ def dispatch_batch_candidate_window(
                 from app.services.job_service import _resume_pending_items
                 if _resume_pending_items(source_type, str(job_uuid), str(task_id), existing_task.checkpoint):
                     dispatched_tasks.append((source_str, str(task_id)))
-                    continue
-                task_repo.set_status(existing_task.id, JobSourceTaskStatus.PENDING)
-                tasks_to_dispatch.append((task_path, str(job_uuid), str(task_id)))
+                elif task_path is not None and not (existing_task.checkpoint or {}).get("discovery_exhausted", False):
+                    task_repo.set_status(existing_task.id, JobSourceTaskStatus.DISCOVERING)
+                    tasks_to_dispatch.append((task_path, str(job_uuid), str(task_id)))
 
             dispatched_tasks.append((source_str, str(task_id)))
 
@@ -670,6 +856,12 @@ def dispatch_batch_candidate_window(
         # Dispatch Celery tasks only AFTER durable commit so workers never see task is None
         for t_path, j_id, s_task_id in tasks_to_dispatch:
             JobService._dispatch(t_path, j_id, s_task_id)
+
+        # Release replenishment lock now that dispatch is safely completed
+        try:
+            get_redis().delete(f"job:{job_id}:batch:{batch_id}:replenish_lock")
+        except Exception:
+            pass
 
     logger.info(
         f"[BATCH WINDOW] Job {job_id} Batch #{batch_index}: "

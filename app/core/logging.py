@@ -52,11 +52,12 @@ def configure_logging(level: int = logging.INFO) -> None:
     # in the worker process, which never runs uvicorn.
     logging.getLogger("uvicorn.access").addFilter(SuppressJunkAccessLogs())
 
-    # NAS client libraries log every protocol message at INFO (smbprotocol alone emits
-    # ~20 lines per file operation), which would bury the job logs. Warnings and
-    # errors still come through.
+    # NAS client libraries and HTTP connection pools log protocol noise or broken external
+    # site headers at INFO/WARNING with tracebacks, which would bury job logs.
     for noisy in ("smbprotocol", "smbclient", "spnego", "paramiko"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
+    for noisy_err in ("urllib3.connection", "urllib3.util.response"):
+        logging.getLogger(noisy_err).setLevel(logging.ERROR)
 
     configure_nas_file_logging()
 

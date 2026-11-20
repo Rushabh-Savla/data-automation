@@ -38,6 +38,7 @@ class TestDiscover:
     def test_matches_class_and_shards(self, monkeypatch, tmp_path):
         cache_dir = _build_fake_cache(tmp_path)
         monkeypatch.setattr(kitti_mod, "_ensure_dataset_cached", lambda: cache_dir)
+        monkeypatch.setattr(kitti_mod, "_ensure_labels_cached", lambda: cache_dir)
 
         connector = KittiConnector()
         page = connector.discover("a car on the road", cursor=None, limit=200)
@@ -49,6 +50,7 @@ class TestDiscover:
     def test_a_query_no_class_names_scans_instead_of_failing(self, monkeypatch, tmp_path):
         cache_dir = _build_fake_cache(tmp_path)
         monkeypatch.setattr(kitti_mod, "_ensure_dataset_cached", lambda: cache_dir)
+        monkeypatch.setattr(kitti_mod, "_ensure_labels_cached", lambda: cache_dir)
 
         page = KittiConnector().discover("xylophone", cursor=None, limit=200)
 
@@ -59,6 +61,7 @@ class TestDiscover:
     def test_explicit_classes_are_exact_and_never_scanned(self, monkeypatch, tmp_path):
         cache_dir = _build_fake_cache(tmp_path)
         monkeypatch.setattr(kitti_mod, "_ensure_dataset_cached", lambda: cache_dir)
+        monkeypatch.setattr(kitti_mod, "_ensure_labels_cached", lambda: cache_dir)
 
         page = KittiConnector().discover("anything", cursor=None, limit=200, explicit_categories=["Car"])
 
@@ -67,6 +70,7 @@ class TestDiscover:
     def test_explicit_classes_that_match_nothing_still_report_it(self, monkeypatch, tmp_path):
         cache_dir = _build_fake_cache(tmp_path)
         monkeypatch.setattr(kitti_mod, "_ensure_dataset_cached", lambda: cache_dir)
+        monkeypatch.setattr(kitti_mod, "_ensure_labels_cached", lambda: cache_dir)
 
         page = KittiConnector().discover("anything", cursor=None, limit=200, explicit_categories=["Dragon"])
 

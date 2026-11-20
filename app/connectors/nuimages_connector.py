@@ -55,7 +55,7 @@ from app.services.format_conversion import BBox, ClassRegistry, boxes_to_yolo_li
 logger = logging.getLogger(__name__)
 
 _BASE_URL = "https://motional-nuscenes.s3.amazonaws.com/public/nuimages-v1.0"
-_SHARD_SIZE = 20
+_SHARD_SIZE = 50
 _INDEX_FILENAME = "index.sqlite3"
 _LICENSE_NOTE = (
     "nuImages (non-commercial research use — Motional terms, "
@@ -120,7 +120,7 @@ def _cache_dir(dataset: _Dataset) -> Path:
     return get_settings().work_root / "_shared_cache" / dataset.cache_subdir
 
 
-def _ensure_dataset_cached(dataset: _Dataset) -> Path:
+def _ensure_dataset_cached(dataset: _Dataset, metadata_only: bool = False) -> Path:
     """Downloads+extracts each of the dataset's archives once and returns the
     cache root (containing the v1.0-* metadata dirs + samples/).
 
@@ -130,6 +130,8 @@ def _ensure_dataset_cached(dataset: _Dataset) -> Path:
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     for archive in dataset.archives:
+        if metadata_only and not archive.sentinel.startswith("v1.0"):
+            continue
         if (cache_dir / archive.sentinel).exists():
             continue
         with exclusive_cache_lock(cache_dir / ".dataset.lock"):
@@ -141,7 +143,7 @@ def _ensure_dataset_cached(dataset: _Dataset) -> Path:
                 archive_path,
                 label=f"nuImages {archive.filename}",
                 timeout=120,
-                required_free_bytes=archive.size_bytes + archive.extracted_bytes,
+                required_free_bytes=archive.size_bytes + (2_000_000_000 if archive.remove_after_extract else archive.extracted_bytes),
             )
             extract_into_cache(
                 archive_path, cache_dir, sentinel=archive.sentinel, remove_archive=archive.remove_after_extract
@@ -278,7 +280,7 @@ class NuImagesConnector:
     ) -> DiscoveryPage:
         try:
             selected = _dataset(dataset or _DEFAULT_DATASET)
-            index_path = _ensure_index(_ensure_dataset_cached(selected))
+            index_path = _ensure_index(_ensure_dataset_cached(selected, metadata_only=True))
         except FatalConnectorError as e:
             return DiscoveryPage(items=[], next_cursor=None, exhausted=True, error_reason=str(e))
         except Exception as e:
@@ -417,10 +419,10 @@ class NuImagesConnector:
                         getattr(admission, "window_index", None),
                         i,
                     )
+                if status == "INACTIVE":
+                    raise JobStopped(f"Candidate admission closed for {source_item_id}")
                 if status != "ADMITTED":
-                    raise FatalConnectorError(
-                        f"Candidate admission failed for {source_item_id}: {status}"
-                    )
+                    continue
 
             dest = workdir / f"nuimages_{token}{src_img.suffix}"
             try:

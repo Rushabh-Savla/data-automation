@@ -38,8 +38,11 @@ from app.domain.enums import SourceType
 
 logger = logging.getLogger(__name__)
 
-_ARCHIVE_URL = "http://host.robots.ox.ac.uk/pascal/VOC/voc2012/VOCtrainval_11-May-2012.tar"
-_SHARD_SIZE = 20
+_ARCHIVE_URLS = [
+    "https://data.pjreddie.com/files/VOCtrainval_11-May-2012.tar",
+    "http://host.robots.ox.ac.uk/pascal/VOC/voc2012/VOCtrainval_11-May-2012.tar",
+]
+_SHARD_SIZE = 50
 _VOC_CLASSES = [
     "aeroplane", "bicycle", "bird", "boat", "bottle", "bus", "car", "cat", "chair", "cow",
     "diningtable", "dog", "horse", "motorbike", "person", "pottedplant", "sheep", "sofa",
@@ -63,17 +66,26 @@ def _ensure_dataset_cached() -> Path:
 
     tar_path = cache_dir / "VOCtrainval_11-May-2012.tar"
     if not tar_path.exists():
-        logger.info(f"Downloading Pascal VOC 2012 trainval ({_ARCHIVE_URL})")
-        tmp_path = tar_path.with_suffix(".tar.tmp")
-        try:
-            download_with_retry(_ARCHIVE_URL, tmp_path, timeout=300, headers=HTTP_HEADERS)
-        except requests.HTTPError as e:
-            raise FatalConnectorError(f"Pascal VOC archive not accessible: {e}") from e
-        if not tar_path.exists() and tmp_path.exists():
+        download_err = None
+        for archive_url in _ARCHIVE_URLS:
+            logger.info(f"Downloading Pascal VOC 2012 trainval ({archive_url})")
+            tmp_path = tar_path.with_suffix(".tar.tmp")
             try:
-                tmp_path.replace(tar_path)
-            except OSError:
-                pass
+                download_with_retry(archive_url, tmp_path, timeout=300, headers=HTTP_HEADERS)
+                if not tar_path.exists() and tmp_path.exists():
+                    try:
+                        tmp_path.replace(tar_path)
+                    except OSError:
+                        pass
+                download_err = None
+                break
+            except Exception as e:
+                logger.warning(f"Pascal VOC mirror {archive_url} failed: {e}")
+                download_err = e
+            finally:
+                tmp_path.unlink(missing_ok=True)
+        if not tar_path.exists() and not devkit_dir.exists():
+            raise FatalConnectorError(f"Pascal VOC archive not accessible: {download_err}") from download_err
 
     if devkit_dir.exists():
         return devkit_dir
@@ -162,7 +174,7 @@ class PascalVocConnector:
             # fill the rest from every other image and let the relevance filter decide
             # (open_vocab.py). Not for explicit class overrides, which are exact.
             scan_ids: list[str] = []
-            if not explicit_categories and len(labelled) < limit:
+            if not explicit_categories and not matched and len(labelled) < limit:
                 everything = _image_ids_for_classes(devkit_dir, set(_VOC_CLASSES))
                 scan_ids = scan_candidates(everything, set(labelled), limit - len(labelled))
         except FatalConnectorError as e:
@@ -237,10 +249,10 @@ class PascalVocConnector:
                         getattr(admission, "window_index", None),
                         i,
                     )
+                if status == "INACTIVE":
+                    raise JobStopped(f"Candidate admission closed for {source_item_id}")
                 if status != "ADMITTED":
-                    raise FatalConnectorError(
-                        f"Candidate admission failed for {source_item_id}: {status}"
-                    )
+                    continue
 
             src_img = devkit_dir / "JPEGImages" / f"{image_id}.jpg"
             src_xml = devkit_dir / "Annotations" / f"{image_id}.xml"

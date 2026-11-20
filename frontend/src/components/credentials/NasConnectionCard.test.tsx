@@ -65,7 +65,7 @@ describe('NasConnectionCard', () => {
       has_password: true,
     })
     renderCard()
-    expect(await screen.findByText('Connected')).toBeInTheDocument()
+    expect(await screen.findByText('Configured')).toBeInTheDocument()
     expect(screen.getByText(/SMB \/ CIFS · 192\.168\.1\.20 \/ datasets · signed in as alice · filtered images are stored here/)).toBeInTheDocument()
     expect(screen.getByRole('link', { name: 'Edit connection' })).toHaveAttribute('href', '/nas')
   })

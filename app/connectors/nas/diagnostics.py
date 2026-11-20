@@ -115,7 +115,6 @@ def run_connection_test(params: NasConnectionParams, require_write: bool = False
             else:
                 if not sample_files:
                     messages.append("Source folder contains no images.")
-                messages.append("Source folder can be read.")
         elif not can_read and can_write:
             if read_err:
                 messages.append(read_err)

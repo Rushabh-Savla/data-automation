@@ -262,10 +262,25 @@ class TestRoundCap:
     def test_the_default_allows_a_dedup_heavy_source_to_converge(self):
         from app.core.config import Settings
 
-        assert Settings().topup_max_rounds >= 8
+        assert Settings().topup_max_rounds is None or Settings().topup_max_rounds >= 8
 
-    def test_the_cap_still_stops_a_loop_that_keeps_making_progress(self):
+    def test_the_cap_still_stops_a_loop_that_keeps_making_progress_when_explicitly_set(self):
         assert TopupPlanner.plan(_snapshot(round_number=10, max_rounds=10, gained_last_round=50)) is None
+
+    def test_unbounded_replenishment_continues_indefinitely_when_max_rounds_is_none(self):
+        # Demand-driven replenishment: no arbitrary round cap.
+        # Round 500, 1000, etc., must continue while shortfall remains and sources have supply.
+        snap_500 = _snapshot(round_number=500, max_rounds=None, gained_last_round=50)
+        plan_500 = TopupPlanner.plan(snap_500)
+        assert plan_500 is not None
+        assert plan_500.round_number == 501
+        assert plan_500.max_rounds is None
+
+        snap_1000 = _snapshot(round_number=1000, max_rounds=None, gained_last_round=50)
+        plan_1000 = TopupPlanner.plan(snap_1000)
+        assert plan_1000 is not None
+        assert plan_1000.round_number == 1001
+        assert plan_1000.max_rounds is None
 
 
 class TestTinyRoundsNeverEndAJobOneShort:

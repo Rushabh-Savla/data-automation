@@ -122,6 +122,10 @@ def test_1_candidate_window_completion_dispatches_filtering_while_sources_active
 
     dispatched = []
     monkeypatch.setattr(
+        "app.tasks.orchestration_tasks.schedule_eligible_source_tasks.delay",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
         "app.tasks.filtering_tasks.run_relevance_filter.delay",
         lambda j_id: dispatched.append(j_id),
     )
@@ -177,6 +181,10 @@ def test_2_slow_connectors_cannot_block_completed_candidate_batches(db_session, 
     monkeypatch.setattr("app.tasks.orchestration_tasks.session_scope", lambda: _session_context(db_session))
 
     dispatched = []
+    monkeypatch.setattr(
+        "app.tasks.orchestration_tasks.schedule_eligible_source_tasks.delay",
+        lambda *args, **kwargs: None,
+    )
     monkeypatch.setattr(
         "app.tasks.filtering_tasks.run_relevance_filter.delay",
         lambda j_id: dispatched.append(j_id),
@@ -288,6 +296,10 @@ def test_4_watchdog_can_recover_stuck_eligible_batch(db_session, monkeypatch):
     monkeypatch.setattr("app.tasks.orchestration_tasks.session_scope", lambda: _session_context(db_session))
 
     dispatched = []
+    monkeypatch.setattr(
+        "app.tasks.orchestration_tasks.schedule_eligible_source_tasks.delay",
+        lambda *args, **kwargs: None,
+    )
     monkeypatch.setattr(
         "app.tasks.filtering_tasks.run_relevance_filter.delay",
         lambda j_id: dispatched.append(j_id),
@@ -414,7 +426,7 @@ def test_7_nas_upload_starts_only_after_filtering_dedup_and_batch_creation(db_se
 
     uploaded_batches = []
     monkeypatch.setattr("app.storage.nas_writer.enqueue_nas_batch", lambda b_id, j_id, m_path: uploaded_batches.append(b_id))
-    monkeypatch.setattr("app.tasks.nas_tasks.process_nas_upload_queue.delay", lambda: None)
+    monkeypatch.setattr("app.tasks.nas_tasks.process_nas_upload_queue.delay", lambda *a, **k: None)
     monkeypatch.setattr("app.tasks.batch_orchestration.session_scope", lambda: _session_context(db_session))
     monkeypatch.setattr("app.tasks.batch_orchestration.get_redis", lambda: _FakeRedis())
 

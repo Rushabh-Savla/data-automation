@@ -67,7 +67,34 @@ def _should_skip_discovery(task_repo: JobSourceTaskRepository, job_uuid: uuid.UU
     return False
 
 
-def _default_container_limit(target_count: int | None, *, min_n: int = 5, max_n: int = 30, divisor: int = 30) -> int:
+def _dispatch_unconsumed_or_complete(
+    db, task_repo, job_uuid, task_uuid, item_dicts, id_fn, download_task, job_id, job_source_task_id, max_batch=25
+) -> bool:
+    task = task_repo.get(task_uuid)
+    cp = dict(task.checkpoint or {})
+    completed_items = set(cp.get("_completed_items", []))
+    unconsumed = [
+        item for item in item_dicts
+        if id_fn(item) not in completed_items
+    ]
+    if not unconsumed:
+        cp["discovery_exhausted"] = True
+        task_repo.heartbeat(task_uuid, checkpoint=cp)
+        task_repo.set_status(task_uuid, JobSourceTaskStatus.COMPLETED)
+        db.commit()
+        check_and_advance_job(job_id)
+        return False
+
+    task_repo.set_status(task_uuid, JobSourceTaskStatus.DOWNLOADING)
+    db.commit()
+
+    initial_batch = unconsumed[:max_batch]
+    download_group = [download_task.s(job_id, job_source_task_id, item) for item in initial_batch]
+    chord(download_group)(on_source_finished.s(job_id, job_source_task_id))
+    return True
+
+
+def _default_container_limit(target_count: int | None, *, min_n: int = 5, max_n: int = 200, divisor: int = 20) -> int:
     """How many datasets/projects/videos to consider by default, scaled with
     the job's target image count. Each one can yield anywhere from a
     handful to thousands of images downstream, so a flat default (e.g. 5)
@@ -79,7 +106,7 @@ def _default_container_limit(target_count: int | None, *, min_n: int = 5, max_n:
     return min(max_n, max(min_n, (target_count or 100) // divisor))
 
 
-def _default_image_limit(target_count: int | None, *, min_n: int = 20, max_n: int = 5000, multiplier: int = 3) -> int:
+def _default_image_limit(target_count: int | None, *, min_n: int = 20, max_n: int = 50_000, multiplier: int = 4) -> int:
     """How many candidate images to pull by default from a locally-cached,
     fixed-vocabulary dataset (COCO/Open Images/Pascal VOC/Visual Genome/
     DAVIS/SUN RGB-D/nuImages/KITTI) or YouTube, scaled with the job's
@@ -87,17 +114,7 @@ def _default_image_limit(target_count: int | None, *, min_n: int = 20, max_n: in
     (which routinely rejects a majority of candidates) real headroom
     proportional to what was actually asked for -- `min_n` here is only a
     floor against degenerate near-zero targets (target_count 1-6ish),
-    not a substitute for that scaling.
-
-    Previously min_n=200 unconditionally, regardless of target_count: a
-    target of 11-20 still got at least 200 candidates discovered and
-    dispatched for download, most of them guaranteed to be thrown away
-    (observed directly: a target_count=20 YouTube job discovering/
-    dispatching 400 downloads on top of a live queue already contended by
-    other jobs). Worse than wasted local compute for COCO/etc. -- every
-    dispatched item is a real Celery task competing for the same limited
-    worker pool every other job's downloads share, so one oversized small
-    job measurably slows down everything else running at the time."""
+    not a substitute for that scaling."""
     return min(max_n, max(min_n, (target_count or 200) * multiplier))
 
 
@@ -224,8 +241,9 @@ def discover_kaggle(self, job_id: str, job_source_task_id: str):
         task_repo.heartbeat(task_uuid, checkpoint={**(task.checkpoint or {}), "_pending_items": pending})
         db.flush()
 
-    download_group = [download_kaggle_dataset.s(job_id, job_source_task_id, item) for item in item_dicts]
-    chord(download_group)(on_source_finished.s(job_id, job_source_task_id))
+    _dispatch_unconsumed_or_complete(
+        db, task_repo, job_uuid, task_uuid, item_dicts, lambda it: it["external_ref"]["slug"], download_kaggle_dataset, job_id, job_source_task_id
+    )
     unbind_context()
 
 
@@ -321,8 +339,9 @@ def discover_roboflow(self, job_id: str, job_source_task_id: str):
         task_repo.heartbeat(task_uuid, checkpoint={**(task.checkpoint or {}), "_pending_items": pending})
         db.flush()
 
-    download_group = [download_roboflow_item.s(job_id, job_source_task_id, item) for item in item_dicts]
-    chord(download_group)(on_source_finished.s(job_id, job_source_task_id))
+    _dispatch_unconsumed_or_complete(
+        db, task_repo, job_uuid, task_uuid, item_dicts, lambda it: f"{it['external_ref']['workspace']}/{it['external_ref']['project']}", download_roboflow_item, job_id, job_source_task_id
+    )
     unbind_context()
 
 
@@ -382,11 +401,10 @@ def discover_youtube(self, job_id: str, job_source_task_id: str):
             with heartbeat_during(task_uuid):
                 page = connector.discover(
                     job.query, cursor=None,
-                    # Unlike Kaggle/Roboflow "containers" (a handful yield everything
-                    # needed), one video caps out at frames_per_video frames — reaching
-                    # a large target needs many more videos, so this scales like the
-                    # image-scan sources below instead of the tiny container default.
-                    limit=yt_config.get("max_videos", scale_for_topup(_default_image_limit(job.target_count), job, hard_max=50_000)),
+                    # Unlike single images, one video yields multiple frames up to frames_per_video.
+                    # Scaling by container limit keeps the download queue manageable and prevents
+                    # IP rate-limiting from YouTube.
+                    limit=yt_config.get("max_videos", scale_for_topup(_default_container_limit(job.target_count), job, hard_max=200)),
                     api_key=credentials.get("YOUTUBE_API_KEY", ""),
                 )
             discovery_error_reason = page.error_reason
@@ -422,8 +440,6 @@ def discover_youtube(self, job_id: str, job_source_task_id: str):
             unbind_context()
             return
 
-        task_repo.increment_counts(task_uuid, discovered=len(items))
-
         item_dicts = [
             {
                 "external_ref": {"url": it["url"], "video_id": it["video_id"]},
@@ -433,13 +449,26 @@ def discover_youtube(self, job_id: str, job_source_task_id: str):
             for it in items
         ]
 
-        pending = {**(task.checkpoint or {}).get("_pending_items", {})}
-        pending.update({it["video_id"]: item for it, item in zip(items, item_dicts)})
+        existing_pending = (task.checkpoint or {}).get("_pending_items", {})
+        pending = dict(existing_pending)
+        new_items = 0
+        for it, item in zip(items, item_dicts):
+            v_id = it["video_id"]
+            if v_id not in pending:
+                pending[v_id] = item
+                new_items += 1
+
+        if new_items > 0:
+            task_repo.increment_counts(task_uuid, discovered=new_items)
+        elif not existing_pending and items:
+            task_repo.increment_counts(task_uuid, discovered=len(items))
+
         task_repo.heartbeat(task_uuid, checkpoint={**(task.checkpoint or {}), "_pending_items": pending})
         db.flush()
 
-    download_group = [download_youtube_video.s(job_id, job_source_task_id, item) for item in item_dicts]
-    chord(download_group)(on_source_finished.s(job_id, job_source_task_id))
+    _dispatch_unconsumed_or_complete(
+        db, task_repo, job_uuid, task_uuid, item_dicts, lambda it: it["external_ref"].get("video_id") or it["external_ref"].get("url"), download_youtube_video, job_id, job_source_task_id
+    )
     unbind_context()
 
 
@@ -557,11 +586,11 @@ def discover_web(self, job_id: str, job_source_task_id: str):
             task_repo.increment_counts(task_uuid, discovered=total_urls)
 
         task_repo.heartbeat(task_uuid, checkpoint={**(task.checkpoint or {}), "_pending_items": pending})
-        task_repo.set_status(task_uuid, JobSourceTaskStatus.DOWNLOADING)
-        db.commit()
+        db.flush()
 
-    download_group = [download_web_batch.s(job_id, job_source_task_id, item) for item in item_dicts]
-    chord(download_group)(on_source_finished.s(job_id, job_source_task_id))
+    _dispatch_unconsumed_or_complete(
+        db, task_repo, job_uuid, task_uuid, item_dicts, lambda it: hashlib.md5(",".join(it["external_ref"]["urls"]).encode()).hexdigest()[:12], download_web_batch, job_id, job_source_task_id, max_batch=50
+    )
     unbind_context()
 
 
@@ -642,20 +671,36 @@ def discover_coco(self, job_id: str, job_source_task_id: str):
             return
 
         total_images = sum(len(s.external_ref["image_ids"]) for s in shards)
-        task_repo.increment_counts(task_uuid, discovered=total_images)
+
+        item_dicts = [
+            {
+                "external_ref": {**s.external_ref},
+                "license_hint": None,
+                "dataset_identifier": s.dataset_identifier,
+            }
+            for s in shards
+        ]
+
+        existing_pending = (task.checkpoint or {}).get("_pending_items", {})
+        pending = dict(existing_pending)
+        new_images = 0
+        for item in item_dicts:
+            shard_id = hashlib.md5(str(item["external_ref"]["image_ids"]).encode()).hexdigest()[:12]
+            if shard_id not in pending:
+                pending[shard_id] = item
+                new_images += len(item["external_ref"]["image_ids"])
+
+        if new_images > 0:
+            task_repo.increment_counts(task_uuid, discovered=new_images)
+        elif not existing_pending and total_images > 0:
+            task_repo.increment_counts(task_uuid, discovered=total_images)
+
+        task_repo.heartbeat(task_uuid, checkpoint={**(task.checkpoint or {}), "_pending_items": pending})
         db.flush()
 
-    item_dicts = [
-        {
-            "external_ref": {**s.external_ref},
-            "license_hint": None,
-            "dataset_identifier": s.dataset_identifier,
-        }
-        for s in shards
-    ]
-
-    download_group = [download_coco_shard.s(job_id, job_source_task_id, item) for item in item_dicts]
-    chord(download_group)(on_source_finished.s(job_id, job_source_task_id))
+    _dispatch_unconsumed_or_complete(
+        db, task_repo, job_uuid, task_uuid, item_dicts, lambda it: hashlib.md5(str(it["external_ref"]["image_ids"]).encode()).hexdigest()[:12], download_coco_shard, job_id, job_source_task_id
+    )
     unbind_context()
 
 
@@ -720,20 +765,36 @@ def discover_open_images(self, job_id: str, job_source_task_id: str):
             return
 
         total_images = sum(len(s.external_ref["image_ids"]) for s in shards)
-        task_repo.increment_counts(task_uuid, discovered=total_images)
+
+        item_dicts = [
+            {
+                "external_ref": s.external_ref,
+                "license_hint": s.license_hint,
+                "dataset_identifier": s.dataset_identifier,
+            }
+            for s in shards
+        ]
+
+        existing_pending = (task.checkpoint or {}).get("_pending_items", {})
+        pending = dict(existing_pending)
+        new_images = 0
+        for item in item_dicts:
+            shard_id = hashlib.md5(str(item["external_ref"]["image_ids"]).encode()).hexdigest()[:12]
+            if shard_id not in pending:
+                pending[shard_id] = item
+                new_images += len(item["external_ref"]["image_ids"])
+
+        if new_images > 0:
+            task_repo.increment_counts(task_uuid, discovered=new_images)
+        elif not existing_pending and total_images > 0:
+            task_repo.increment_counts(task_uuid, discovered=total_images)
+
+        task_repo.heartbeat(task_uuid, checkpoint={**(task.checkpoint or {}), "_pending_items": pending})
         db.flush()
 
-    item_dicts = [
-        {
-            "external_ref": s.external_ref,
-            "license_hint": s.license_hint,
-            "dataset_identifier": s.dataset_identifier,
-        }
-        for s in shards
-    ]
-
-    download_group = [download_open_images_shard.s(job_id, job_source_task_id, item) for item in item_dicts]
-    chord(download_group)(on_source_finished.s(job_id, job_source_task_id))
+    _dispatch_unconsumed_or_complete(
+        db, task_repo, job_uuid, task_uuid, item_dicts, lambda it: hashlib.md5(str(it["external_ref"]["image_ids"]).encode()).hexdigest()[:12], download_open_images_shard, job_id, job_source_task_id
+    )
     unbind_context()
 
 
@@ -798,20 +859,36 @@ def discover_pascal_voc(self, job_id: str, job_source_task_id: str):
             return
 
         total_images = sum(len(s.external_ref["image_ids"]) for s in shards)
-        task_repo.increment_counts(task_uuid, discovered=total_images)
+
+        item_dicts = [
+            {
+                "external_ref": {**s.external_ref},
+                "license_hint": s.license_hint,
+                "dataset_identifier": s.dataset_identifier,
+            }
+            for s in shards
+        ]
+
+        existing_pending = (task.checkpoint or {}).get("_pending_items", {})
+        pending = dict(existing_pending)
+        new_images = 0
+        for item in item_dicts:
+            shard_id = hashlib.md5(str(item["external_ref"]["image_ids"]).encode()).hexdigest()[:12]
+            if shard_id not in pending:
+                pending[shard_id] = item
+                new_images += len(item["external_ref"]["image_ids"])
+
+        if new_images > 0:
+            task_repo.increment_counts(task_uuid, discovered=new_images)
+        elif not existing_pending and total_images > 0:
+            task_repo.increment_counts(task_uuid, discovered=total_images)
+
+        task_repo.heartbeat(task_uuid, checkpoint={**(task.checkpoint or {}), "_pending_items": pending})
         db.flush()
 
-    item_dicts = [
-        {
-            "external_ref": {**s.external_ref},
-            "license_hint": s.license_hint,
-            "dataset_identifier": s.dataset_identifier,
-        }
-        for s in shards
-    ]
-
-    download_group = [download_pascal_voc_shard.s(job_id, job_source_task_id, item) for item in item_dicts]
-    chord(download_group)(on_source_finished.s(job_id, job_source_task_id))
+    _dispatch_unconsumed_or_complete(
+        db, task_repo, job_uuid, task_uuid, item_dicts, lambda it: hashlib.md5(str(it["external_ref"]["image_ids"]).encode()).hexdigest()[:12], download_pascal_voc_shard, job_id, job_source_task_id
+    )
     unbind_context()
 
 
@@ -876,20 +953,36 @@ def discover_visual_genome(self, job_id: str, job_source_task_id: str):
             return
 
         total_images = sum(len(s.external_ref["image_ids"]) for s in shards)
-        task_repo.increment_counts(task_uuid, discovered=total_images)
+
+        item_dicts = [
+            {
+                "external_ref": s.external_ref,
+                "license_hint": s.license_hint,
+                "dataset_identifier": s.dataset_identifier,
+            }
+            for s in shards
+        ]
+
+        existing_pending = (task.checkpoint or {}).get("_pending_items", {})
+        pending = dict(existing_pending)
+        new_images = 0
+        for item in item_dicts:
+            shard_id = hashlib.md5(str(item["external_ref"]["image_ids"]).encode()).hexdigest()[:12]
+            if shard_id not in pending:
+                pending[shard_id] = item
+                new_images += len(item["external_ref"]["image_ids"])
+
+        if new_images > 0:
+            task_repo.increment_counts(task_uuid, discovered=new_images)
+        elif not existing_pending and total_images > 0:
+            task_repo.increment_counts(task_uuid, discovered=total_images)
+
+        task_repo.heartbeat(task_uuid, checkpoint={**(task.checkpoint or {}), "_pending_items": pending})
         db.flush()
 
-    item_dicts = [
-        {
-            "external_ref": s.external_ref,
-            "license_hint": s.license_hint,
-            "dataset_identifier": s.dataset_identifier,
-        }
-        for s in shards
-    ]
-
-    download_group = [download_visual_genome_shard.s(job_id, job_source_task_id, item) for item in item_dicts]
-    chord(download_group)(on_source_finished.s(job_id, job_source_task_id))
+    _dispatch_unconsumed_or_complete(
+        db, task_repo, job_uuid, task_uuid, item_dicts, lambda it: hashlib.md5(str(it["external_ref"]["image_ids"]).encode()).hexdigest()[:12], download_visual_genome_shard, job_id, job_source_task_id
+    )
     unbind_context()
 
 
@@ -954,20 +1047,36 @@ def discover_davis(self, job_id: str, job_source_task_id: str):
             return
 
         total_frames = sum(len(s.external_ref["frames"]) for s in shards)
-        task_repo.increment_counts(task_uuid, discovered=total_frames)
+
+        item_dicts = [
+            {
+                "external_ref": {**s.external_ref},
+                "license_hint": s.license_hint,
+                "dataset_identifier": s.dataset_identifier,
+            }
+            for s in shards
+        ]
+
+        existing_pending = (task.checkpoint or {}).get("_pending_items", {})
+        pending = dict(existing_pending)
+        new_frames = 0
+        for item in item_dicts:
+            shard_id = hashlib.md5(str(item["external_ref"]["frames"]).encode()).hexdigest()[:12]
+            if shard_id not in pending:
+                pending[shard_id] = item
+                new_frames += len(item["external_ref"]["frames"])
+
+        if new_frames > 0:
+            task_repo.increment_counts(task_uuid, discovered=new_frames)
+        elif not existing_pending and total_frames > 0:
+            task_repo.increment_counts(task_uuid, discovered=total_frames)
+
+        task_repo.heartbeat(task_uuid, checkpoint={**(task.checkpoint or {}), "_pending_items": pending})
         db.flush()
 
-    item_dicts = [
-        {
-            "external_ref": {**s.external_ref},
-            "license_hint": s.license_hint,
-            "dataset_identifier": s.dataset_identifier,
-        }
-        for s in shards
-    ]
-
-    download_group = [download_davis_shard.s(job_id, job_source_task_id, item) for item in item_dicts]
-    chord(download_group)(on_source_finished.s(job_id, job_source_task_id))
+    _dispatch_unconsumed_or_complete(
+        db, task_repo, job_uuid, task_uuid, item_dicts, lambda it: hashlib.md5(str(it["external_ref"]["frames"]).encode()).hexdigest()[:12], download_davis_shard, job_id, job_source_task_id
+    )
     unbind_context()
 
 
@@ -1041,20 +1150,36 @@ def discover_sun_rgbd(self, job_id: str, job_source_task_id: str):
             return
 
         total_images = sum(len(s.external_ref["record_indices"]) for s in shards)
-        task_repo.increment_counts(task_uuid, discovered=total_images)
+
+        item_dicts = [
+            {
+                "external_ref": {**s.external_ref},
+                "license_hint": s.license_hint,
+                "dataset_identifier": s.dataset_identifier,
+            }
+            for s in shards
+        ]
+
+        existing_pending = (task.checkpoint or {}).get("_pending_items", {})
+        pending = dict(existing_pending)
+        new_images = 0
+        for item in item_dicts:
+            shard_id = hashlib.md5(str(item["external_ref"]["record_indices"]).encode()).hexdigest()[:12]
+            if shard_id not in pending:
+                pending[shard_id] = item
+                new_images += len(item["external_ref"]["record_indices"])
+
+        if new_images > 0:
+            task_repo.increment_counts(task_uuid, discovered=new_images)
+        elif not existing_pending and total_images > 0:
+            task_repo.increment_counts(task_uuid, discovered=total_images)
+
+        task_repo.heartbeat(task_uuid, checkpoint={**(task.checkpoint or {}), "_pending_items": pending})
         db.flush()
 
-    item_dicts = [
-        {
-            "external_ref": {**s.external_ref},
-            "license_hint": s.license_hint,
-            "dataset_identifier": s.dataset_identifier,
-        }
-        for s in shards
-    ]
-
-    download_group = [download_sun_rgbd_shard.s(job_id, job_source_task_id, item) for item in item_dicts]
-    chord(download_group)(on_source_finished.s(job_id, job_source_task_id))
+    _dispatch_unconsumed_or_complete(
+        db, task_repo, job_uuid, task_uuid, item_dicts, lambda it: hashlib.md5(str(it["external_ref"]["record_indices"]).encode()).hexdigest()[:12], download_sun_rgbd_shard, job_id, job_source_task_id
+    )
     unbind_context()
 
 
@@ -1120,20 +1245,36 @@ def discover_nuscenes(self, job_id: str, job_source_task_id: str):
             return
 
         total_samples = sum(len(s.external_ref["sample_data_tokens"]) for s in shards)
-        task_repo.increment_counts(task_uuid, discovered=total_samples)
+
+        item_dicts = [
+            {
+                "external_ref": {**s.external_ref},
+                "license_hint": s.license_hint,
+                "dataset_identifier": s.dataset_identifier,
+            }
+            for s in shards
+        ]
+
+        existing_pending = (task.checkpoint or {}).get("_pending_items", {})
+        pending = dict(existing_pending)
+        new_samples = 0
+        for item in item_dicts:
+            shard_id = hashlib.md5(str(item["external_ref"]["sample_data_tokens"]).encode()).hexdigest()[:12]
+            if shard_id not in pending:
+                pending[shard_id] = item
+                new_samples += len(item["external_ref"]["sample_data_tokens"])
+
+        if new_samples > 0:
+            task_repo.increment_counts(task_uuid, discovered=new_samples)
+        elif not existing_pending and total_samples > 0:
+            task_repo.increment_counts(task_uuid, discovered=total_samples)
+
+        task_repo.heartbeat(task_uuid, checkpoint={**(task.checkpoint or {}), "_pending_items": pending})
         db.flush()
 
-    item_dicts = [
-        {
-            "external_ref": {**s.external_ref},
-            "license_hint": s.license_hint,
-            "dataset_identifier": s.dataset_identifier,
-        }
-        for s in shards
-    ]
-
-    download_group = [download_nuscenes_shard.s(job_id, job_source_task_id, item) for item in item_dicts]
-    chord(download_group)(on_source_finished.s(job_id, job_source_task_id))
+    _dispatch_unconsumed_or_complete(
+        db, task_repo, job_uuid, task_uuid, item_dicts, lambda it: hashlib.md5(str(it["external_ref"]["sample_data_tokens"]).encode()).hexdigest()[:12], download_nuscenes_shard, job_id, job_source_task_id
+    )
     unbind_context()
 
 
@@ -1198,20 +1339,36 @@ def discover_kitti(self, job_id: str, job_source_task_id: str):
             return
 
         total_images = sum(len(s.external_ref["image_ids"]) for s in shards)
-        task_repo.increment_counts(task_uuid, discovered=total_images)
+
+        item_dicts = [
+            {
+                "external_ref": {**s.external_ref},
+                "license_hint": s.license_hint,
+                "dataset_identifier": s.dataset_identifier,
+            }
+            for s in shards
+        ]
+
+        existing_pending = (task.checkpoint or {}).get("_pending_items", {})
+        pending = dict(existing_pending)
+        new_images = 0
+        for item in item_dicts:
+            shard_id = hashlib.md5(str(item["external_ref"]["image_ids"]).encode()).hexdigest()[:12]
+            if shard_id not in pending:
+                pending[shard_id] = item
+                new_images += len(item["external_ref"]["image_ids"])
+
+        if new_images > 0:
+            task_repo.increment_counts(task_uuid, discovered=new_images)
+        elif not existing_pending and total_images > 0:
+            task_repo.increment_counts(task_uuid, discovered=total_images)
+
+        task_repo.heartbeat(task_uuid, checkpoint={**(task.checkpoint or {}), "_pending_items": pending})
         db.flush()
 
-    item_dicts = [
-        {
-            "external_ref": {**s.external_ref},
-            "license_hint": s.license_hint,
-            "dataset_identifier": s.dataset_identifier,
-        }
-        for s in shards
-    ]
-
-    download_group = [download_kitti_shard.s(job_id, job_source_task_id, item) for item in item_dicts]
-    chord(download_group)(on_source_finished.s(job_id, job_source_task_id))
+    _dispatch_unconsumed_or_complete(
+        db, task_repo, job_uuid, task_uuid, item_dicts, lambda it: hashlib.md5(str(it["external_ref"]["image_ids"]).encode()).hexdigest()[:12], download_kitti_shard, job_id, job_source_task_id
+    )
     unbind_context()
 
 
@@ -1292,19 +1449,36 @@ def discover_nas_share(self, job_id: str, job_source_task_id: str):
             return
 
         total_images = sum(len(s.external_ref["paths"]) for s in shards)
-        task_repo.increment_counts(task_uuid, discovered=total_images)
-        db.flush()
 
-    item_dicts = [
-        {
-            "external_ref": {**s.external_ref},
-            "license_hint": s.license_hint,
-            "dataset_identifier": s.dataset_identifier,
-        }
-        for s in shards
-    ]
+        item_dicts = [
+            {
+                "external_ref": {**s.external_ref},
+                "license_hint": s.license_hint,
+                "dataset_identifier": s.dataset_identifier,
+            }
+            for s in shards
+        ]
 
-    download_group = [download_nas_share_shard.s(job_id, job_source_task_id, item) for item in item_dicts]
+        existing_pending = (task.checkpoint or {}).get("_pending_items", {})
+        pending = dict(existing_pending)
+        new_images = 0
+        for item in item_dicts:
+            shard_id = hashlib.md5(str(item["external_ref"]["paths"]).encode()).hexdigest()[:12]
+            if shard_id not in pending:
+                pending[shard_id] = item
+                new_images += len(item["external_ref"]["paths"])
+
+        if new_images > 0:
+            task_repo.increment_counts(task_uuid, discovered=new_images)
+        elif not existing_pending and total_images > 0:
+            task_repo.increment_counts(task_uuid, discovered=total_images)
+
+        task_repo.heartbeat(task_uuid, checkpoint={**(task.checkpoint or {}), "_pending_items": pending})
+        task_repo.set_status(task_uuid, JobSourceTaskStatus.DOWNLOADING)
+        db.commit()
+
+    initial_batch = item_dicts[:25]
+    download_group = [download_nas_share_shard.s(job_id, job_source_task_id, item) for item in initial_batch]
     chord(download_group)(on_source_finished.s(job_id, job_source_task_id))
     unbind_context()
 

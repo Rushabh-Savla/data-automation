@@ -47,6 +47,7 @@ _LEGAL_BATCH_TRANSITIONS: dict[BatchStatus, set[BatchStatus]] = {
         BatchStatus.FAILED,
     },
     BatchStatus.PROCESSING: {
+        BatchStatus.DOWNLOADING,
         BatchStatus.FILTERING,
         BatchStatus.REPLENISHING,
         BatchStatus.FILLING_SHORTFALL,

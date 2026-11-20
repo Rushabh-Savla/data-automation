@@ -42,7 +42,7 @@ logger = logging.getLogger(__name__)
 
 _IMAGES_URL = "https://s3.eu-central-1.amazonaws.com/avg-kitti/data_object_image_2.zip"
 _LABELS_URL = "https://s3.eu-central-1.amazonaws.com/avg-kitti/data_object_label_2.zip"
-_SHARD_SIZE = 20
+_SHARD_SIZE = 50
 _LICENSE_NOTE = "KITTI Vision Benchmark Suite (CC BY-NC-SA 3.0 — academic/non-commercial use only)"
 # KITTI's fixed object-type vocabulary; "DontCare" is a non-object filler
 # annotation, deliberately excluded.
@@ -69,14 +69,21 @@ def _download_and_extract(url: str, cache_dir: Path, marker_dir: Path) -> None:
         zf.extractall(cache_dir)
 
 
+def _ensure_labels_cached() -> Path:
+    cache_dir = _cache_dir()
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    _download_and_extract(_LABELS_URL, cache_dir, cache_dir / "training" / "label_2")
+    return cache_dir
+
+
 def _ensure_dataset_cached() -> Path:
     """Downloads+extracts KITTI's 2D object-detection images (~12GB) and
     labels (~5MB) archives once, returning the cache root (containing
     training/image_2/ and training/label_2/)."""
     cache_dir = _cache_dir()
     cache_dir.mkdir(parents=True, exist_ok=True)
-    _download_and_extract(_IMAGES_URL, cache_dir, cache_dir / "training" / "image_2")
     _download_and_extract(_LABELS_URL, cache_dir, cache_dir / "training" / "label_2")
+    _download_and_extract(_IMAGES_URL, cache_dir, cache_dir / "training" / "image_2")
     return cache_dir
 
 
@@ -129,7 +136,7 @@ class KittiConnector:
         self, query: str, cursor: str | None, limit: int = 200, explicit_categories: list[str] | None = None
     ) -> DiscoveryPage:
         try:
-            cache_dir = _ensure_dataset_cached()
+            cache_dir = _ensure_labels_cached()
             class_index = _ensure_class_index_cached(cache_dir)
         except FatalConnectorError as e:
             return DiscoveryPage(items=[], next_cursor=None, exhausted=True, error_reason=str(e))
@@ -154,13 +161,14 @@ class KittiConnector:
         labelled = sorted({iid for cls in matched for iid in class_index.get(cls, [])})
         image_ids = labelled[:limit]
 
-        # KITTI is 8 driving-scene classes. When they cannot fill the limit -- or none names
-        # this query -- fill the rest from every other image and let the relevance filter
-        # decide (open_vocab.py). Not for explicit class overrides, which are exact.
+        # KITTI is 8 driving-scene classes. When no categories match this query,
+        # fill from every other image and let the relevance filter decide (open_vocab.py).
+        # When a category matches (or for explicit category overrides), stay exact and do not pad
+        # results using unrelated objects.
         scan_ids: list = []
-        if not explicit_categories and len(labelled) < limit:
+        if not explicit_categories and not matched:
             universe = {iid for ids in class_index.values() for iid in ids}
-            scan_ids = scan_candidates(universe, set(labelled), limit - len(labelled))
+            scan_ids = scan_candidates(universe, set(labelled), limit)
 
         if not image_ids and not scan_ids:
             return DiscoveryPage(items=[], next_cursor=None, exhausted=True)
@@ -186,6 +194,7 @@ class KittiConnector:
         checkpoint: dict,
         should_stop: ShouldStopFn,
         on_progress: OnProgressFn,
+        admit_candidate=None,
     ) -> Iterator[RawAssetDraft]:
         import shutil
 
@@ -208,9 +217,33 @@ class KittiConnector:
                 on_progress({"checkpoint": {"index": i}})
                 raise JobStopped("should_stop() signalled during KITTI shard walk")
 
+            source_item_id = f"kitti_{image_id}"
+            admission = None
+            if admit_candidate is not None:
+                admission = admit_candidate(source_item_id)
+                raw_status = getattr(admission, "status", "")
+                status = str(getattr(raw_status, "value", raw_status)).upper()
+                if status == "DUPLICATE":
+                    on_progress({"checkpoint": {"index": i + 1}})
+                    continue
+                if status == "WINDOW_FULL":
+                    on_progress({"checkpoint": {"index": i}})
+                    raise CandidateWindowFull(
+                        getattr(admission, "window_id", None),
+                        getattr(admission, "window_index", None),
+                        i,
+                    )
+                if status == "INACTIVE":
+                    raise JobStopped(f"Candidate admission closed for {source_item_id}")
+                if status != "ADMITTED":
+                    continue
+
             src_img = cache_dir / "training" / "image_2" / f"{image_id}.png"
             src_label = cache_dir / "training" / "label_2" / f"{image_id}.txt"
             if not src_img.exists() or not src_label.exists():
+                if admission is not None and getattr(admission, "reservation_id", None):
+                    from app.services.candidate_reservation_service import mark_candidate_failed
+                    mark_candidate_failed(admission.reservation_id)
                 on_progress({"rejected": 1})
                 continue
 
@@ -222,10 +255,16 @@ class KittiConnector:
                 with Image.open(dest) as img:
                     w, h = img.size
                 if w < self.min_w or h < self.min_h:
+                    if admission is not None and getattr(admission, "reservation_id", None):
+                        from app.services.candidate_reservation_service import mark_candidate_failed
+                        mark_candidate_failed(admission.reservation_id)
                     on_progress({"rejected": 1})
                     continue
             except Exception as e:
                 logger.warning(f"KITTI image {image_id} copy/validate failed: {e}")
+                if admission is not None and getattr(admission, "reservation_id", None):
+                    from app.services.candidate_reservation_service import mark_candidate_failed
+                    mark_candidate_failed(admission.reservation_id)
                 on_progress({"rejected": 1})
                 continue
 
@@ -240,7 +279,7 @@ class KittiConnector:
                 annotation_format = "yolo_txt"
 
             draft = RawAssetDraft(
-                source_item_id=f"kitti_{image_id}",
+                source_item_id=source_item_id,
                 source_url=None,
                 dataset_identifier=item.dataset_identifier,
                 license=item.license_hint,
@@ -255,6 +294,7 @@ class KittiConnector:
                     "kitti_image_id": image_id,
                     # "vlm": picked by the relevance model among images not labelled for this query.
                     "matched_by": "vlm" if item.external_ref.get("unlabelled") else "label",
+                    "candidate_reservation_id": getattr(admission, "reservation_id", None) if admission else None,
                 },
             )
             on_progress({"checkpoint": {"index": i + 1}, "downloaded": 1})

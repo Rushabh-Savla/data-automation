@@ -614,7 +614,7 @@ class TestReconcileNasTransfers:
         monkeypatch.setattr("app.db.repositories.image_batch_repository.NasTransferBatchRepository", lambda db: mock_repo)
 
         dispatched = []
-        monkeypatch.setattr(nt.process_nas_upload_queue, "delay", lambda: dispatched.append(True))
+        monkeypatch.setattr(nt.process_nas_upload_queue, "delay", lambda *a, **kw: dispatched.append(True))
 
         res = nt.reconcile_nas_transfers.run()
         assert res == {"status": "dispatched", "actionable_count": 1, "cleaned_count": 0}

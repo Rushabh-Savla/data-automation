@@ -38,6 +38,7 @@ from app.db.models.image_batch import ImageBatch, NasTransferBatch
 from app.db.models.candidate_window import CandidateWindow
 from app.db.models.job import Job
 from app.db.repositories.asset_repository import AssetRepository
+from app.db.repositories.job_repository import JobRepository
 from app.db.repositories.image_batch_repository import ImageBatchRepository, NasTransferBatchRepository
 from app.db.session import session_scope
 from app.domain.enums import AssetStatus, BatchStatus, TransferStatus
@@ -56,7 +57,7 @@ _REDIS_COOLDOWN_KEY = "nas_offload:cooldown"
 DEFAULT_LOCK_TTL_S = 180  # 3 minutes default lease
 
 _LUA_ACQUIRE = """
-if redis.call('set', KEYS[1], ARGV[1], 'NX', 'EX', ARGV[2]) then
+if redis.call('set', KEYS[1], ARGV[1], 'NX', 'PX', ARGV[2]) then
     return 1
 else
     return 0
@@ -73,7 +74,7 @@ end
 
 _LUA_EXTEND = """
 if redis.call('get', KEYS[1]) == ARGV[1] then
-    return redis.call('expire', KEYS[1], ARGV[2])
+    return redis.call('pexpire', KEYS[1], ARGV[2])
 else
     return 0
 end
@@ -135,7 +136,8 @@ class NasWriterLock:
             r = self._get_redis_safe()
             if r is not None:
                 try:
-                    res = r.eval(_LUA_ACQUIRE, 1, _REDIS_NAS_LOCK_KEY, self.owner_token, self.ttl_s)
+                    ttl_ms = max(1, int(float(self.ttl_s) * 1000))
+                    res = r.eval(_LUA_ACQUIRE, 1, _REDIS_NAS_LOCK_KEY, self.owner_token, ttl_ms)
                     if bool(res == 1):
                         self.acquired = True
                         self._lock_lost = False
@@ -207,7 +209,8 @@ class NasWriterLock:
         r = self._get_redis_safe()
         if r is not None:
             try:
-                res = r.eval(_LUA_EXTEND, 1, _REDIS_NAS_LOCK_KEY, self.owner_token, ttl)
+                ttl_ms = max(1, int(float(ttl) * 1000))
+                res = r.eval(_LUA_EXTEND, 1, _REDIS_NAS_LOCK_KEY, self.owner_token, ttl_ms)
                 if bool(res == 1):
                     return True
                 else:
@@ -331,13 +334,20 @@ def enqueue_nas_batch(
     job_id: uuid.UUID,
     manifest_path: Path | str | None = None,
     remote_dest: str | None = None,
-) -> uuid.UUID:
+    db: Session | None = None,
+) -> uuid.UUID | None:
     """Enqueues an accepted batch into the centralized NAS upload queue and DB."""
-    with session_scope() as db:
-        transfer_repo = NasTransferBatchRepository(db)
+    def _execute(session: Session) -> uuid.UUID | None:
+        transfer_repo = NasTransferBatchRepository(session)
         from app.domain.nas_resolver import resolve_job_nas_destination
-        job = db.execute(select(Job).where(Job.id == job_id)).scalar_one_or_none()
-        remote_dest = resolve_job_nas_destination(job, default_storage=remote_dest)
+        from app.db.models.image_batch import ImageBatch
+        job = session.execute(select(Job).where(Job.id == job_id)).scalar_one_or_none()
+        dest = resolve_job_nas_destination(job, default_storage=remote_dest)
+        if not dest:
+            logger.info(f"[NAS QUEUE] Job {job_id} has no NAS storage destination configured. Keeping batch {batch_id} in local storage.")
+            return None
+
+        batch = session.execute(select(ImageBatch).where(ImageBatch.id == batch_id)).scalar_one_or_none()
 
         manifest_file = Path(manifest_path) if manifest_path else None
         total_files = 0
@@ -351,14 +361,53 @@ def enqueue_nas_batch(
             except Exception as e:
                 logger.warning(f"Could not parse manifest {manifest_file}: {e}")
 
+        # Flexible Batch Delivery Guard:
+        # Never upload an empty batch/manifest
+        if manifest_path is not None and total_files <= 0:
+            logger.warning(
+                f"[NAS QUEUE] Refusing to enqueue empty batch {batch_id}: manifest has {total_files} items."
+            )
+            return None
+
+        # Verify batch is finalized and not still in active candidate acquisition
+        if batch and batch.status in (BatchStatus.DISCOVERING, BatchStatus.DOWNLOADING, BatchStatus.PROCESSING):
+            logger.warning(
+                f"[NAS QUEUE] Refusing to enqueue unfinalized batch {batch_id} in status '{batch.status.value}'."
+            )
+            return None
+
+        # Verify manifest items match batch accepted count
+        if batch and batch.accepted_image_count is not None and batch.accepted_image_count > 0:
+            if total_files != batch.accepted_image_count:
+                logger.warning(
+                    f"[NAS QUEUE] Manifest items ({total_files}) != batch accepted count ({batch.accepted_image_count}) for batch {batch_id}. "
+                    "Reconciling before enqueue."
+                )
+                batch.accepted_image_count = total_files
+                session.flush()
+
+        logger.info(
+            f"[NAS QUEUE] Enqueueing finalized batch {batch_id}: "
+            f"{total_files} accepted assets (target max: {batch.target_image_count if batch else 'unknown'}) for NAS upload."
+        )
+
         transfer = transfer_repo.get_or_create_for_batch(
             batch_id=batch_id,
             job_id=job_id,
-            remote_path=remote_dest,
+            remote_path=dest,
             total_files=total_files,
             asset_ids=asset_ids,
         )
-        transfer_id = transfer.id
+        return transfer.id
+
+    if db is not None:
+        transfer_id = _execute(db)
+    else:
+        with session_scope() as session:
+            transfer_id = _execute(session)
+
+    if transfer_id is None:
+        return None
 
     r = _get_redis()
     if r is not None:
@@ -491,6 +540,14 @@ def enqueue_nas_window(
                     f"{asset.status}"
                 )
 
+        if not remote_dest:
+            logger.info(f"[NAS QUEUE] Job {job_id} has no NAS storage destination configured. Window {window_id} assets stay in local storage.")
+            for asset in assets:
+                if asset.status == AssetStatus.RELEVANCE_PASSED:
+                    asset.status = AssetStatus.COMPLETED
+            db.commit()
+            return None
+
         repo = NasTransferBatchRepository(db)
         transfer = repo.get_or_create_for_window(
             window_id=window_id,
@@ -563,10 +620,24 @@ def compute_file_sha256(path: Path) -> str:
 def _remote_rel_for(storage_path: str, local_file: Path, job_folder: str | None = None) -> str:
     """Constructs deterministic remote POSIX path mirroring local layout."""
     settings = get_settings()
+    resolved = local_file.resolve()
+    rel = None
     try:
-        rel = local_file.resolve().relative_to(settings.nas_root.resolve()).as_posix()
+        rel = resolved.relative_to(settings.nas_root.resolve()).as_posix()
     except ValueError:
-        rel = "/".join(local_file.parts[-4:])
+        pass
+    if rel is None:
+        try:
+            rel = resolved.relative_to(settings.local_staging_path.resolve()).as_posix()
+        except ValueError:
+            pass
+    if rel is None:
+        parts = local_file.parts
+        job_indices = [i for i, p in enumerate(parts) if p.startswith("job_")]
+        if job_indices:
+            rel = "/".join(parts[job_indices[-1]:])
+        else:
+            rel = "/".join(parts[-4:])
     if job_folder is not None:
         _job_id_segment, _, remainder = rel.partition("/")
         if remainder:
@@ -621,6 +692,7 @@ class NasBatchWriter:
         self.transfer_repo = NasTransferBatchRepository(db)
         self.batch_repo = ImageBatchRepository(db)
         self.asset_repo = AssetRepository(db)
+        self.job_repo = JobRepository(db)
         self.staging_manager = LocalStagingManager()
         self._dir_cache: set[str] = set()
 
@@ -652,8 +724,13 @@ class NasBatchWriter:
         from app.domain.nas_resolver import resolve_job_nas_destination
         effective_storage_path = resolve_job_nas_destination(
             job,
-            default_storage=transfer.remote_path or (self.params.storage_path if self.params else None),
+            default_storage=transfer.remote_path,
         )
+
+        if not effective_storage_path:
+            logger.info(f"[NAS WRITER] Transfer {transfer_id} has no NAS destination. Marking completed (stored locally).")
+            self.transfer_repo.mark_completed(transfer_id)
+            return {"status": "skipped", "reason": "no_nas_destination"}
 
         # Handle durable transfer recovery before reading a staging manifest.
         if transfer.transfer_status == TransferStatus.COMPLETED:
@@ -666,6 +743,30 @@ class NasBatchWriter:
             }
 
         if transfer.transfer_status == TransferStatus.VERIFIED:
+            # If the worker crashed before updating asset statuses to NAS_VERIFIED,
+            # update the assets belonging to this verified transfer.
+            m_path = (
+                Path(batch.manifest_path)
+                if batch.manifest_path and Path(batch.manifest_path).exists()
+                else self.staging_manager.get_batch_staging_dir(transfer.job_id, batch.batch_index) / "manifest.json"
+            )
+            if m_path.exists():
+                try:
+                    mdata = json.loads(m_path.read_text())
+                    for it in mdata.get("items", []):
+                        aid = it.get("asset_id")
+                        if aid:
+                            a = self.asset_repo.get(uuid.UUID(aid))
+                            if a and a.status in (
+                                AssetStatus.RELEVANCE_PASSED,
+                                AssetStatus.READY_FOR_UPLOAD,
+                                AssetStatus.UPLOADING,
+                            ):
+                                a.status = AssetStatus.NAS_VERIFIED
+                    self.db.commit()
+                except Exception as e:
+                    logger.warning(f"[NAS WRITER] Could not parse manifest on verified recovery: {e}")
+
             return self._finalize_verified_transfer(
                 transfer_id,
                 batch,
@@ -726,26 +827,6 @@ class NasBatchWriter:
 
         items = manifest_data.get("items", [])
         total_files = len(items)
-
-        # Idempotency check: if transfer was ALREADY completed, return immediately without re-processing
-        if transfer.transfer_status == TransferStatus.COMPLETED:
-            logger.info(f"[NAS WRITER] Transfer {transfer_id} is already COMPLETED. Returning immediately.")
-            return {
-                "status": "completed",
-                "batch_id": str(batch.id),
-                "uploaded_files": transfer.uploaded_files,
-                "failed_files": transfer.failed_files,
-                "bytes_transferred": transfer.bytes_transferred,
-            }
-
-        # Crash recovery check: if transfer was ALREADY verified on NAS before worker crashed,
-        # do not re-upload files; proceed directly to completion and local staging cleanup!
-        if transfer.transfer_status == TransferStatus.VERIFIED:
-            logger.info(
-                f"[NAS WRITER] Transfer {transfer_id} is already VERIFIED on NAS. "
-                "Bypassing upload loop; proceeding to completion and staging cleanup."
-            )
-            return self._finalize_verified_transfer(transfer_id, batch, len(items), transfer.bytes_transferred)
 
         owner_token = getattr(self.lock, "owner_token", None) if self.lock else None
         self.transfer_repo.mark_uploading(transfer_id, owner_token=owner_token)
@@ -810,6 +891,7 @@ class NasBatchWriter:
         uploaded_count = 0
         total_bytes = 0
         failed_count = 0
+        skipped_trimmed = 0
 
         # Filter items to only include assets that are actively retained and ready for upload.
         # Assets trimmed by trim_excess_assets (or rejected/deduplicated) are not transfer failures;
@@ -834,6 +916,7 @@ class NasBatchWriter:
                 )
 
         total_items = len(active_items)
+        successful_verified_assets: list[tuple[uuid.UUID, str, str | None]] = []
 
         for i, item in enumerate(active_items):
             if self.lock:
@@ -863,11 +946,18 @@ class NasBatchWriter:
                 AssetStatus.UPLOADING,
                 AssetStatus.NAS_VERIFIED,
             ):
+                if asset is not None and asset.status in (AssetStatus.RELEVANCE_REJECTED, AssetStatus.DUPLICATE):
+                    logger.info(
+                        f"[NAS WRITER] Asset {asset_uuid} was trimmed/deduplicated (status={asset.status}); "
+                        "skipping without error."
+                    )
+                    skipped_trimmed += 1
+                    continue
                 failed_count += 1
                 self.transfer_repo.update_progress(
                     transfer_id=transfer_id,
                     uploaded_files=uploaded_count,
-                    pending_files=max(0, total_items - uploaded_count - failed_count),
+                    pending_files=max(0, total_items - uploaded_count - failed_count - skipped_trimmed),
                     bytes_transferred=total_bytes,
                     failed_files=failed_count,
                 )
@@ -875,12 +965,19 @@ class NasBatchWriter:
 
             local_img_path = Path(item.get("local_path") or asset.nas_path or "")
             if not local_img_path.exists():
+                if asset.nas_path and asset.nas_path.startswith("nas://") and asset.status == AssetStatus.NAS_VERIFIED:
+                    uploaded_count += 1
+                    continue
+                if asset.status in (AssetStatus.RELEVANCE_REJECTED, AssetStatus.DUPLICATE):
+                    logger.info(f"[NAS WRITER] Asset {asset_uuid} was trimmed; skipping.")
+                    skipped_trimmed += 1
+                    continue
                 logger.warning(f"[NAS WRITER] Local asset {asset_uuid} file {local_img_path} missing")
                 failed_count += 1
                 self.transfer_repo.update_progress(
                     transfer_id=transfer_id,
                     uploaded_files=uploaded_count,
-                    pending_files=max(0, total_items - uploaded_count - failed_count),
+                    pending_files=max(0, total_items - uploaded_count - failed_count - skipped_trimmed),
                     bytes_transferred=total_bytes,
                     failed_files=failed_count,
                 )
@@ -997,11 +1094,13 @@ class NasBatchWriter:
                         except Exception:
                             pass
 
-            # Update asset record to point to NAS URI and record NAS_VERIFIED state
-            asset.nas_path = asset_files.make_remote_path(final_rel)
-            if final_ann_rel:
-                asset.annotation_nas_path = asset_files.make_remote_path(final_ann_rel)
-            asset.status = AssetStatus.NAS_VERIFIED
+            # Record successful upload without modifying Asset ORM in-flight
+            # to prevent long-lived row locks on the 'assets' table during SFTP I/O
+            successful_verified_assets.append((
+                asset_uuid,
+                asset_files.make_remote_path(final_rel),
+                asset_files.make_remote_path(final_ann_rel) if final_ann_rel else None,
+            ))
 
             uploaded_count += 1
             total_bytes += expected_size
@@ -1016,23 +1115,34 @@ class NasBatchWriter:
             )
             self.db.flush()
 
+        # Step 1.5: Apply all verified asset path/status updates in deterministic sorted UUID order
+        # to guarantee deadlock-free bulk updates
+        if successful_verified_assets:
+            successful_verified_assets.sort(key=lambda x: x[0])
+            for a_uuid, r_path, r_ann_path in successful_verified_assets:
+                vals = {"nas_path": r_path, "status": AssetStatus.NAS_VERIFIED}
+                if r_ann_path:
+                    vals["annotation_nas_path"] = r_ann_path
+                self.db.execute(
+                    update(Asset).where(Asset.id == a_uuid).values(**vals)
+                )
+            self.db.flush()
+
         owner_token = getattr(self.lock, "owner_token", None) if self.lock else None
+        retained_items = total_items - skipped_trimmed
 
         # Step 2: Update all Asset NAS paths and mark transfer VERIFIED conditionally
-        if failed_count > 0 or uploaded_count != total_items:
-            self.transfer_repo.update_progress(
+        if failed_count > 0 or (retained_items > 0 and uploaded_count < retained_items):
+            self.transfer_repo.mark_failed(
                 transfer_id=transfer_id,
-                uploaded_files=uploaded_count,
-                pending_files=max(0, total_items - uploaded_count - failed_count),
-                bytes_transferred=total_bytes,
-                failed_files=failed_count,
+                error=f"{failed_count} file(s) failed during NAS upload",
             )
             self.db.commit()
             return {
-                "status": "incomplete",
+                "status": "failed",
                 "uploaded_files": uploaded_count,
                 "failed_files": failed_count,
-                "pending_files": max(0, total_items - uploaded_count - failed_count),
+                "pending_files": max(0, retained_items - uploaded_count - failed_count),
             }
 
         # Publish verified manifest to NAS destination folder alongside images
@@ -1051,7 +1161,7 @@ class NasBatchWriter:
                 logger.warning(f"[NAS WRITER] Non-fatal: could not upload remote manifest: {e}")
 
         self.transfer_repo.mark_verified(transfer_id, owner_token=owner_token)
-        if batch.status not in (BatchStatus.REPLENISHING, BatchStatus.DOWNLOADING, BatchStatus.PROCESSING):
+        if batch.status not in (BatchStatus.REPLENISHING, BatchStatus.DOWNLOADING, BatchStatus.PROCESSING, BatchStatus.COMPLETED):
             if batch.status != BatchStatus.VERIFYING:
                 self.batch_repo.set_status(batch.id, BatchStatus.VERIFYING)
         # Step 3: Commit verification transaction
@@ -1165,8 +1275,15 @@ class NasBatchWriter:
             owner_token=owner_token,
         )
 
-        for asset in assets:
-            asset.status = AssetStatus.COMPLETED
+        self.db.execute(
+            update(Asset)
+            .where(
+                Asset.batch_id == batch.id,
+                Asset.window_id == transfer.window_id,
+                Asset.id.in_(asset_ids),
+            )
+            .values(status=AssetStatus.COMPLETED)
+        )
 
         window.status = "COMPLETED"
         window.completed_at = datetime.now(timezone.utc)
@@ -1211,6 +1328,24 @@ class NasBatchWriter:
         except Exception as e:
             logger.warning(f"[NAS WRITER] Error triggering job advance after window completion: {e}")
 
+        try:
+            job = self.job_repo.get(batch.job_id)
+            if job and job.status in (JobStatus.COMPLETED, JobStatus.COMPLETED_PARTIAL):
+                has_active = self.db.execute(
+                    select(NasTransferBatch.id).where(
+                        NasTransferBatch.job_id == batch.job_id,
+                        NasTransferBatch.transfer_status.in_([
+                            TransferStatus.PENDING,
+                            TransferStatus.UPLOADING,
+                        ]),
+                    ).limit(1)
+                ).scalar_one_or_none() is not None
+                if not has_active:
+                    from app.tasks.nas_tasks import consolidate_job_dataset_on_nas
+                    consolidate_job_dataset_on_nas.delay(str(batch.job_id))
+        except Exception as e:
+            logger.warning(f"[NAS WRITER] Error triggering consolidation after window transfer: {e}")
+
         return {
             "status": "completed",
             "batch_id": str(batch.id),
@@ -1244,6 +1379,17 @@ class NasBatchWriter:
 
         # Step 4: Mark transfer COMPLETED and record that local cleanup is pending conditionally
         self.transfer_repo.mark_completed_staging_pending(transfer_id, owner_token=owner_token)
+
+        # Transition verified/uploaded assets in this batch to COMPLETED in a single atomic update
+        self.db.execute(
+            update(Asset)
+            .where(
+                Asset.batch_id == batch.id,
+                Asset.status == AssetStatus.NAS_VERIFIED,
+            )
+            .values(status=AssetStatus.COMPLETED)
+        )
+
         # Step 5: Commit completion transaction
         self.db.commit()
 
@@ -1254,11 +1400,42 @@ class NasBatchWriter:
             .where(CandidateWindow.batch_id == batch.id, CandidateWindow.status != "COMPLETED")
         ).scalars().first() is not None
 
-        if not has_pending_windows:
+        has_unuploaded_assets = self.db.execute(
+            select(Asset.id)
+            .where(
+                Asset.batch_id == batch.id,
+                Asset.status.in_([
+                    AssetStatus.RELEVANCE_PASSED,
+                    AssetStatus.READY_FOR_UPLOAD,
+                    AssetStatus.UPLOADING,
+                ]),
+            )
+        ).scalars().first() is not None
+
+        has_active_transfers = self.db.execute(
+            select(NasTransferBatch.id)
+            .where(
+                NasTransferBatch.batch_id == batch.id,
+                NasTransferBatch.id != transfer_id,
+                NasTransferBatch.transfer_status.in_([
+                    TransferStatus.PENDING,
+                    TransferStatus.UPLOADING,
+                ]),
+            )
+        ).scalars().first() is not None
+
+        if not has_pending_windows and not has_unuploaded_assets and not has_active_transfers:
             cleanup_success = self.staging_manager.cleanup_batch_staging(batch.job_id, batch.batch_index)
         else:
             cleanup_success = True
-            logger.info(f"[NAS WRITER] Preserving batch staging directory {staging_dir} because active candidate windows exist.")
+            reasons = []
+            if has_pending_windows:
+                reasons.append("active candidate windows exist")
+            if has_unuploaded_assets:
+                reasons.append("unuploaded assets remain in batch")
+            if has_active_transfers:
+                reasons.append("concurrent transfers active")
+            logger.info(f"[NAS WRITER] Preserving batch staging directory {staging_dir} because {', '.join(reasons)}.")
 
         # Step 7: Record local staging cleanup as completed only when verified absent
         if cleanup_success:
@@ -1270,24 +1447,15 @@ class NasBatchWriter:
                 "Retaining staging_cleanup_status as 'pending' for retry by recovery task."
             )
 
-        # Transition only verified/uploaded assets in this batch to COMPLETED
-        stmt = select(Asset).where(
-            Asset.batch_id == batch.id,
-            Asset.status == AssetStatus.NAS_VERIFIED,
-        )
-        for a in self.db.execute(stmt).scalars():
-            a.status = AssetStatus.COMPLETED
-
         from app.services.job_counters import reconcile
         reconcile(self.db, batch.job_id)
         self.db.commit()
 
-        # Only complete the batch if it's not currently replenishing or downloading shortfall replacements
+        # Flexible Batch Delivery: Any verified batch that is not currently downloading/replenishing completes
         batch_completed = False
-        if batch.status not in (BatchStatus.REPLENISHING, BatchStatus.DOWNLOADING, BatchStatus.PROCESSING):
-            if batch.accepted_image_count >= batch.target_image_count or batch.status == BatchStatus.PARTIAL:
-                self.batch_repo.set_status(batch.id, BatchStatus.COMPLETED)
-                batch_completed = True
+        if batch.status not in (BatchStatus.REPLENISHING, BatchStatus.DOWNLOADING, BatchStatus.PROCESSING, BatchStatus.COMPLETED):
+            self.batch_repo.set_status(batch.id, BatchStatus.COMPLETED)
+            batch_completed = True
         self.db.commit()
 
         if batch_completed:
@@ -1298,6 +1466,24 @@ class NasBatchWriter:
                 process_active_batch.delay(str(batch.job_id))
             except Exception as e:
                 logger.warning(f"[NAS WRITER] Error triggering job advance after batch completion: {e}")
+
+        try:
+            job = self.job_repo.get(batch.job_id)
+            if job and job.status in (JobStatus.COMPLETED, JobStatus.COMPLETED_PARTIAL):
+                has_active = self.db.execute(
+                    select(NasTransferBatch.id).where(
+                        NasTransferBatch.job_id == batch.job_id,
+                        NasTransferBatch.transfer_status.in_([
+                            TransferStatus.PENDING,
+                            TransferStatus.UPLOADING,
+                        ]),
+                    ).limit(1)
+                ).scalar_one_or_none() is not None
+                if not has_active:
+                    from app.tasks.nas_tasks import consolidate_job_dataset_on_nas
+                    consolidate_job_dataset_on_nas.delay(str(batch.job_id))
+        except Exception as e:
+            logger.warning(f"[NAS WRITER] Error triggering consolidation after batch transfer: {e}")
 
         logger.info(
             f"[NAS WRITER] Successfully uploaded and verified Batch #{batch.batch_index} "

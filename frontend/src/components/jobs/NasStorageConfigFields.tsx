@@ -204,7 +204,7 @@ export function NasStorageConfigFields({
 
               return (
                 <div className="flex flex-col gap-3">
-                  <div className="flex flex-col sm:flex-row gap-2">
+                  <div className="flex flex-col sm:flex-row gap-2 items-stretch sm:items-center">
                     <div className="relative flex-1 min-w-0">
                       <Input
                         id="nas-storage-path-input"
@@ -222,7 +222,7 @@ export function NasStorageConfigFields({
                       />
                     </div>
 
-                    <div className="flex items-center gap-2">
+                    <div className="flex items-center gap-2 flex-wrap shrink-0">
                       {currentPath ? (
                         <Button
                           type="button"

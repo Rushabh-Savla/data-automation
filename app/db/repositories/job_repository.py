@@ -150,8 +150,6 @@ class JobRepository:
         error_message: str | None = None,
     ) -> None:
         values: dict = {"status": status}
-        if completion_reason is not None:
-            values["completion_reason"] = completion_reason
         if error_message is not None:
             values["error_message"] = error_message
         if status == JobStatus.RUNNING:
@@ -159,6 +157,8 @@ class JobRepository:
         from app.domain.enums import JOB_TERMINAL_STATUSES
 
         if status in JOB_TERMINAL_STATUSES:
+            if completion_reason is not None:
+                values["completion_reason"] = completion_reason
             values["completed_at"] = datetime.now(timezone.utc)
             # Drop the top-up bookkeeping now that no further round will
             # ever run: JobResponse surfaces config["_topup"]["round"] as
@@ -167,6 +167,10 @@ class JobRepository:
             # data" forever. The JSONB `-` operator removes the key
             # server-side (no-op if absent) without a read-modify-write.
             values["config"] = Job.config.op("-")("_topup")
+        else:
+            # Active/running jobs must never retain a completion reason or completed_at
+            values["completion_reason"] = None
+            values["completed_at"] = None
         self.db.execute(update(Job).where(Job.id == job_id).values(**values))
 
     def increment_counts(

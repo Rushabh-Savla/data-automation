@@ -33,6 +33,7 @@ export const sourceKeys = {
 export const nasKeys = {
   all: ['nas'] as const,
   config: () => [...nasKeys.all, 'config'] as const,
+  status: () => [...nasKeys.all, 'status'] as const,
 }
 
 export const statsKeys = {

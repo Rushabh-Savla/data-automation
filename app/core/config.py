@@ -1,8 +1,10 @@
 """Application configuration, loaded from environment variables / .env."""
 
 from functools import lru_cache
+import math
 from pathlib import Path
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -133,17 +135,26 @@ class Settings(BaseSettings):
     # watchdog_scan is a fourth. This is the backstop for when none of those
     # fire.
     #
-    # 10, not 5: a source full of near-duplicates (DAVIS video frames) loses
-    # ~2/3 of each round to dedup, so closing a gap takes a geometric series of
-    # rounds -- 43, 32, 15, 5 short across rounds 2-5 on a 350-image job, which
-    # a cap of 5 left 5 images short despite thousands of unused frames.
-    topup_max_rounds: int = 400
+    # Demand-driven replenishment: no arbitrary round cap. Replenishment continues
+    # until the requested unique target count is satisfied or sources are genuinely exhausted.
+    # Set to None for unbounded demand-driven replenishment.
+    topup_max_rounds: int | None = None
 
     # First-round prior only. Once a round has completed, the top-up planner
     # measures the query's actual post-filter yield and sizes the next round
     # from that instead -- a fixed multiplier cannot absorb an attrition rate
     # that varies per query (a real job needed ~7x, not 1.5x).
     target_overfetch_buffer: float = 1.5
+    # Configurable candidate overfetch percentage (default: 25.0 = 25% buffer upfront)
+    overfetch_percentage: float = 25.0
+    over_download_buffer_pct: float = 25.0
+
+    @field_validator("overfetch_percentage", "over_download_buffer_pct", mode="after")
+    @classmethod
+    def validate_non_negative_pct(cls, v: float) -> float:
+        if v < 0:
+            raise ValueError("Overfetch percentage cannot be negative")
+        return v
 
     # -- Source credentials (fallback if not set via the Credential API) -----------
     roboflow_api_key: str = ""
@@ -198,3 +209,77 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
+
+
+def resolve_overfetch_buffer(job_config: dict | None = None) -> float:
+    """Resolves the configurable over-download multiplier for candidate collection.
+
+    Prioritizes explicit job-level config parameters:
+      1. `overfetch_percentage` (e.g. 25.0 -> 1.25 multiplier)
+      2. `over_download_buffer_pct` (e.g. 20.0 -> 1.20 multiplier)
+      3. `over_download_buffer` (e.g. 1.20)
+      4. `target_overfetch_buffer` (e.g. 1.50)
+    Falls back to global settings `overfetch_percentage`, `over_download_buffer_pct`, or `target_overfetch_buffer`.
+    """
+    settings = get_settings()
+    if job_config and isinstance(job_config, dict):
+        if "overfetch_percentage" in job_config:
+            try:
+                pct = float(job_config["overfetch_percentage"])
+                return max(1.0, 1.0 + (max(0.0, pct) / 100.0))
+            except (ValueError, TypeError):
+                pass
+        if "over_download_buffer_pct" in job_config:
+            try:
+                pct = float(job_config["over_download_buffer_pct"])
+                return max(1.0, 1.0 + (max(0.0, pct) / 100.0))
+            except (ValueError, TypeError):
+                pass
+        if "over_download_buffer" in job_config:
+            try:
+                buf = float(job_config["over_download_buffer"])
+                return max(1.0, buf)
+            except (ValueError, TypeError):
+                pass
+        if "target_overfetch_buffer" in job_config:
+            try:
+                buf = float(job_config["target_overfetch_buffer"])
+                return max(1.0, buf)
+            except (ValueError, TypeError):
+                pass
+
+    if hasattr(settings, "overfetch_percentage") and settings.overfetch_percentage is not None:
+        try:
+            return max(1.0, 1.0 + (max(0.0, float(settings.overfetch_percentage)) / 100.0))
+        except (ValueError, TypeError):
+            pass
+
+    if hasattr(settings, "over_download_buffer_pct") and settings.over_download_buffer_pct is not None:
+        try:
+            return max(1.0, 1.0 + (max(0.0, float(settings.over_download_buffer_pct)) / 100.0))
+        except (ValueError, TypeError):
+            pass
+
+    if hasattr(settings, "target_overfetch_buffer") and settings.target_overfetch_buffer is not None:
+        try:
+            return max(1.0, float(settings.target_overfetch_buffer))
+        except (ValueError, TypeError):
+            pass
+
+    return 1.25
+
+
+def calculate_initial_candidates(
+    required_images: int,
+    overfetch_percentage: float | None = None,
+    job_config: dict | None = None,
+) -> int:
+    """Calculates the initial candidate requirement:
+    initial_candidates = math.ceil(required_images * (1 + overfetch_percentage / 100.0))
+    """
+    if overfetch_percentage is not None:
+        multiplier = 1.0 + max(0.0, float(overfetch_percentage)) / 100.0
+    else:
+        multiplier = resolve_overfetch_buffer(job_config)
+    return math.ceil(required_images * multiplier)
+

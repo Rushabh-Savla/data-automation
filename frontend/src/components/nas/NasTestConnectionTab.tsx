@@ -54,7 +54,7 @@ export function NasTestConnectionTab({
 
   // Current values from live form or saved config
   const formValues = form?.getValues()
-  const activeProtocol = formValues?.protocol ?? config.protocol ?? 'smb'
+  const activeProtocol = formValues?.protocol ?? config.protocol ?? 'sftp'
   const activeHost = formValues?.host ?? config.host ?? ''
   const activePort = formValues?.port ? Number(formValues.port) : config.port
   const activeShare = formValues?.share ?? config.share ?? ''

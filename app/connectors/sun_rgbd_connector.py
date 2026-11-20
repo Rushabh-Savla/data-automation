@@ -51,7 +51,7 @@ logger = logging.getLogger(__name__)
 
 _META_URL = "https://rgbd.cs.princeton.edu/data/SUNRGBDMeta2DBB_v2.mat"
 _IMAGES_URL = "https://rgbd.cs.princeton.edu/data/SUNRGBD.zip"
-_SHARD_SIZE = 20
+_SHARD_SIZE = 50
 # Each image is one ~1.6s round trip for ~50KB, so a shard fetches a few at a
 # time. Threads within a shard are bounded by _MAX_CONCURRENT_REQUESTS below,
 # which is the limit that actually protects the server.
@@ -306,10 +306,10 @@ class SunRgbdConnector:
                             getattr(admission, "window_index", None),
                             i,
                         )
+                    if status == "INACTIVE":
+                            raise JobStopped(f"Candidate admission closed for {source_item_id}")
                     if status != "ADMITTED":
-                        raise FatalConnectorError(
-                            f"Candidate admission failed for {source_item_id}: {status}"
-                        )
+                        continue
 
                 rec = records[record_idx]
                 src_img = local_path(record_idx)

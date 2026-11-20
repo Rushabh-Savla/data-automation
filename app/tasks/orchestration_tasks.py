@@ -9,9 +9,9 @@ import logging
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import select
+from sqlalchemy import select, func, delete
 
-from app.core.config import get_settings
+from app.core.config import calculate_initial_candidates, get_settings, resolve_overfetch_buffer
 from app.core.logging import bind_job_context, clear_job_context
 from app.core.redis_client import get_redis
 from app.db.models.candidate_window import CandidateWindow
@@ -19,6 +19,7 @@ from app.db.models.job_source_task import JobSourceTask
 from app.db.repositories.asset_repository import AssetRepository
 from app.db.repositories.job_repository import JobRepository
 from app.db.repositories.job_source_task_repository import JobSourceTaskRepository
+from app.db.repositories.image_batch_repository import ImageBatchRepository
 from app.db.session import session_scope
 from app.domain.completion import JobCompletionEvaluator, JobSnapshot
 from app.domain.enums import (
@@ -31,7 +32,7 @@ from app.domain.enums import (
 )
 from app.domain.recovery import is_orphaned, orphan_cutoff
 from app.domain.state_machine import JobStateMachine
-from app.domain.topup import SourceState, TopupPlanner, TopupSnapshot, filtering_incomplete
+from app.domain.topup import SourceState, TopupPlan, TopupPlanner, TopupSnapshot, filtering_incomplete
 from app.tasks._helpers import buffered_target
 from app.services.cancellation_service import CancellationService
 from app.services.progress_service import ProgressPublisher
@@ -75,7 +76,13 @@ def on_source_finished(self, results, job_id: str, job_source_task_id: str):
         # re-running discovery and rebuilding the whole chord (see
         # JobService.resume / _resume_task).
         done_items = {
-            r["item"] for r in (results or []) if isinstance(r, dict) and r.get("item") and not r.get("stopped") and not r.get("window_full")
+            r["item"]
+            for r in (results or [])
+            if isinstance(r, dict)
+            and r.get("item")
+            and not r.get("stopped")
+            and not r.get("window_full")
+            and not r.get("deferred")
         }
         if done_items:
             existing_completed = set(task.checkpoint.get("_completed_items", []))
@@ -98,19 +105,35 @@ def on_source_finished(self, results, job_id: str, job_source_task_id: str):
             clear_job_context()
             return
 
+        pending_items = (task.checkpoint or {}).get("_pending_items") or {}
+        completed_items = set((task.checkpoint or {}).get("_completed_items", []))
+        has_remaining = bool(pending_items and not set(pending_items.keys()).issubset(completed_items))
+
         if had_stopped and cancellation.is_cancelled(job_id):
             final_status = JobSourceTaskStatus.CANCELLED
         elif had_window_full:
             final_status = JobSourceTaskStatus.WINDOW_WAITING
             window_waiting = True
+        elif has_remaining:
+            final_status = JobSourceTaskStatus.PARTIALLY_PROCESSED
+            window_waiting = True
         elif had_errors:
-            final_status = JobSourceTaskStatus.COMPLETED_PARTIAL
+            final_status = JobSourceTaskStatus.PARTIALLY_PROCESSED if has_remaining else JobSourceTaskStatus.COMPLETED_PARTIAL
         else:
             final_status = JobSourceTaskStatus.COMPLETED
 
         if task.status != JobSourceTaskStatus.CANCELLED:
-            task_repo.set_status(task_uuid, final_status)
+            if final_status == JobSourceTaskStatus.COMPLETED or (final_status == JobSourceTaskStatus.WINDOW_WAITING and not had_errors):
+                task_repo.set_status(task_uuid, final_status, clear_error=True)
+            else:
+                task_repo.set_status(task_uuid, final_status)
         db.flush()
+
+        # Clear per-source dispatch lock so subsequent batches can be scheduled
+        try:
+            get_redis().delete(f"job:{job_id}:source:{task.source_type}:dispatch_lock")
+        except Exception:
+            pass
 
     # This source's raw intermediates (downloaded videos, extracted archives)
     # have served their purpose: anything worth keeping was promoted to NAS and
@@ -129,6 +152,7 @@ def on_source_finished(self, results, job_id: str, job_source_task_id: str):
             "the active candidate window; preserving its work directory."
         )
 
+    schedule_eligible_source_tasks.delay(job_id)
     check_and_advance_job(job_id)
     clear_job_context()
 
@@ -186,7 +210,8 @@ def check_and_advance_job(job_id: str) -> None:
         all_terminal = task_repo.all_terminal_for_job(job_uuid)
         tasks = task_repo.list_for_job(job_uuid)
         all_waiting_or_terminal = bool(tasks) and all(
-            t.status in JOB_SOURCE_TASK_TERMINAL_STATUSES or t.status == JobSourceTaskStatus.WINDOW_WAITING
+            t.status in JOB_SOURCE_TASK_TERMINAL_STATUSES
+            or t.status in (JobSourceTaskStatus.WINDOW_WAITING, JobSourceTaskStatus.STALLED)
             for t in tasks
         )
 
@@ -194,10 +219,17 @@ def check_and_advance_job(job_id: str) -> None:
         cancellation = CancellationService(get_redis())
 
         from app.db.models.candidate_window import CandidateWindow
+        from sqlalchemy import case
         active_window = db.execute(
             select(CandidateWindow)
-            .where(CandidateWindow.job_id == job_uuid)
-            .order_by(CandidateWindow.created_at.desc())
+            .where(
+                CandidateWindow.job_id == job_uuid,
+                CandidateWindow.status.in_(["FULL", "ACQUIRING", "OPEN"]),
+            )
+            .order_by(
+                case((CandidateWindow.status == "FULL", 0), else_=1),
+                CandidateWindow.window_index.desc(),
+            )
             .limit(1)
         ).scalar_one_or_none()
 
@@ -205,22 +237,30 @@ def check_and_advance_job(job_id: str) -> None:
         window_limit = active_window.candidate_limit if active_window else None
 
         candidate_window = job.config.get("candidate_window", get_settings().download_candidate_window)
-        active_batch_target = min(candidate_window, job_target_count or candidate_window)
-        window_buffered_target = buffered_target(active_batch_target, get_settings().target_overfetch_buffer)
+        from app.db.repositories.image_batch_repository import ImageBatchRepository
+        active_b = ImageBatchRepository(db).get_active_batch(job_uuid)
+        active_batch_target = (
+            active_b.target_image_count
+            if (active_b and active_b.target_image_count)
+            else min(candidate_window, job_target_count or candidate_window)
+        )
+        from app.core.config import calculate_initial_candidates
+        window_buffered_target = calculate_initial_candidates(active_batch_target, job_config=job.config)
+
+        job_accepted_count = int(job.accepted_count or 0)
 
         promoted_count = asset_repo.count_for_job(job_uuid, status=AssetStatus.PROMOTED)
         relevance_passed_count = asset_repo.count_for_job(job_uuid, status=AssetStatus.RELEVANCE_PASSED)
         candidate_count = promoted_count + relevance_passed_count
-        effective_accepted = job_accepted_count + relevance_passed_count
+        effective_accepted = job_accepted_count
 
         window_ready = (
             cancellation.is_target_reached(str(job_id))
-            or (window_is_full and candidate_count > 0)
+            or (window_is_full and candidate_count >= window_buffered_target)
             or (all_waiting_or_terminal and candidate_count > 0)
             or (window_limit is not None and candidate_count >= window_limit and candidate_count > 0)
             or effective_accepted >= window_buffered_target
             or candidate_count >= window_buffered_target
-            or (candidate_count >= active_batch_target and candidate_count > 0)
         )
 
         target_reached = job_target_count is not None and effective_accepted >= job_target_count
@@ -243,7 +283,9 @@ def check_and_advance_job(job_id: str) -> None:
         pending_tiers = job.config.get("_orchestration_pending_tiers") or []
         remaining_sources = job.config.get("_fast_path_remaining_sources") or []
 
-        if (pending_tiers or remaining_sources) and not target_reached and all_terminal:
+        from app.domain.enums import is_source_task_exhausted
+        tier_ready = all_terminal or (bool(tasks) and all(is_source_task_exhausted(t) for t in tasks))
+        if (pending_tiers or remaining_sources) and not target_reached and tier_ready:
             current_tier = job.config.get("_orchestration_tier", 1)
             next_tier_sources = []
             new_pending_tiers = []
@@ -401,14 +443,33 @@ def plan_topup_round(self, job_id: str):
             promoted_total = total_assets - undecided
 
             tasks = task_repo.list_for_job(job_uuid)
+
+            def _is_source_exhausted(task) -> bool:
+                cp = task.checkpoint or {}
+                disc_exhausted = bool(cp.get("discovery_exhausted"))
+                pending = cp.get("_pending_items") or {}
+                completed = set(cp.get("_completed_items") or [])
+                unconsumed = [k for k in pending.keys() if k not in completed]
+                return disc_exhausted and len(unconsumed) == 0
+
             sources = [
                 SourceState(
                     source_type=str(getattr(t.source_type, "value", t.source_type)),
                     accepted=t.accepted_count,
-                    exhausted=bool((t.checkpoint or {}).get("discovery_exhausted")),
+                    exhausted=_is_source_exhausted(t),
                 )
                 for t in tasks
             ]
+
+            gained_last_round = (
+                accepted - previous_accepted if previous_accepted is not None else None
+            )
+            consecutive_no_progress = int((job.config or {}).get("_topup", {}).get("consecutive_no_progress", 0))
+            if gained_last_round is not None:
+                if gained_last_round <= 0:
+                    consecutive_no_progress += 1
+                else:
+                    consecutive_no_progress = 0
 
             plan = TopupPlanner.plan(
                 TopupSnapshot(
@@ -418,20 +479,43 @@ def plan_topup_round(self, job_id: str):
                     round_number=round_number,
                     max_rounds=job.config.get("topup_max_rounds", settings.topup_max_rounds) if job and job.config else settings.topup_max_rounds,
                     sources=sources,
-                    gained_last_round=(
-                        accepted - previous_accepted if previous_accepted is not None else None
-                    ),
+                    gained_last_round=gained_last_round,
                     promoted_last_round=(
                         promoted_total - previous_promoted if previous_promoted is not None else None
                     ),
+                    consecutive_no_progress=consecutive_no_progress,
                 )
             )
 
             if plan is None:
+                shortfall = (job.target_count or 0) - accepted
+                if shortfall > 0:
+                    unexhausted_sources = [s for s in sources if not s.exhausted]
+                    if not unexhausted_sources:
+                        unexhausted_sources = sources
+                    logger.info(
+                        f"Top-up for job {job_id}: round {round_number}, short by {shortfall}. "
+                        f"Continuing infinite replenishment iterations across {len(unexhausted_sources)} source(s)..."
+                    )
+                    import math
+                    per_source = math.ceil(max(25, shortfall) / max(1, len(unexhausted_sources)))
+                    quota = {s.source_type: per_source for s in unexhausted_sources}
+                    plan = TopupPlan(
+                        round_number=round_number + 1,
+                        shortfall=shortfall,
+                        observed_yield=0.05,
+                        quota=quota,
+                        max_rounds=None,
+                    )
+
+            if plan is None:
                 logger.info(
-                    f"Top-up for job {job_id}: stopping at {accepted}/{job.target_count} "
+                    f"Top-up for job {job_id}: target fulfilled at {accepted}/{job.target_count} "
                     f"after round {round_number}"
                 )
+                config = dict(job.config or {})
+                config["_topup_stopped"] = False
+                job_repo.set_config(job_uuid, config)
             else:
                 logger.info(
                     f"Top-up for job {job_id}: round {plan.round_number}, short by "
@@ -440,11 +524,13 @@ def plan_topup_round(self, job_id: str):
                 )
 
                 config = dict(job.config or {})
+                config["_topup_stopped"] = False
                 config["_topup"] = {
                     "round": plan.round_number,
                     "quota": plan.quota,
                     "accepted_after_last_round": accepted,
                     "promoted_after_last_round": promoted_total,
+                    "consecutive_no_progress": consecutive_no_progress,
                     # Raw (pre-filter) accepted_count as of right now, before
                     # this round's downloads start — the fixed baseline
                     # build_on_progress anchors this round's target to. Not
@@ -478,7 +564,7 @@ def plan_topup_round(self, job_id: str):
                         continue
                     task_repo.set_status(task.id, JobSourceTaskStatus.PENDING)
                     task_repo.heartbeat(task.id)
-                    redispatch.append((source_value, str(task.id)))
+                    redispatch.append((source_value, str(task.id), task.checkpoint or {}))
 
         # -- After the transaction has committed. --------------------------
         if plan is None:
@@ -490,6 +576,51 @@ def plan_topup_round(self, job_id: str):
             from app.tasks.filtering_tasks import trim_excess_assets
 
             trim_excess_assets(job_id)
+
+            # Finalize any incomplete active batch so its accepted assets are manifested and sent to NAS
+            try:
+                from app.tasks.batch_orchestration import BatchOrchestrator
+                from app.domain.enums import BatchStatus
+                with session_scope() as batch_db:
+                    orchestrator = BatchOrchestrator(batch_db, job_uuid)
+                    active = orchestrator.batch_repo.get_active_batch(job_uuid)
+                    if active and active.status not in (
+                        BatchStatus.COMPLETED,
+                        BatchStatus.READY_FOR_UPLOAD,
+                        BatchStatus.UPLOADING,
+                        BatchStatus.NAS_UPLOADING,
+                        BatchStatus.VERIFYING,
+                    ):
+                        if (active.accepted_image_count or 0) > 0:
+                            manifest_path = orchestrator.create_batch_manifest(active.id)
+                            if manifest_path is not None:
+                                from app.storage.nas_writer import enqueue_nas_batch
+                                from app.tasks.nas_tasks import process_nas_upload_queue
+                                enqueue_nas_batch(active.id, job_uuid, manifest_path)
+                                process_nas_upload_queue.delay()
+                                logger.info(
+                                    f"Top-up planner: active batch {active.id} finalized with {active.accepted_image_count} images for NAS upload."
+                                )
+                        else:
+                            orchestrator.batch_repo.set_status(active.id, BatchStatus.PARTIAL)
+                            logger.info(
+                                f"Top-up planner: empty active batch {active.id} marked PARTIAL without NAS upload."
+                            )
+                        task_repo_batch = JobSourceTaskRepository(batch_db)
+                        for t in task_repo_batch.list_for_job(job_uuid):
+                            if t.status not in JOB_SOURCE_TASK_TERMINAL_STATUSES:
+                                cp = t.checkpoint or {}
+                                pending = cp.get("_pending_items") or {}
+                                completed = set(cp.get("_completed_items", []))
+                                has_remaining = bool(pending and not set(pending.keys()).issubset(completed))
+                                if has_remaining:
+                                    task_repo_batch.set_status(t.id, JobSourceTaskStatus.PARTIALLY_PROCESSED)
+                                else:
+                                    task_repo_batch.set_status(t.id, JobSourceTaskStatus.COMPLETED_PARTIAL)
+                        batch_db.commit()
+            except Exception as e:
+                logger.warning(f"Error finalizing active batch in plan_topup_round: {e}")
+
             evaluate_job_completion.delay(job_id)
             return
 
@@ -504,14 +635,21 @@ def plan_topup_round(self, job_id: str):
             },
         )
 
-        for source_value, task_id in redispatch:
-            _resume_task(job_id, task_id, source_value, {})
+        for source_value, task_id, cp in redispatch:
+            _resume_task(job_id, task_id, source_value, cp)
     finally:
         clear_job_context()
 
 
 @celery_app.task(name="app.tasks.orchestration_tasks.evaluate_job_completion", bind=True)
 def evaluate_job_completion(self, job_id: str):
+    from app.domain.enums import (
+        JOB_SOURCE_TASK_TERMINAL_STATUSES,
+        JOB_TERMINAL_STATUSES,
+        JobSourceTaskStatus,
+        JobStatus,
+        JobCompletionReason,
+    )
     job_uuid = uuid.UUID(job_id)
     bind_job_context(job_id)
 
@@ -583,11 +721,79 @@ def evaluate_job_completion(self, job_id: str):
             trim_excess_assets(job_id)
             db.refresh(job)
 
+        all_sources_terminal = task_repo.all_terminal_for_job(job_uuid)
+        if not all_sources_terminal:
+            # Check if all batches are completed/partial, meaning batch orchestration is finished
+            from app.db.repositories.image_batch_repository import ImageBatchRepository
+            from app.domain.enums import BatchStatus
+            from app.db.models.candidate_window import CandidateWindow
+            from app.db.models.asset import Asset
+            batch_repo = ImageBatchRepository(db)
+            batches = batch_repo.list_for_job(job_uuid)
+
+            # Prune empty ghost batches with 0 assets that were created spuriously
+            cleaned_batches = []
+            for b in batches:
+                if (b.accepted_image_count or 0) == 0 and b.status not in (BatchStatus.COMPLETED, BatchStatus.PARTIAL):
+                    asset_count = db.execute(
+                        select(func.count(Asset.id)).where(Asset.batch_id == b.id)
+                    ).scalar_one()
+                    if asset_count == 0:
+                        db.execute(delete(CandidateWindow).where(CandidateWindow.batch_id == b.id))
+                        db.delete(b)
+                        continue
+                cleaned_batches.append(b)
+            db.flush()
+            batches = cleaned_batches
+
+            all_batches_done = not batches or all(
+                b.status in (BatchStatus.COMPLETED, BatchStatus.PARTIAL) for b in batches
+            )
+            tasks = task_repo.list_for_job(job_uuid)
+            all_waiting_or_terminal = bool(tasks) and all(
+                t.status in JOB_SOURCE_TASK_TERMINAL_STATUSES
+                or t.status in (JobSourceTaskStatus.WINDOW_WAITING, JobSourceTaskStatus.STALLED, JobSourceTaskStatus.COMPLETED_PARTIAL)
+                for t in tasks
+            )
+            if all_batches_done and all_waiting_or_terminal:
+                # If target is not met, NEVER declare sources exhausted or terminate if eligible sources remain.
+                # Continuous sequential iterations: trigger the sequential scheduler to continue or advance round.
+                if job.target_count is not None and job.accepted_count < job.target_count:
+                    from app.domain.source_priority import evaluate_sequential_execution_plan
+                    from app.domain.enums import is_source_task_exhausted
+                    plan = evaluate_sequential_execution_plan(job, tasks)
+                    if not plan.all_sources_complete or any(not is_source_task_exhausted(t) for t in tasks):
+                        logger.info(
+                            f"[EVALUATE] Job {job_id} target not met ({job.accepted_count}/{job.target_count}); "
+                            f"sources remain eligible (active: {plan.active_source}). Triggering sequential scheduler."
+                        )
+                        schedule_eligible_source_tasks.delay(job_id)
+                        clear_job_context()
+                        return
+
+                for t in tasks:
+                    if t.status not in JOB_SOURCE_TASK_TERMINAL_STATUSES:
+                        cp = t.checkpoint or {}
+                        pending = cp.get("_pending_items") or {}
+                        completed = set(cp.get("_completed_items", []))
+                        has_remaining = bool(pending and not set(pending.keys()).issubset(completed))
+                        if has_remaining:
+                            t_status = JobSourceTaskStatus.PARTIALLY_PROCESSED
+                        elif t.accepted_count and t.discovered_count and t.accepted_count >= t.discovered_count:
+                            t_status = JobSourceTaskStatus.COMPLETED
+                        else:
+                            t_status = JobSourceTaskStatus.SOURCE_EXHAUSTED
+                        task_repo.set_status(t.id, t_status)
+                db.flush()
+                all_sources_terminal = all(
+                    t.status in JOB_SOURCE_TASK_TERMINAL_STATUSES for t in tasks
+                )
+
         snapshot = JobSnapshot(
             target_count=job.target_count,
             deadline_at=job.deadline_at,
             accepted_count=job.accepted_count,
-            all_sources_terminal=task_repo.all_terminal_for_job(job_uuid),
+            all_sources_terminal=all_sources_terminal,
         )
         reason = JobCompletionEvaluator.should_stop(snapshot)
         if reason is None:
@@ -597,22 +803,162 @@ def evaluate_job_completion(self, job_id: str):
         success = JobCompletionEvaluator.is_success(reason, job.accepted_count, job.target_count)
         event = "complete" if success else ("fail" if job.accepted_count == 0 else "complete_partial")
         new_status = JobStateMachine.transition(job.status, event)
+
+        if success:
+            try:
+                cancellation.mark_target_reached(job_id)
+            except Exception:
+                pass
+
+        # Protect in-flight and active NAS uploads for both COMPLETED and COMPLETED_PARTIAL jobs
+        if new_status in (JobStatus.COMPLETED, JobStatus.COMPLETED_PARTIAL):
+            from app.services.nas_config_service import is_storage_active
+            from app.db.models.image_batch import NasTransferBatch, ImageBatch
+            from app.db.models.asset import Asset
+            from app.domain.enums import TransferStatus, BatchStatus
+            if is_storage_active():
+                from app.storage import asset_files
+
+                # Under Flexible Batch Delivery: ensure any finalized non-empty batches
+                # are manifested and enqueued so no valid images are stranded in local staging
+                from app.tasks.batch_orchestration import BatchOrchestrator
+                unmanifested = db.execute(
+                    select(ImageBatch).where(
+                        ImageBatch.job_id == job_uuid,
+                        ImageBatch.status.in_([BatchStatus.PROCESSING, BatchStatus.PARTIAL, BatchStatus.DISCOVERING]),
+                        ImageBatch.accepted_image_count > 0,
+                    )
+                ).scalars().all()
+                if unmanifested:
+                    orchestrator = BatchOrchestrator(db, job_uuid)
+                    for b in unmanifested:
+                        m_path = orchestrator.create_batch_manifest(b.id)
+                        if m_path:
+                            from app.storage.nas_writer import enqueue_nas_batch
+                            enqueue_nas_batch(b.id, job_uuid, m_path, db=db)
+
+                # Wait only for assets in batches that are actively in the upload pipeline
+                from sqlalchemy import or_
+                has_in_flight = db.execute(
+                    select(Asset.id)
+                    .join(ImageBatch, Asset.batch_id == ImageBatch.id, isouter=True)
+                    .where(
+                        Asset.job_id == job_uuid,
+                        Asset.status.in_([
+                            AssetStatus.READY_FOR_UPLOAD,
+                            AssetStatus.UPLOADING,
+                        ]),
+                        Asset.nas_path.is_not(None),
+                        ~Asset.nas_path.like(f"{asset_files.NAS_SCHEME}%"),
+                        or_(
+                            ImageBatch.id.is_(None),
+                            ImageBatch.status.in_([
+                                BatchStatus.READY_FOR_UPLOAD,
+                                BatchStatus.UPLOADING,
+                                BatchStatus.NAS_UPLOADING,
+                                BatchStatus.VERIFYING,
+                            ]),
+                        ),
+                    ).limit(1)
+                ).scalar_one_or_none() is not None
+
+                has_active_transfers = db.execute(
+                    select(NasTransferBatch.id).where(
+                        NasTransferBatch.job_id == job_uuid,
+                        NasTransferBatch.transfer_status.in_([
+                            TransferStatus.PENDING,
+                            TransferStatus.UPLOADING,
+                            TransferStatus.VERIFIED,
+                        ]),
+                    ).limit(1)
+                ).scalar_one_or_none() is not None
+
+                pending_assets = db.execute(
+                    select(Asset).where(
+                        Asset.job_id == job_uuid,
+                        Asset.status.in_([
+                            AssetStatus.RELEVANCE_PASSED,
+                            AssetStatus.READY_FOR_UPLOAD,
+                            AssetStatus.UPLOADING,
+                        ]),
+                    )
+                ).scalars().all()
+                has_pending_pipeline = False
+                for pa in pending_assets:
+                    if pa.nas_path and (asset_files.is_remote(pa.nas_path) or Path(pa.nas_path).exists()):
+                        has_pending_pipeline = True
+                    else:
+                        pa.status = AssetStatus.FAILED
+                if not has_pending_pipeline and pending_assets:
+                    db.flush()
+                    reconcile(db, job_uuid)
+                    db.flush()
+
+                completed_nas = db.execute(
+                    select(func.count(Asset.id)).where(
+                        Asset.job_id == job_uuid,
+                        Asset.status.in_([AssetStatus.COMPLETED, AssetStatus.NAS_VERIFIED]),
+                    )
+                ).scalar_one()
+
+                is_short_of_target = (
+                    new_status == JobStatus.COMPLETED
+                    and job.target_count is not None
+                    and completed_nas < job.target_count
+                )
+
+                if has_in_flight or has_active_transfers or (is_short_of_target and has_pending_pipeline):
+                    retries = getattr(getattr(self, "request", None), "retries", 0)
+                    from app.tasks.nas_tasks import reconcile_nas_transfers
+                    try:
+                        reconcile_nas_transfers()
+                    except Exception as e:
+                        logger.warning(f"Reconcile NAS transfers warning: {e}")
+                    if retries < 120:
+                        countdown = 5 if retries < 30 else (10 if retries < 60 else 15)
+                        logger.info(
+                            f"[EVALUATE] Job {job_id} reached completion ({new_status.value}) but has active uploads or pending delivery "
+                            f"(in_flight={has_in_flight}, active_transfers={has_active_transfers}, delivered={completed_nas}/{job.target_count}). "
+                            f"Retrying completion evaluation in {countdown}s (retry {retries}/120)..."
+                        )
+                        clear_job_context()
+                        raise self.retry(countdown=countdown, max_retries=120)
+                    else:
+                        logger.error(
+                            f"[EVALUATE] Job {job_id} reached retry timeout but active transfers still running "
+                            f"(in_flight={has_in_flight}, active_transfers={has_active_transfers}). "
+                            "Aborting completion transition to prevent data loss."
+                        )
+                        clear_job_context()
+                        raise self.retry(countdown=30, max_retries=240)
+
+                # If all pipeline stages are drained, but delivered NAS count is STILL below target_count:
+                # Do NOT mark COMPLETED with TARGET_COUNT_REACHED!
+                if is_short_of_target:
+                    logger.warning(
+                        f"[EVALUATE] Job {job_id} pipeline drained but actual NAS delivered count "
+                        f"({completed_nas}/{job.target_count}) is short of target. Re-triggering sources to complete requested count."
+                    )
+                    from app.tasks.orchestration_tasks import schedule_eligible_source_tasks
+                    schedule_eligible_source_tasks.delay(job_id)
+                    clear_job_context()
+                    return
         job_repo.set_status(job_uuid, new_status, completion_reason=reason)
 
-        from app.domain.enums import JOB_SOURCE_TASK_TERMINAL_STATUSES, JobSourceTaskStatus
         from app.tasks.cleanup_tasks import cleanup_local
-        non_terminal_tasks = [
-            t for t in task_repo.list_for_job(job_uuid)
-            if t.status not in JOB_SOURCE_TASK_TERMINAL_STATUSES
-        ]
+        all_tasks = task_repo.list_for_job(job_uuid)
         target_task_status = (
             JobSourceTaskStatus.COMPLETED
             if new_status == JobStatus.COMPLETED
             else JobSourceTaskStatus.COMPLETED_PARTIAL
         )
-        for t in non_terminal_tasks:
-            task_repo.set_status(t.id, target_task_status)
-            cleanup_local.delay(str(t.id))
+        for t in all_tasks:
+            if t.status not in (JobSourceTaskStatus.FAILED, JobSourceTaskStatus.CANCELLED):
+                task_repo.set_status(t.id, target_task_status, clear_error=True)
+            elif new_status == JobStatus.COMPLETED:
+                task_repo.set_status(t.id, t.status, clear_error=True)
+            if t.status not in JOB_SOURCE_TASK_TERMINAL_STATUSES:
+                cleanup_local.delay(str(t.id))
 
         db.commit()
 
@@ -629,8 +975,15 @@ def evaluate_job_completion(self, job_id: str):
             cancellation.mark_target_reached(job_id)
         else:
             cancellation.clear_target_reached(job_id)
+        now_iso = datetime.now(timezone.utc).isoformat()
         ProgressPublisher(get_redis()).publish(
-            job_id, {"type": "job_status", "status": new_status.value, "completion_reason": reason.value}
+            job_id,
+            {
+                "type": "job_status",
+                "status": new_status.value,
+                "completion_reason": reason.value if reason else None,
+                "completed_at": now_iso if new_status in JOB_TERMINAL_STATUSES else None,
+            },
         )
 
     # Only after the job is actually marked COMPLETED/COMPLETED_PARTIAL in the
@@ -647,7 +1000,7 @@ def evaluate_job_completion(self, job_id: str):
         from app.tasks.nas_tasks import consolidate_job_dataset_on_nas, schedule_offload_for_job
 
         schedule_offload_for_job(job_id)
-        consolidate_job_dataset_on_nas.apply_async((job_id,), countdown=2)
+        consolidate_job_dataset_on_nas.delay(job_id)
 
     from app.tasks.cleanup_tasks import cleanup_shared_cache
     cleanup_shared_cache.delay()
@@ -743,8 +1096,9 @@ def watchdog_scan():
         # -- Resume stalled tasks -----------------------------------------------
         for task in task_repo.list_stalled(settings.watchdog_stall_threshold_s, now, orphan_cutoff=restart_cutoff):
             logger.warning(f"Watchdog: task {task.id} stalled (source={task.source_type}), resuming")
-            task_repo.set_status(task.id, JobSourceTaskStatus.STALLED)
-            task_repo.increment_counts(task.id, errors=0)  # no-op, keeps intent explicit
+            task_repo.set_status(task.id, JobSourceTaskStatus.DOWNLOADING)
+            task_repo.heartbeat(task.id)
+            db.commit()
             _resume_task(str(task.job_id), str(task.id), task.source_type, task.checkpoint or {})
 
         # -- Kick off scheduled jobs whose start time has passed -------------------
@@ -759,6 +1113,8 @@ def watchdog_scan():
         # JobService.cancel()/evaluate_job_completion's retry guard) --------------
         _cancelling_stall_threshold_s = 120
         for job in job_repo.list_active():
+            if job.status in (JobStatus.RUNNING, JobStatus.DISCOVERING):
+                schedule_eligible_source_tasks.delay(str(job.id))
             if job.deadline_at is not None and now >= job.deadline_at:
                 evaluate_job_completion.delay(str(job.id))
             elif (
@@ -778,9 +1134,17 @@ def watchdog_scan():
                 and (
                     task_repo.all_terminal_for_job(job.id)
                     or (
-                        AssetRepository(db).count_for_job(job.id, status=AssetStatus.PROMOTED) >= min(
-                            job.config.get("candidate_window", settings.download_candidate_window),
-                            job.target_count or settings.download_candidate_window,
+                        AssetRepository(db).count_for_job(job.id, status=AssetStatus.PROMOTED) >= (
+                            int(job.config["candidate_window"])
+                            if (job.config and "candidate_window" in job.config)
+                            else calculate_initial_candidates(
+                                (
+                                    ImageBatchRepository(db).get_active_batch(job.id).target_image_count
+                                    if ImageBatchRepository(db).get_active_batch(job.id) and ImageBatchRepository(db).get_active_batch(job.id).target_image_count
+                                    else min(settings.batch_accepted_target, job.target_count or settings.batch_accepted_target)
+                                ),
+                                job_config=job.config,
+                            )
                         )
                     )
                     or (
@@ -877,3 +1241,158 @@ def _resume_task(job_id: str, job_source_task_id: str, source_type, checkpoint: 
         return
 
     celery_app.send_task(task_path, args=[job_id, job_source_task_id])
+
+
+@celery_app.task(name="app.tasks.orchestration_tasks.schedule_eligible_source_tasks", bind=True)
+def schedule_eligible_source_tasks(self, job_id: str, max_batch_per_source: int = 20) -> dict:
+    """Checkpoint-driven persistent scheduler that dispatches bounded batches across all unexhausted sources.
+
+    Continuous ingestion without arbitrary round caps or deadlocks.
+    """
+    job_uuid = uuid.UUID(job_id)
+    with session_scope() as db:
+        job = JobRepository(db).get(job_uuid)
+        if job is None or job.status not in (JobStatus.RUNNING, JobStatus.DISCOVERING):
+            return {"status": "inactive_job"}
+
+        target = job.target_count
+        accepted = job.accepted_count or 0
+        if target is not None and accepted >= target:
+            return {"status": "target_reached"}
+
+        from app.tasks.batch_orchestration import BatchOrchestrator
+        from app.db.models.candidate_window import CandidateWindow
+        from app.db.models.candidate_reservation import CandidateReservation
+        from app.services.candidate_reservation_service import cleanup_stale_reservations
+
+        orchestrator = BatchOrchestrator(db, job_uuid)
+        active_b = orchestrator.get_or_create_active_batch()
+        if active_b is None:
+            return {"status": "no_active_batch"}
+
+        window = db.execute(
+            select(CandidateWindow)
+            .where(CandidateWindow.batch_id == active_b.id)
+            .order_by(CandidateWindow.window_index.desc())
+            .limit(1)
+        ).scalar_one_or_none()
+
+        if window is not None:
+            # Clean up abandoned reservations (> 60s without update)
+            cleanup_stale_reservations(db, window.id, stale_seconds=60)
+            db.flush()
+
+            # If window is FULL and all reservations are resolved, advance the batch
+            if window.status == "FULL":
+                active_reserved = db.execute(
+                    select(func.count(CandidateReservation.id)).where(
+                        CandidateReservation.window_id == window.id,
+                        CandidateReservation.status == "RESERVED",
+                    )
+                ).scalar_one()
+                if active_reserved == 0:
+                    from app.tasks.batch_orchestration import process_active_batch
+                    process_active_batch.delay(str(job_uuid))
+                    return {"status": "window_full_advancing_batch"}
+
+        task_repo = JobSourceTaskRepository(db)
+        tasks = task_repo.list_for_job(job_uuid)
+        from app.domain.source_priority import evaluate_sequential_execution_plan, is_source_round_complete
+        from app.services.job_service import _resume_pending_items, _SOURCE_DISCOVERY_TASKS
+        if not _SOURCE_DISCOVERY_TASKS:
+            import app.tasks.discovery_tasks
+
+        from app.services.cancellation_service import CancellationService
+        canc = CancellationService(get_redis())
+        for t in tasks:
+            if t.status == JobSourceTaskStatus.DOWNLOADING and canc.is_source_cap_reached(str(job_uuid), str(t.id)):
+                task_repo.set_status(t.id, JobSourceTaskStatus.PARTIALLY_PROCESSED)
+        db.flush()
+
+        # Evaluate canonical priority plan across configured sources
+        plan = evaluate_sequential_execution_plan(job, tasks)
+
+        # Check if all sources completed current round
+        if plan.all_sources_complete:
+            if target is not None and accepted >= target:
+                from app.tasks.orchestration_tasks import evaluate_job_completion
+                evaluate_job_completion.delay(job_id)
+                return {"status": "target_reached", "round": plan.current_round}
+
+            # Increment round without arbitrary round limits; start again from Priority 1 (WEB)
+            next_round = plan.current_round + 1
+            cfg = dict(job.config or {})
+            cfg["topup_round"] = next_round
+            job.config = cfg
+            for t in tasks:
+                cp = dict(t.checkpoint or {})
+                cp["discovery_exhausted"] = False
+                task_repo.heartbeat(t.id, checkpoint=cp)
+                task_repo.set_status(t.id, JobSourceTaskStatus.PENDING)
+                canc.clear_source_cap_reached(str(job_uuid), str(t.id))
+            db.commit()
+            plan = evaluate_sequential_execution_plan(job, tasks)
+
+        active_src = plan.active_source
+        if active_src is None:
+            return {"status": "idle", "plan": "all_sources_complete"}
+
+        # STRICT SINGLE-SOURCE EXECUTION:
+        # Only the currently active source may receive new discovery, download, extraction and candidate-ingestion tasks.
+        active_task = next((t for t in tasks if t.source_type == active_src.value), None)
+        if active_task is None:
+            active_task = JobSourceTask(id=uuid.uuid4(), job_id=job_uuid, source_type=active_src.value)
+            task_repo.create(active_task)
+            db.flush()
+
+        if active_task.status == JobSourceTaskStatus.DOWNLOADING:
+            return {
+                "status": "active_source_downloading",
+                "active_source": active_src.value,
+                "position": plan.active_source_position,
+            }
+
+        source_str = active_src.value
+        source_lock_key = f"job:{job_id}:source:{source_str}:dispatch_lock"
+        if not get_redis().set(source_lock_key, "1", nx=True, ex=30):
+            return {
+                "status": "source_locked",
+                "active_source": source_str,
+                "position": plan.active_source_position,
+            }
+
+        dispatched = {}
+        cp = active_task.checkpoint or {}
+        pending = cp.get("_pending_items") or {}
+        completed = set(cp.get("_completed_items", []))
+        unconsumed = [k for k in pending.keys() if k not in completed]
+
+        if unconsumed:
+            task_repo.set_status(active_task.id, JobSourceTaskStatus.DOWNLOADING)
+            task_repo.heartbeat(active_task.id)
+            ok = _resume_pending_items(
+                active_src, str(job_uuid), str(active_task.id), active_task.checkpoint, max_batch=max_batch_per_source
+            )
+            if ok:
+                dispatched[source_str] = len(unconsumed[:max_batch_per_source])
+            else:
+                get_redis().delete(source_lock_key)
+        else:
+            task_path = _SOURCE_DISCOVERY_TASKS.get(active_src)
+            if task_path is not None and not cp.get("discovery_exhausted", False):
+                task_repo.set_status(active_task.id, JobSourceTaskStatus.DISCOVERING)
+                task_repo.heartbeat(active_task.id)
+                celery_app.send_task(task_path, args=[str(job_uuid), str(active_task.id)])
+                dispatched[source_str] = "discovery_dispatched"
+            else:
+                task_repo.set_status(active_task.id, JobSourceTaskStatus.COMPLETED)
+                get_redis().delete(source_lock_key)
+
+        db.commit()
+        return {
+            "status": "scheduled",
+            "active_source": source_str,
+            "position": plan.active_source_position,
+            "dispatched": dispatched,
+        }
+

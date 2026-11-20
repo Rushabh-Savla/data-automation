@@ -65,7 +65,7 @@ from app.domain.enums import SourceType
 logger = logging.getLogger(__name__)
 
 _ANNOTATIONS_ZIP_URL = "http://images.cocodataset.org/annotations/annotations_trainval2017.zip"
-_SHARD_SIZE = 20
+_SHARD_SIZE = 50
 
 
 def _cache_dir() -> Path:
@@ -507,13 +507,13 @@ class CocoConnector:
                         )
                         break
 
-                    if status != "ADMITTED":
+                    if status == "INACTIVE":
                         stop_at = i
-                        stop_signal = FatalConnectorError(
-                            f"Candidate admission failed for {source_item_id}: "
-                            f"{status or 'unknown admission status'}"
-                        )
+                        stop_signal = JobStopped(f"Candidate admission closed for {source_item_id}")
                         break
+
+                    if status != "ADMITTED":
+                        continue
 
                     if (
                         getattr(admission, "reservation_id", None) is None

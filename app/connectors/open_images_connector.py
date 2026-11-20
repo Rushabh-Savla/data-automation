@@ -48,7 +48,7 @@ _ANNOTATIONS_URLS = {
     "test": "https://storage.googleapis.com/openimages/v5/test-annotations-bbox.csv",
 }
 _IMAGE_BASE_URL = "https://open-images-dataset.s3.amazonaws.com"
-_SHARD_SIZE = 20
+_SHARD_SIZE = 50
 _LICENSE_NOTE = (
     "Open Images (predominantly CC BY 2.0 — see "
     "https://storage.googleapis.com/openimages/web/factsfigures.html)"
@@ -128,38 +128,46 @@ class OpenImagesConnector:
         else:
             matched_ids = self._match_classes(query, descriptions)
 
-        try:
-            ann_csv_path = _ensure_annotations_cached(self.split)
-        except Exception as e:
-            logger.warning(f"Open Images annotations unavailable: {e}")
-            return DiscoveryPage(
-                items=[], next_cursor=None, exhausted=True,
-                error_reason=f"Failed to download Open Images {self.split} annotations: {e}",
-            )
+        splits = [self.split]
+        if self.split == "validation":
+            splits.append("test")
 
-        # Open Images has ~600 classes, so many queries name none of them. Labelled images
-        # come first; when they cannot fill the limit -- or none names this query -- the rest
-        # is filled from every other image, and the relevance filter decides (open_vocab.py).
-        # Not for explicit class overrides, which are an exact request. The file is only read
-        # to the end when a scan is needed: a full labelled set stops the read at the limit.
-        scan_wanted = not explicit_classes
-        image_ids: list[str] = []
-        seen: set[str] = set()
-        every_image: set[str] = set()
-        with open(ann_csv_path, encoding="utf-8") as f:
-            for row in csv.DictReader(f):
-                every_image.add(row["ImageID"])
-                if row.get("LabelName") in matched_ids and row["ImageID"] not in seen:
-                    seen.add(row["ImageID"])
-                    image_ids.append(row["ImageID"])
-                    if len(image_ids) >= limit:
-                        break
+        per_split: list[tuple[str, list[str], bool]] = []
+        remaining = limit
+        scan_wanted = not explicit_classes and not matched_ids
 
-        scan_ids: list[str] = []
-        if scan_wanted and len(image_ids) < limit:
-            scan_ids = scan_candidates(every_image, seen, limit - len(image_ids))
+        for split in splits:
+            if remaining <= 0:
+                break
+            try:
+                ann_csv_path = _ensure_annotations_cached(split)
+            except Exception as e:
+                logger.warning(f"Open Images annotations unavailable for split {split}: {e}")
+                continue
 
-        if not image_ids and not scan_ids:
+            split_image_ids: list[str] = []
+            seen: set[str] = set()
+            every_image: set[str] = set()
+            with open(ann_csv_path, encoding="utf-8") as f:
+                for row in csv.DictReader(f):
+                    every_image.add(row["ImageID"])
+                    if row.get("LabelName") in matched_ids and row["ImageID"] not in seen:
+                        seen.add(row["ImageID"])
+                        split_image_ids.append(row["ImageID"])
+                        if len(split_image_ids) >= remaining:
+                            break
+
+            if split_image_ids:
+                per_split.append((split, split_image_ids, False))
+                remaining -= len(split_image_ids)
+
+            if scan_wanted and remaining > 0 and split == splits[-1]:
+                scan_ids = scan_candidates(every_image, seen, remaining)
+                if scan_ids:
+                    per_split.append((split, scan_ids, True))
+                    remaining -= len(scan_ids)
+
+        if not per_split:
             return DiscoveryPage(items=[], next_cursor=None, exhausted=True)
 
         items = [
@@ -167,14 +175,14 @@ class OpenImagesConnector:
                 source_type=SourceType.OPEN_IMAGES,
                 external_ref={
                     "image_ids": batch[i : i + _SHARD_SIZE],
-                    "split": self.split,
+                    "split": split,
                     "label_ids": sorted(matched_ids),
                     "unlabelled": unlabelled,
                 },
                 license_hint=_LICENSE_NOTE,
-                dataset_identifier=f"open-images-{self.split}",
+                dataset_identifier=f"open-images-{split}",
             )
-            for batch, unlabelled in ((image_ids, False), (scan_ids, True))
+            for split, batch, unlabelled in per_split
             for i in range(0, len(batch), _SHARD_SIZE)
         ]
         return DiscoveryPage(items=items, next_cursor=None, exhausted=True)
@@ -260,10 +268,10 @@ class OpenImagesConnector:
                         getattr(admission, "window_index", None),
                         i,
                     )
+                if status == "INACTIVE":
+                    raise JobStopped(f"Candidate admission closed for {source_item_id}")
                 if status != "ADMITTED":
-                    raise FatalConnectorError(
-                        f"Candidate admission failed for {source_item_id}: {status}"
-                    )
+                    continue
 
             url = f"{_IMAGE_BASE_URL}/{split}/{image_id}.jpg"
             dest = workdir / f"{image_id}.jpg"

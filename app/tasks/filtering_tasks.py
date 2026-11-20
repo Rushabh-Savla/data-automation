@@ -82,9 +82,13 @@ fork bug rode in on (see app/db/session.dispose_engine_for_fork).
 
 import logging
 import uuid
+from datetime import datetime, timezone
 
 from celery.exceptions import SoftTimeLimitExceeded
+from sqlalchemy.exc import OperationalError
+from sqlalchemy.orm import Session
 
+from app.db.models.asset import Asset
 from app.db.repositories.asset_repository import AssetRepository
 from app.db.repositories.job_repository import JobRepository
 from app.db.session import session_scope
@@ -590,7 +594,14 @@ def finalize_relevance_filter(self, job_id: str):
     run_deduplication.delay(job_id)
 
 
-@celery_app.task(name="app.tasks.filtering_tasks.run_deduplication", bind=True)
+@celery_app.task(
+    name="app.tasks.filtering_tasks.run_deduplication",
+    bind=True,
+    autoretry_for=(OperationalError,),
+    retry_backoff=True,
+    retry_backoff_max=30,
+    max_retries=3,
+)
 def run_deduplication(self, job_id: str):
     from pathlib import Path
     from app.filtering.canonical_selector import CanonicalSelector
@@ -663,11 +674,18 @@ def run_deduplication(self, job_id: str):
                     delete_asset_files(loser)
                     duplicate_count += 1
 
-        db.flush()
+        # Commit duplicate status updates first to release locks on the assets table
+        # before updating image_batches counters, avoiding lock-order deadlocks.
+        db.commit()
+
         # Derived rather than hand-decremented: the DUPLICATE status written
         # above is the fact, and reconcile reads it back for both rollups.
+        from app.db.repositories.image_batch_repository import ImageBatchRepository
+        batch_repo = ImageBatchRepository(db)
+        for b in batch_repo.list_for_job(job_uuid):
+            batch_repo.reconcile_batch_counters(b.id)
         reconcile(db, job_uuid)
-        db.flush()
+        db.commit()
         logger.info(f"Intelligent dedup for job {job_id}: {duplicate_count} confirmed duplicate(s)")
 
     ProgressPublisher(get_redis()).publish(job_id, {"type": "dedup_complete", "duplicate_count": duplicate_count})
@@ -678,6 +696,7 @@ def run_deduplication(self, job_id: str):
     # its target instead of converging on it. The planner runs the trim on the
     # final round, once no further rounds are coming.
     # Trigger batch orchestration progress check to coordinate 600-item batch replenishment
+    get_redis().delete(f"job:{job_id}:filtering_dispatched")
     from app.tasks.batch_orchestration import process_active_batch
 
     process_active_batch.delay(job_id)
@@ -698,21 +717,30 @@ def _select_trim_candidates(assets: list[tuple[str, float | None]], excess: int)
     return [asset_id for asset_id, _ in ordered[:excess]]
 
 
+def _asset_quality_sort_key(a: Asset):
+    """Deterministic ranking for surplus selection: highest relevance score,
+    highest image resolution, annotation completeness, and stable tie-breaking."""
+    is_uploaded = 1 if a.status in (AssetStatus.COMPLETED, AssetStatus.NAS_VERIFIED) else 0
+    has_score = 1 if a.relevance_score is not None else 0
+    score = float(a.relevance_score) if a.relevance_score is not None else 0.0
+    res = (a.width or 0) * (a.height or 0)
+    has_annot = 1 if a.annotation_nas_path else 0
+    created = a.discovered_at.timestamp() if a.discovered_at else 0.0
+    return (is_uploaded, has_score, score, res, has_annot, -created, str(a.id))
+
+
 def trim_excess_assets(job_id: str) -> None:
-    """If a job over-fetched past target_count (see the over-fetch buffer
-    in app/tasks/_helpers.py::build_on_progress, which deliberately fetches
-    more than target_count up front so relevance/dedup attrition still
-    lands on target), trims the worst-scoring surplus back down to exactly
-    target_count — reusing RELEVANCE_REJECTED + delete_asset_files rather
-    than introducing a new status or deletion path. Runs synchronously
-    inside run_deduplication's flow (cheap: one query + a handful of
-    status updates, not per-asset model inference) rather than as its own
-    Celery task."""
+    """Intelligent surplus trimming: retains exactly the requested target_count
+    highest-quality, eligible, unique assets and safely removes excess surplus assets.
+    Surplus assets are transitioned to AssetStatus.SURPLUS, their files safely deleted
+    (unless shared with another job), batch counters and job counters reconciled,
+    and NAS directory/manifest synchronized."""
     job_uuid = uuid.UUID(job_id)
 
     with session_scope() as db:
         job_repo = JobRepository(db)
         asset_repo = AssetRepository(db)
+        reconcile(db, job_uuid)
         job = job_repo.get(job_uuid)
         if job is None or job.target_count is None:
             return
@@ -720,41 +748,144 @@ def trim_excess_assets(job_id: str) -> None:
         if job.accepted_count <= job.target_count:
             return
 
-        # excess must be sized off len(kept), not job.accepted_count: that
-        # counter also includes PROMOTED assets awaiting a filtering
-        # decision (reconcile() treats "not yet filtered" as "provisionally
-        # accepted" — see app/services/job_counters.py), which this function
-        # can't trim since it only selects from RELEVANCE_PASSED. Sizing off
-        # job.accepted_count let excess exceed len(kept) whenever a
-        # meaningful number of assets were still undecided, and
-        # ordered[:excess] on a shorter list silently returns the WHOLE
-        # list — trimming every relevance-passed asset instead of just the
-        # surplus, leaving only the undecided leftovers as the job's
-        # "accepted" total once reconcile() ran again.
+        from app.domain.enums import ASSET_ACCEPTED_STATUSES, BatchStatus
         kept = asset_repo.list_for_job(
             job_uuid,
-            status=[AssetStatus.RELEVANCE_PASSED, AssetStatus.READY_FOR_UPLOAD],
+            status=list(ASSET_ACCEPTED_STATUSES),
             limit=100_000,
         )
-        if not kept:
+        if not kept or len(kept) <= job.target_count:
             return
 
-        excess = job.accepted_count - job.target_count
-        if excess <= 0:
-            return
+        # Sort descending by quality so the best job.target_count are retained
+        sorted_kept = sorted(kept, key=_asset_quality_sort_key, reverse=True)
+        retained = sorted_kept[: job.target_count]
+        surplus = sorted_kept[job.target_count :]
+        trim_ids = [str(a.id) for a in surplus]
 
-        excess = min(excess, len(kept))
-        trim_ids = _select_trim_candidates([(str(a.id), a.relevance_score) for a in kept], excess)
-        if not trim_ids:
-            return
-
-        by_id = {str(a.id): a for a in kept}
-        for asset_id in trim_ids:
-            asset = by_id[asset_id]
-            asset_repo.set_status(asset.id, AssetStatus.RELEVANCE_REJECTED)
+        for asset in surplus:
+            asset_repo.set_status(asset.id, AssetStatus.SURPLUS)
+            md = dict(asset.asset_metadata or {})
+            md["trimmed_as_surplus"] = True
+            md["surplus_trimmed_at"] = datetime.now(timezone.utc).isoformat()
+            asset.asset_metadata = md
             delete_asset_files(asset)
 
         db.flush()
+        from app.db.repositories.image_batch_repository import ImageBatchRepository
+        batch_repo = ImageBatchRepository(db)
+        for b in batch_repo.list_for_job(job_uuid):
+            batch_repo.reconcile_batch_counters(b.id)
         reconcile(db, job_uuid)
         db.flush()
-        logger.info(f"Trimmed {len(trim_ids)} excess asset(s) for job {job_id} to match target_count")
+        logger.info(
+            f"Trimmed {len(trim_ids)} surplus asset(s) for job {job_id} to match target_count "
+            f"({job.accepted_count}/{job.target_count})"
+        )
+
+    # Sync NAS dataset directory and manifest if NAS folder already exists
+    try:
+        from app.services.nas_config_service import get_active_storage_params, is_storage_active
+        if is_storage_active():
+            params = get_active_storage_params()
+            if params:
+                with session_scope() as db:
+                    job = JobRepository(db).get(job_uuid)
+                    if job and isinstance(job.config, dict):
+                        from app.domain.nas_resolver import resolve_job_nas_directory
+                        remote_job_dir = resolve_job_nas_directory(job)
+                        if remote_job_dir:
+                            from app.connectors.nas.base import open_client
+                            with open_client(params) as client:
+                                images_dir = f"{remote_job_dir}/images"
+                                if client.exists(images_dir):
+                                    surplus_id_set = set(trim_ids)
+                                    for entry in list(client.walk(images_dir)):
+                                        stem = Path(entry.path).stem
+                                        if stem in surplus_id_set:
+                                            try:
+                                                client.delete(entry.path)
+                                            except Exception as exc:
+                                                logger.debug(f"Could not delete surplus NAS file {entry.path}: {exc}")
+                                    # Refresh manifest
+                                    final_imgs = list(client.walk(images_dir))
+                                    manifest_path = f"{remote_job_dir}/manifest.json"
+                                    if client.exists(manifest_path):
+                                        try:
+                                            import tempfile
+                                            manifest_payload = {
+                                                "job_id": str(job_id),
+                                                "job_name": job.name,
+                                                "generated_at": datetime.now(timezone.utc).isoformat(),
+                                                "total_images": len(final_imgs),
+                                                "images": [
+                                                    {"filename": Path(e.path).name, "rel_path": f"images/{Path(e.path).name}", "size": e.size}
+                                                    for e in sorted(final_imgs, key=lambda x: x.path)
+                                                ],
+                                            }
+                                            with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as tf:
+                                                json.dump(manifest_payload, tf, indent=2)
+                                                tmp_p = Path(tf.name)
+                                            client.upload(tmp_p, manifest_path)
+                                            tmp_p.unlink(missing_ok=True)
+                                        except Exception as exc:
+                                            logger.debug(f"Could not rewrite manifest on NAS after trim: {exc}")
+    except Exception as e:
+        logger.debug(f"NAS sync after surplus trim skipped or warning: {e}")
+
+
+def trim_excess_batch_assets(batch_id: str | uuid.UUID, db: Session | None = None) -> int:
+    """Batch-level surplus trimming: retains exactly the batch's target_image_count
+    highest-quality, eligible, unique assets and transitions excess surplus assets
+    to AssetStatus.SURPLUS, deleting their local files and updating batch counters.
+    """
+    b_uuid = uuid.UUID(str(batch_id))
+
+    def _execute(session: Session) -> int:
+        from sqlalchemy import select
+        from app.db.models.image_batch import ImageBatch
+        from app.db.repositories.image_batch_repository import ImageBatchRepository
+        from app.domain.enums import ASSET_ACCEPTED_STATUSES, BatchStatus
+
+        batch = session.get(ImageBatch, b_uuid)
+        if batch is None or not batch.target_image_count:
+            return 0
+
+        target = batch.target_image_count
+        stmt = select(Asset).where(
+            Asset.batch_id == b_uuid,
+            Asset.status.in_(list(ASSET_ACCEPTED_STATUSES)),
+        )
+        batch_assets = list(session.execute(stmt).scalars().all())
+        if len(batch_assets) <= target:
+            return 0
+
+        # Sort descending by quality so the best batch.target_image_count are retained
+        sorted_assets = sorted(batch_assets, key=_asset_quality_sort_key, reverse=True)
+        retained = sorted_assets[:target]
+        surplus = sorted_assets[target:]
+
+        asset_repo = AssetRepository(session)
+        for asset in surplus:
+            asset_repo.set_status(asset.id, AssetStatus.SURPLUS)
+            md = dict(asset.asset_metadata or {})
+            md["trimmed_as_surplus"] = True
+            md["surplus_trimmed_at"] = datetime.now(timezone.utc).isoformat()
+            asset.asset_metadata = md
+            delete_asset_files(asset)
+
+        session.flush()
+        batch_repo = ImageBatchRepository(session)
+        batch_repo.reconcile_batch_counters(b_uuid)
+        reconcile(session, batch.job_id)
+        session.commit()
+        logger.info(
+            f"Batch {batch_id}: Trimmed {len(surplus)} surplus asset(s) to match target_image_count "
+            f"({len(retained)}/{target})"
+        )
+        return len(surplus)
+
+    if db is not None:
+        return _execute(db)
+    with session_scope() as session:
+        return _execute(session)

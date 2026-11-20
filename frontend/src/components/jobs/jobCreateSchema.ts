@@ -393,7 +393,7 @@ export function buildConfigPayload(values: JobCreateFormValues): JobConfig {
 export function buildJobCreatePayload(values: JobCreateFormValues): JobCreateRequest {
   const payload: JobCreateRequest = {
     query: values.query,
-    name: values.name?.trim() ? values.name.trim() : values.query.trim(),
+    name: values.name?.trim() || undefined,
     sources: values.useAutoSources ? undefined : (values.sources as SourceType[]),
     target_count: values.targetCountEnabled ? values.targetCount : undefined,
     deadline_at: values.deadlineEnabled && values.deadline ? new Date(values.deadline).toISOString() : undefined,

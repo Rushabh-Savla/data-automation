@@ -92,19 +92,32 @@ def reconcile(db: Session, job_id: uuid.UUID) -> dict[str, int]:
     if job is None:
         return {}
 
+    from app.domain.enums import JobStatus
+    is_terminal_job = job.status in (
+        JobStatus.COMPLETED,
+        JobStatus.COMPLETED_PARTIAL,
+        JobStatus.FAILED,
+        JobStatus.CANCELLED,
+    )
+    accepted_statuses = (
+        (AssetStatus.COMPLETED, AssetStatus.NAS_VERIFIED)
+        if is_terminal_job
+        else _ACCEPTED
+    )
+
     per_task = _counts_by_task_and_status(db, job_id)
     for task in db.execute(
         select(JobSourceTask).where(JobSourceTask.job_id == job_id)
     ).scalars():
         counts = per_task.get(task.id, {})
-        task.accepted_count = _sum(counts, _ACCEPTED)
+        task.accepted_count = _sum(counts, accepted_statuses)
         task.rejected_count = _sum(counts, _REJECTED)
         # downloaded = every asset row this source ever created; a row only
         # exists once its file landed.
         task.downloaded_count = sum(counts.values())
 
     totals = _counts_by_status(db, job_id)
-    job.accepted_count = _sum(totals, _ACCEPTED)
+    job.accepted_count = _sum(totals, accepted_statuses)
     job.rejected_count = _sum(totals, _REJECTED)
     job.duplicate_count = _sum(totals, _DUPLICATE)
     job.downloaded_count = sum(totals.values())
@@ -130,6 +143,7 @@ def reconcile(db: Session, job_id: uuid.UUID) -> dict[str, int]:
         "retry_pending": totals.get(AssetStatus.RETRY_PENDING.value, 0),
         "rejected": job.rejected_count,
         "duplicate": job.duplicate_count,
+        "surplus": totals.get(AssetStatus.SURPLUS.value, 0),
         "downloaded": job.downloaded_count,
         "discovered": job.discovered_count,
     }

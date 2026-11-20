@@ -110,6 +110,7 @@ def test_window_waiting_checkpoint_persistence(mock_db, monkeypatch):
     monkeypatch.setattr("app.tasks.cleanup_tasks.cleanup_local.delay", cleanup_mock)
     advance_mock = MagicMock()
     monkeypatch.setattr("app.tasks.orchestration_tasks.check_and_advance_job", advance_mock)
+    monkeypatch.setattr("app.tasks.orchestration_tasks.schedule_eligible_source_tasks.delay", MagicMock())
 
     # Simulated chord results where one task returned window_full
     chord_results = [

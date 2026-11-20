@@ -16,6 +16,8 @@ from app.core.logging import bind_job_context, clear_job_context
 from app.core.redis_client import get_redis
 from app.db.repositories.job_repository import JobRepository
 from app.db.repositories.job_source_task_repository import JobSourceTaskRepository
+from app.db.session import session_scope
+from app.domain.enums import BatchStatus
 from app.services.cancellation_service import CancellationService
 from app.services.progress_service import ProgressPublisher
 
@@ -114,7 +116,9 @@ def build_on_progress(
 ) -> Callable[[dict], None]:
     import time
     from collections import defaultdict
-    from sqlalchemy.exc import OperationalError
+    from sqlalchemy.exc import DBAPIError, OperationalError
+    from app.db.session import session_scope
+    from app.domain.enums import BatchStatus
 
     task_repo = JobSourceTaskRepository(db)
     job_repo = JobRepository(db)
@@ -159,38 +163,42 @@ def build_on_progress(
             last_commit_time = now
             for attempt in range(5):
                 try:
-                    # STRICT LOCK ORDERING: ALWAYS update Job first, then JobSourceTask.
-                    # Consistent lock acquisition order eliminates deadlock (Postgres 40P01)
-                    # under concurrent worker execution.
-                    if pending_job:
-                        job_repo.increment_counts(job_id, **pending_job)
+                    with session_scope() as progress_db:
+                        prog_job_repo = JobRepository(progress_db)
+                        prog_task_repo = JobSourceTaskRepository(progress_db)
 
-                    if pending_checkpoint is not None:
-                        task = task_repo.get(job_source_task_id)
-                        merged = dict(task.checkpoint or {}) if task else {}
-                        for cp_k, cp_v in pending_checkpoint.items():
-                            if isinstance(cp_v, dict) and isinstance(merged.get(cp_k), dict):
-                                merged[cp_k] = {**merged[cp_k], **cp_v}
-                            else:
-                                merged[cp_k] = cp_v
-                        task_repo.heartbeat(job_source_task_id, checkpoint=merged)
-                    else:
-                        task_repo.heartbeat(job_source_task_id)
+                        # STRICT LOCK ORDERING: ALWAYS update Job first, then JobSourceTask.
+                        # Consistent lock acquisition order eliminates deadlock (Postgres 40P01)
+                        # under concurrent worker execution.
+                        if pending_job:
+                            prog_job_repo.increment_counts(job_id, **pending_job)
 
-                    if pending_task:
-                        task_repo.increment_counts(job_source_task_id, **pending_task)
+                        if pending_checkpoint is not None:
+                            task = prog_task_repo.get(job_source_task_id)
+                            merged = dict(task.checkpoint or {}) if task else {}
+                            for cp_k, cp_v in pending_checkpoint.items():
+                                if isinstance(cp_v, dict) and isinstance(merged.get(cp_k), dict):
+                                    merged[cp_k] = {**merged[cp_k], **cp_v}
+                                else:
+                                    merged[cp_k] = cp_v
+                            prog_task_repo.heartbeat(job_source_task_id, checkpoint=merged)
+                        else:
+                            prog_task_repo.heartbeat(job_source_task_id)
 
-                    db.commit()
+                        if pending_task:
+                            prog_task_repo.increment_counts(job_source_task_id, **pending_task)
+
+                        progress_db.commit()
+
                     pending_job.clear()
                     pending_task.clear()
                     pending_checkpoint = None
                     break
-                except OperationalError as exc:
-                    db.rollback()
+                except (OperationalError, DBAPIError, Exception) as exc:
                     if attempt == 4:
                         logger.warning(f"Failed to commit progress for task {job_source_task_id}: {exc}")
-                        raise
-                    time.sleep(0.05 * (2 ** attempt))
+                    else:
+                        time.sleep(0.05 * (2 ** attempt))
 
         # Fast-path completion check: as soon as a count-based job's
         # (buffered) target is hit, flag it so should_stop() (checked by
@@ -208,6 +216,9 @@ def build_on_progress(
         if delta.get("accepted"):
             job = job_repo.get(job_id)
             if job is not None and job.target_count is not None:
+                from app.core.config import resolve_overfetch_buffer
+                buffer = resolve_overfetch_buffer(job.config)
+
                 # If batch processing is enabled for this job (default), the candidate window
                 # bounds each round to download_candidate_window (e.g. 600) rather than downloading
                 # the entire job target (e.g. 5000) upfront.
@@ -220,11 +231,22 @@ def build_on_progress(
                 elif batch_mode:
                     # Bounded candidate window: stop this round once the current batch window is reached
                     candidate_window = job.config.get("candidate_window", get_settings().download_candidate_window)
-                    # Current round target is capped to candidate window or remaining job target
-                    active_batch_target = min(candidate_window, job.target_count)
-                    target = buffered_target(active_batch_target, get_settings().target_overfetch_buffer)
+                    from app.db.repositories.image_batch_repository import ImageBatchRepository
+                    batch_repo = ImageBatchRepository(db)
+                    active_b = batch_repo.get_active_batch(job.id)
+                    active_batch_target = (
+                        active_b.target_image_count
+                        if (active_b and active_b.target_image_count)
+                        else min(candidate_window, job.target_count)
+                    )
+                    completed_acc = sum(
+                        b.accepted_image_count or b.target_image_count or 0
+                        for b in batch_repo.list_for_job(job.id)
+                        if b.status == BatchStatus.COMPLETED
+                    )
+                    target = completed_acc + buffered_target(active_batch_target, buffer)
                 else:
-                    target = buffered_target(job.target_count, get_settings().target_overfetch_buffer)
+                    target = buffered_target(job.target_count, buffer)
                 if job.accepted_count >= target:
                     cancellation.mark_target_reached(str(job_id))
                     # Trigger processing of the acquired candidate window immediately without waiting for slow sources

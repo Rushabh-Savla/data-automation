@@ -40,7 +40,7 @@ logger = logging.getLogger(__name__)
 
 _OBJECTS_URL = "https://homes.cs.washington.edu/~ranjay/visualgenome/data/dataset/objects.json.zip"
 _IMAGE_DATA_URL = "https://homes.cs.washington.edu/~ranjay/visualgenome/data/dataset/image_data.json.zip"
-_SHARD_SIZE = 20
+_SHARD_SIZE = 50
 _LICENSE_NOTE = "Visual Genome (CC BY 4.0 — see https://visualgenome.org/api/v0/api_home.html)"
 
 
@@ -208,10 +208,10 @@ class VisualGenomeConnector:
                         getattr(admission, "window_index", None),
                         i,
                     )
+                if status == "INACTIVE":
+                    raise JobStopped(f"Candidate admission closed for {source_item_id}")
                 if status != "ADMITTED":
-                    raise FatalConnectorError(
-                        f"Candidate admission failed for {source_item_id}: {status}"
-                    )
+                    continue
 
             url = info["url"]
             dest = workdir / f"vg_{image_id}.jpg"

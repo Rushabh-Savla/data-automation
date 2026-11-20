@@ -9,30 +9,17 @@ import { useNasConfig } from '@/hooks/useNasConfig'
 
 export function NasPage() {
   const { data: config, isLoading, isError } = useNasConfig()
-  const [testResult, setTestResult] = useState<NasTestResult | null>(null)
+  const [, setTestResult] = useState<NasTestResult | null>(null)
 
   return (
     <>
       <Topbar
         title="NAS"
         right={
-          config && (
-            <div className="flex items-center gap-2">
-              {config.configured && (
-                <Badge variant="outline" className="text-xs font-mono uppercase">
-                  {config.protocol}
-                </Badge>
-              )}
-              {testResult ? (
-                <Badge variant={testResult.ok ? 'success' : 'destructive'}>
-                  {testResult.ok ? 'Connected' : 'Disconnected'}
-                </Badge>
-              ) : (
-                <Badge variant={config.configured ? 'outline' : 'secondary'}>
-                  {config.configured ? 'Configured' : 'Not configured'}
-                </Badge>
-              )}
-            </div>
+          config?.configured && (
+            <Badge variant="outline" className="text-xs font-mono uppercase">
+              {config.protocol}
+            </Badge>
           )
         }
       />

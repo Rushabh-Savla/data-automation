@@ -45,8 +45,8 @@ export function AssetCard({ asset, onClick }: { asset: AssetResponse; onClick: (
               className="h-full w-full object-cover transition-transform group-hover:scale-105"
             />
           )}
-          <Badge variant={assetStatusVariant[asset.status]} className="absolute top-2 right-2 shadow-sm">
-            {assetStatusLabels[asset.status]}
+          <Badge variant={assetStatusVariant[asset.status] ?? 'secondary'} className="absolute top-2 right-2 shadow-sm">
+            {assetStatusLabels[asset.status] ?? asset.status}
           </Badge>
         </div>
         <div className="flex flex-col gap-0.5 p-2 text-xs">

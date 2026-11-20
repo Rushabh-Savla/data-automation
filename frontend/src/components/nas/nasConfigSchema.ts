@@ -61,7 +61,7 @@ export const nasConfigSchema = z
       if (!data.password && !data.hasSavedPassword) fail('password', 'Enter a password')
     }
 
-    if (data.useAsStorage && !data.storagePath.trim()) fail('storagePath', 'Enter a storage folder')
+    if (data.useAsStorage && data.storagePath && !data.storagePath.trim()) fail('storagePath', 'Enter a storage folder')
     if (hasParentSegment(data.basePath)) fail('basePath', 'Folder cannot contain ".."')
     if (hasParentSegment(data.storagePath)) fail('storagePath', 'Folder cannot contain ".."')
   })
@@ -74,8 +74,8 @@ export const nasConfigDefaultValues: NasConfigFormValues = {
   port: '',
   share: '',
   basePath: '',
-  storagePath: '',
-  useAsStorage: false,
+  storagePath: 'ai_data_collection/data_collection',
+  useAsStorage: true,
   authMode: 'anonymous',
   username: '',
   domain: '',
@@ -124,8 +124,8 @@ export function configToFormValues(config: NasConfig): NasConfigFormValues {
     port: config.port === null ? '' : String(config.port),
     share: config.share,
     basePath: config.base_path,
-    storagePath: config.storage_path === 'data_automation' ? '' : (config.storage_path ?? ''),
-    useAsStorage: Boolean(config.storage_path && config.storage_path !== 'data_automation' && config.use_as_storage),
+    storagePath: config.storage_path || 'ai_data_collection/data_collection',
+    useAsStorage: config.use_as_storage ?? true,
     authMode: config.auth_mode,
     username: config.username,
     domain: config.domain,
@@ -146,6 +146,7 @@ export function buildNasConfigPayload(values: NasConfigFormValues): NasConfigInp
   const withPassword = authMode === 'password'
   const useTls = protocolSupportsTls(protocol) && values.useTls
   const port = values.port.trim()
+  const storagePath = values.storagePath.trim() || (values.useAsStorage ? 'ai_data_collection/data_collection' : '')
 
   const payload: NasConfigInput = {
     protocol,
@@ -153,8 +154,8 @@ export function buildNasConfigPayload(values: NasConfigFormValues): NasConfigInp
     port: protocol === 'local' || !port ? null : Number(port),
     share: values.share.trim(),
     base_path: values.basePath.trim(),
-    storage_path: values.storagePath ? values.storagePath.trim() : '',
-    use_as_storage: Boolean(values.storagePath && values.storagePath.trim() && values.useAsStorage),
+    storage_path: storagePath,
+    use_as_storage: values.useAsStorage !== undefined ? values.useAsStorage : true,
     auth_mode: authMode,
     username: withPassword ? values.username.trim() : '',
     domain: withPassword && protocol === 'smb' ? values.domain.trim() : '',

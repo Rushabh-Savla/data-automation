@@ -136,6 +136,18 @@ def _run_item_download(
         task_repo.heartbeat(task_uuid)
         db.commit()
 
+        # Fast-stop check: if the job has already satisfied its target count, halt immediately
+        from app.db.models.job import Job
+        job = db.get(Job, job_uuid)
+        if job is not None and job.target_count is not None and (job.accepted_count or 0) >= job.target_count:
+            try:
+                CancellationService(get_redis_client()).mark_target_reached(str(job_uuid))
+            except Exception:
+                pass
+            logger.info(f"[INGEST] Job {job_uuid} target count already satisfied ({job.accepted_count}/{job.target_count}). Stopping download.")
+            unbind_context()
+            return {"item": checkpoint_key, "accepted": 0, "rejected": 0, "stopped": True}
+
         # Fast-skip check: if all active candidate windows are already FULL, don't waste
         # bandwidth/IO downloading a dataset/video only to discard it during frame extraction.
         from sqlalchemy import select
@@ -143,33 +155,35 @@ def _run_item_download(
         from app.db.models.image_batch import ImageBatch
         from app.domain.enums import BatchStatus
 
-        terminal_batches = (BatchStatus.COMPLETED, BatchStatus.PARTIAL, BatchStatus.FAILED)
+        ineligible_batches = (
+            BatchStatus.READY_FOR_UPLOAD,
+            BatchStatus.UPLOADING,
+            BatchStatus.NAS_UPLOADING,
+            BatchStatus.NAS_PENDING,
+            BatchStatus.VERIFYING,
+            BatchStatus.NAS_VERIFIED,
+            BatchStatus.COMPLETED,
+            BatchStatus.PARTIAL,
+            BatchStatus.FAILED,
+        )
         active_batch_ids = db.execute(
             select(ImageBatch.id)
             .where(
                 ImageBatch.job_id == job_uuid,
-                ~ImageBatch.status.in_(terminal_batches),
+                ~ImageBatch.status.in_(ineligible_batches),
             )
         ).scalars().all()
 
         if active_batch_ids:
-            open_win = db.execute(
+            latest_win = db.execute(
                 select(CandidateWindow)
-                .where(
-                    CandidateWindow.batch_id.in_(active_batch_ids),
-                    CandidateWindow.status.in_(("OPEN", "ACQUIRING")),
-                )
+                .where(CandidateWindow.batch_id.in_(active_batch_ids))
+                .order_by(CandidateWindow.window_index.desc())
                 .limit(1)
             ).scalar_one_or_none()
-            if open_win is None:
-                latest_win = db.execute(
-                    select(CandidateWindow)
-                    .where(CandidateWindow.batch_id.in_(active_batch_ids))
-                    .order_by(CandidateWindow.created_at.desc())
-                    .limit(1)
-                ).scalar_one_or_none()
-                win_id = str(latest_win.id) if latest_win else ""
-                win_idx = latest_win.window_index if latest_win else 0
+            if latest_win is not None and latest_win.status == "FULL":
+                win_id = str(latest_win.id)
+                win_idx = latest_win.window_index
                 logger.info(
                     f"[WINDOW] Active candidate windows for job {job_uuid} are already FULL. "
                     f"Fast-skipping download for {checkpoint_key}."
@@ -180,6 +194,7 @@ def _run_item_download(
                     "accepted": 0,
                     "rejected": 0,
                     "window_full": True,
+                    "deferred": True,
                     "window_id": win_id,
                     "window_index": win_idx,
                     "checkpoint_index": 0,
@@ -281,6 +296,7 @@ def _run_item_download(
                 "accepted": accepted,
                 "rejected": rejected,
                 "window_full": True,
+                "deferred": True,
                 "window_id": exc.window_id,
                 "window_index": exc.window_index,
                 "checkpoint_index": exc.checkpoint_index,
@@ -290,6 +306,12 @@ def _run_item_download(
             unbind_context()
             return {"item": checkpoint_key, "accepted": accepted, "rejected": rejected, "stopped": True}
         except FatalConnectorError as e:
+            err_str = str(e)
+            if "Candidate admission failed" in err_str or "INACTIVE" in err_str or "Candidate window" in err_str or "JobStopped" in err_str:
+                logger.info(f"Candidate admission closed/inactive for {checkpoint_key}: {e}")
+                unbind_context()
+                return {"item": checkpoint_key, "accepted": accepted, "rejected": rejected, "stopped": True}
+
             # Increment the error counter on the source task but do NOT set
             # the task status to FAILED — one inaccessible dataset (e.g. a
             # restricted firearm/NSFW dataset returning 403) must not mark
@@ -342,6 +364,18 @@ def _run_item_download(
             logger.error(f"Exhausted retries downloading {checkpoint_key} (recorded as error, not task failure): {e}")
             return {"item": checkpoint_key, "accepted": accepted, "rejected": rejected, "error": str(e)}
         except Exception as e:
+            err_str = str(e)
+            if (
+                "Candidate reservation" in err_str
+                or "Reservation " in err_str
+                or "Candidate window" in err_str
+                or "Candidate admission failed" in err_str
+                or "INACTIVE" in err_str
+            ):
+                unbind_context()
+                logger.info(f"Candidate reservation expired or closed for {checkpoint_key}: {e}")
+                return {"item": checkpoint_key, "accepted": accepted, "rejected": rejected, "window_full": True}
+
             # Anything not covered above (a DB constraint violation, an
             # unclassified third-party SDK error, ...) must not crash this
             # task outright: an unhandled exception in one chord member
@@ -356,7 +390,15 @@ def _run_item_download(
             with session_scope() as err_db:
                 err_repo = JobSourceTaskRepository(err_db)
                 err_repo.increment_counts(task_uuid, errors=1)
-                err_summary = str(e).splitlines()[0] if str(e) else "Connector error"
+                if (
+                    "InFailedSqlTransaction" in err_str
+                    or "current transaction is aborted" in err_str
+                    or "DeadlockDetected" in err_str
+                    or "psycopg" in err_str.lower()
+                ):
+                    err_summary = "Database operation retry (transient)"
+                else:
+                    err_summary = str(e).splitlines()[0] if str(e) else "Connector error"
                 err_repo.set_status(task_uuid, JobSourceTaskStatus.DOWNLOADING, error_message=err_summary)
                 err_db.commit()
             unbind_context()
@@ -508,6 +550,14 @@ def _default_frames_per_video(target_count: int | None) -> int:
     max_retries=5,
 )
 def download_youtube_video(self, job_id: str, job_source_task_id: str, item_dict: dict):
+    try:
+        from app.services.cancellation_service import CancellationService
+        from app.core.redis_client import get_redis as get_redis_client
+        if CancellationService(get_redis_client()).should_stop(job_id, job_source_task_id):
+            return {"item": item_dict.get("external_ref", {}).get("video_id", "yt"), "accepted": 0, "rejected": 0, "stopped": True}
+    except Exception:
+        pass
+
     settings = get_settings()
     item = SourceItem(
         source_type=SourceType.YOUTUBE,
@@ -894,7 +944,8 @@ def download_nuscenes_shard(self, job_id: str, job_source_task_id: str, item_dic
     admit_candidate = _make_admit_candidate(job_source_task_id, SourceType.NUSCENES)
 
     def fetch(checkpoint, should_stop, on_progress):
-        yield from connector.fetch(item, workdir, checkpoint, should_stop, on_progress, admit_candidate=admit_candidate)
+        with heartbeat_during(uuid.UUID(job_source_task_id)):
+            yield from connector.fetch(item, workdir, checkpoint, should_stop, on_progress, admit_candidate=admit_candidate)
 
     return _run_item_download(job_id, job_source_task_id, SourceType.NUSCENES, shard_id, fetch, bound_task=self)
 
@@ -925,9 +976,11 @@ def download_kitti_shard(self, job_id: str, job_source_task_id: str, item_dict: 
         min_res = tuple(task.job.config.get("min_resolution", (64, 64))) if task and task.job else (64, 64)
 
     connector = KittiConnector(min_resolution=min_res)
+    admit_candidate = _make_admit_candidate(job_source_task_id, SourceType.KITTI)
 
     def fetch(checkpoint, should_stop, on_progress):
-        yield from connector.fetch(item, workdir, checkpoint, should_stop, on_progress)
+        with heartbeat_during(uuid.UUID(job_source_task_id)):
+            yield from connector.fetch(item, workdir, checkpoint, should_stop, on_progress, admit_candidate=admit_candidate)
 
     return _run_item_download(job_id, job_source_task_id, SourceType.KITTI, shard_id, fetch, bound_task=self)
 

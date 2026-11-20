@@ -50,6 +50,10 @@ export type JobSourceTaskStatus =
   | 'downloading'
   | 'window_waiting'
   | 'standardizing'
+  | 'discovery_completed'
+  | 'partially_processed'
+  | 'waiting_for_download'
+  | 'source_exhausted'
   | 'completed'
   | 'completed_partial'
   | 'failed'
@@ -65,6 +69,12 @@ export type AssetStatus =
   | 'relevance_pending'
   | 'relevance_passed'
   | 'relevance_rejected'
+  | 'review_pending'
+  | 'retry_pending'
+  | 'ready_for_upload'
+  | 'uploading'
+  | 'nas_verified'
+  | 'completed'
   | 'duplicate'
   | 'failed'
 
@@ -246,6 +256,18 @@ export interface JobSourceTaskResponse {
   error_count: number
   error_message: string | null
   last_heartbeat_at: string | null
+  discovered_unit?: string
+  pending_count?: number
+  total_inventoried?: number
+  processed_count?: number
+  completion_percentage?: number
+  waiting_reason?: string
+  is_active?: boolean
+  is_complete?: boolean
+  unit_label?: string
+  is_reschedulable?: boolean
+  status_label?: string
+  status_explanation?: string
 }
 
 export interface JobResponse {
@@ -281,6 +303,12 @@ export interface JobResponse {
   parent_job_id: string | null
   config?: JobConfig | null
   nas_destination?: string | null
+  current_round?: number
+  active_source?: string | null
+  active_source_position?: string | null
+  completed_sources?: string[]
+  next_source_in_queue?: string | null
+  sequential_waiting_reason?: string | null
 }
 
 export interface JobDetailResponse extends JobResponse {
@@ -296,6 +324,12 @@ export interface JobProgressResponse {
   duplicate_count: number
   discovered_count: number
   downloaded_count: number
+  current_round?: number
+  active_source?: string | null
+  active_source_position?: string | null
+  completed_sources?: string[]
+  next_source_in_queue?: string | null
+  sequential_waiting_reason?: string | null
   source_tasks: JobSourceTaskResponse[]
 }
 
@@ -433,6 +467,16 @@ export interface NasTestResult {
   sample_files: string[]
 }
 
+export interface NasStatus {
+  configured: boolean
+  connected: boolean
+  protocol: NasProtocol | null
+  host: string | null
+  port: number | null
+  latency_ms: number | null
+  message: string | null
+}
+
 export interface NasFoldersResponse {
   current_path: string
   parent_path?: string | null
@@ -480,6 +524,7 @@ export interface WsJobStatus {
   type: 'job_status'
   status: JobStatus
   completion_reason?: JobCompletionReason
+  completed_at?: string | null
 }
 
 export interface WsConnectorFinished {

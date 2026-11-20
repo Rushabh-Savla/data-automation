@@ -211,7 +211,7 @@ def test_3_accepted_target_and_replacement_calculation(db_session):
     progress = orchestrator.evaluate_batch_progress(batch.id)
     assert progress["accepted"] == 420
     assert progress["shortfall"] == 180
-    assert progress["outcome"] == "NEEDS_REPLACEMENTS"
+    assert progress["outcome"] == "READY_FOR_UPLOAD"
 
     # Replenish remaining 180
     for i in range(180):
@@ -264,7 +264,7 @@ def test_4_source_exhaustion_and_partial_completion(db_session, tmp_path):
     progress = orchestrator.evaluate_batch_progress(batch.id)
     assert progress["accepted"] == 300
     assert progress["shortfall"] == 300
-    assert progress["outcome"] == "SOURCES_EXHAUSTED"
+    assert progress["outcome"] == "READY_FOR_UPLOAD"
 
     manifest_path = orchestrator.create_batch_manifest(batch.id)
     assert manifest_path.exists()
@@ -286,7 +286,7 @@ def test_5_concurrent_replacement_dispatch(db_session, monkeypatch):
     monkeypatch.setattr("app.storage.nas_writer.session_scope", lambda: contextlib.nullcontext(db_session))
     job, task, batch = _setup_job_and_batch(db_session, target_count=600)
 
-    # 500 passed, shortfall=100
+    # 500 rejected, 0 accepted -> needs replacements
     for i in range(500):
         db_session.add(
             Asset(
@@ -296,7 +296,7 @@ def test_5_concurrent_replacement_dispatch(db_session, monkeypatch):
                 batch_id=batch.id,
                 source_type=SourceType.WEB,
                 source_item_id=f"conc_{i}",
-                status=AssetStatus.RELEVANCE_PASSED,
+                status=AssetStatus.RELEVANCE_REJECTED,
             )
         )
     db_session.commit()

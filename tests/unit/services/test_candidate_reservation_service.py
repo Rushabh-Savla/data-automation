@@ -208,3 +208,35 @@ def test_set_candidate_window_status_guard(isolated_db):
     # Terminal states directly via set_candidate_window_status must be rejected
     with pytest.raises(ValueError, match="Terminal states require verified NAS"):
         set_candidate_window_status(window_id, "COMPLETED")
+
+
+def test_ensure_candidate_window_concurrency_race(isolated_db):
+    """Verifies that if a concurrent worker creates the window in the same millisecond,
+    ensure_candidate_window safely recovers the window without an unhandled IntegrityError."""
+    with isolated_db() as db:
+        job = Job(id=uuid.uuid4(), name="test_job", query="cats", status=JobStatus.RUNNING)
+        batch = ImageBatch(id=uuid.uuid4(), job_id=job.id, batch_index=2, status=BatchStatus.DOWNLOADING)
+        db.add_all([job, batch])
+        db.commit()
+
+        # Simulate concurrent insertion by creating the window first
+        win1_id = ensure_candidate_window(db, batch, candidate_limit=750)
+        assert win1_id is not None
+
+        # Calling again must return existing window
+        win2_id = ensure_candidate_window(db, batch, candidate_limit=750)
+        assert win2_id == win1_id
+
+
+def test_admit_candidate_concurrent_duplicate_reservation(isolated_db):
+    """Verifies that if two workers concurrently reserve the identical item,
+    the second worker safely returns DUPLICATE without corrupting the session."""
+    job_id, batch_id, task_id, window_id = _setup_job_and_batch(isolated_db, candidate_limit=5)
+
+    admission1 = admit_candidate_for_task(task_id, SourceType.COCO, "duplicate_item_1")
+    assert admission1.status == CandidateAdmissionStatus.ADMITTED
+
+    # Second attempt with same source item id must return DUPLICATE
+    admission2 = admit_candidate_for_task(task_id, SourceType.COCO, "duplicate_item_1")
+    assert admission2.status == CandidateAdmissionStatus.DUPLICATE
+

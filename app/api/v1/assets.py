@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_db
 from app.core.security import require_api_key
 from app.db.repositories.asset_repository import AssetRepository
-from app.domain.enums import AssetStatus, SourceType
+from app.domain.enums import AssetStatus, SourceType, RELEVANCE_ACCEPTED_STATUSES
 from app.schemas.asset import AssetResponse
 from app.schemas.common import PageResponse
 from app.services.standardization_service import delete_asset_files
@@ -79,8 +79,14 @@ def list_assets(
     db: Session = Depends(get_db),
 ):
     repo = AssetRepository(db)
-    items = repo.list_for_job(job_id, status=status, source_type=source_type, search=search, limit=limit, offset=offset)
-    total = repo.count_for_job(job_id, status=status, source_type=source_type, search=search)
+    query_status = status
+    # When filtering by "relevance_passed", return all assets that were accepted
+    # (they advance through ready_for_upload -> uploading -> nas_verified -> completed)
+    if status == AssetStatus.RELEVANCE_PASSED:
+        query_status = RELEVANCE_ACCEPTED_STATUSES
+
+    items = repo.list_for_job(job_id, status=query_status, source_type=source_type, search=search, limit=limit, offset=offset)
+    total = repo.count_for_job(job_id, status=query_status, source_type=source_type, search=search)
     return PageResponse(items=items, total=total, limit=limit, offset=offset)
 
 
@@ -94,38 +100,49 @@ def get_asset(asset_id: uuid.UUID, db: Session = Depends(get_db)):
 
 @router.get("/assets/{asset_id}/file")
 def get_asset_file(asset_id: uuid.UUID, db: Session = Depends(get_db)):
-    asset = AssetRepository(db).get(asset_id)
-    if asset is None or not asset.nas_path:
-        raise HTTPException(404, f"Asset {asset_id} not found or has no stored file")
-    if asset_files.is_remote(asset.nas_path):
-        return _remote_file_response(asset_id, asset.nas_path, thumbnail=False)
-    if not Path(asset.nas_path).exists():
-        # The asset row can outlive its NAS file — relevance rejection,
-        # dedup, and trim_excess_assets all delete the file but leave the
-        # row (see delete_asset_files' docstring). FileResponse checks
-        # existence lazily inside its ASGI __call__, not here, so without
-        # this it raises an unhandled RuntimeError deep in Starlette
-        # instead of a clean 404.
+    repo = AssetRepository(db)
+    asset = repo.get(asset_id)
+    if asset is None:
+        raise HTTPException(404, f"Asset {asset_id} not found")
+
+    target_asset = asset
+    # If file was removed because asset is a duplicate, fall back to the canonical parent
+    if (not target_asset.nas_path or not Path(target_asset.nas_path).exists()) and target_asset.is_duplicate_of:
+        canonical = repo.get(target_asset.is_duplicate_of)
+        if canonical and canonical.nas_path:
+            target_asset = canonical
+
+    if not target_asset.nas_path:
+        raise HTTPException(404, f"Asset {asset_id} has no stored file")
+    if asset_files.is_remote(target_asset.nas_path):
+        return _remote_file_response(target_asset.id, target_asset.nas_path, thumbnail=False)
+    if not Path(target_asset.nas_path).exists():
         raise HTTPException(404, f"Asset {asset_id}'s file no longer exists on disk")
-    return FileResponse(asset.nas_path)
+    return FileResponse(target_asset.nas_path)
 
 
 @router.get("/assets/{asset_id}/thumbnail")
 def get_asset_thumbnail(asset_id: uuid.UUID, db: Session = Depends(get_db)):
-    """A small resized JPEG for grid display — the Assets grid used to
-    fetch the full original file (same route as the Download button) for
-    every card just to show it in a small square, which was especially
-    slow for the platform's larger sources (KITTI/SUN RGB-D). Generated
-    once on first request and cached to disk (see _thumbnail_path_for) —
-    every request after that is a plain file read, no repeated resize
-    cost."""
-    asset = AssetRepository(db).get(asset_id)
-    if asset is None or not asset.nas_path:
-        raise HTTPException(404, f"Asset {asset_id} not found or has no stored file")
-    if asset_files.is_remote(asset.nas_path):
-        return _remote_file_response(asset_id, asset.nas_path, thumbnail=True)
+    """A small resized JPEG for grid display — cached to disk on first request.
+    If the asset is a duplicate whose disk file was pruned, falls back to
+    the canonical asset's thumbnail."""
+    repo = AssetRepository(db)
+    asset = repo.get(asset_id)
+    if asset is None:
+        raise HTTPException(404, f"Asset {asset_id} not found")
 
-    nas_path = Path(asset.nas_path)
+    target_asset = asset
+    if (not target_asset.nas_path or not Path(target_asset.nas_path).exists()) and target_asset.is_duplicate_of:
+        canonical = repo.get(target_asset.is_duplicate_of)
+        if canonical and canonical.nas_path:
+            target_asset = canonical
+
+    if not target_asset.nas_path:
+        raise HTTPException(404, f"Asset {asset_id} has no stored file")
+    if asset_files.is_remote(target_asset.nas_path):
+        return _remote_file_response(target_asset.id, target_asset.nas_path, thumbnail=True)
+
+    nas_path = Path(target_asset.nas_path)
     thumb_path = _thumbnail_path_for(nas_path)
     if not thumb_path.exists():
         _generate_thumbnail(nas_path, thumb_path)
@@ -134,12 +151,6 @@ def get_asset_thumbnail(asset_id: uuid.UUID, db: Session = Depends(get_db)):
         return FileResponse(thumb_path, media_type="image/jpeg")
     if nas_path.exists():
         return FileResponse(nas_path, media_type="image/jpeg")
-    # Neither the thumbnail nor the original exists — the asset row outlived
-    # its NAS file (relevance rejection/dedup/trim all delete the file but
-    # leave the row; see delete_asset_files' docstring). FileResponse checks
-    # existence lazily inside its ASGI __call__, not here, so blindly
-    # falling back to nas_path raised an unhandled RuntimeError deep in
-    # Starlette instead of a clean 404.
     raise HTTPException(404, f"Asset {asset_id}'s file no longer exists on disk")
 
 

@@ -12,11 +12,13 @@ from functools import lru_cache
 from pathlib import Path
 
 from PIL import Image
+from sqlalchemy import select
 from sqlalchemy.orm import object_session
 
 from app.connectors.base import RawAssetDraft
 from app.db.models.asset import Asset
 from app.db.repositories.asset_repository import AssetRepository
+from app.db.session import session_scope
 from app.domain.enums import AnnotationFormat, AssetStatus, SourceType
 from app.storage import asset_files
 from app.storage.base import StorageBackend
@@ -45,6 +47,33 @@ def _refresh_paths(asset: Asset) -> None:
         logger.debug(f"Could not refresh file paths for asset {getattr(asset, 'id', '?')}: {e}")
 
 
+def is_asset_file_shared(asset: Asset, path_str: str) -> bool:
+    """Verifies whether a file path is referenced by another asset belonging to a different job."""
+    if not path_str or not getattr(asset, "job_id", None):
+        return False
+    try:
+        sess = object_session(asset)
+        if sess is not None:
+            shared = sess.execute(
+                select(Asset.id).where(
+                    Asset.job_id != asset.job_id,
+                    (Asset.nas_path == path_str) | (Asset.annotation_nas_path == path_str),
+                ).limit(1)
+            ).scalar_one_or_none()
+            return shared is not None
+        with session_scope() as db:
+            shared = db.execute(
+                select(Asset.id).where(
+                    Asset.job_id != asset.job_id,
+                    (Asset.nas_path == path_str) | (Asset.annotation_nas_path == path_str),
+                ).limit(1)
+            ).scalar_one_or_none()
+            return shared is not None
+    except Exception as e:
+        logger.debug(f"Could not verify if asset file {path_str} is shared: {e}")
+        return False
+
+
 def delete_asset_files(asset: Asset) -> None:
     """Removes an asset's promoted files from NAS — the symmetric operation
     to standardize_and_promote's write. Called once an asset stops being
@@ -62,6 +91,9 @@ def delete_asset_files(asset: Asset) -> None:
     _refresh_paths(asset)
     for path_str in (asset.nas_path, asset.annotation_nas_path):
         if not path_str:
+            continue
+        if is_asset_file_shared(asset, path_str):
+            logger.info(f"Asset file {path_str} is shared with another job; retaining physical file.")
             continue
         try:
             asset_files.delete(path_str)
@@ -155,8 +187,8 @@ class StandardizationService:
             ).scalar_one_or_none()
 
             if reservation is None:
-                raise RuntimeError(
-                    f"Candidate reservation {reservation_uuid} not found"
+                raise AssetRejected(
+                    f"Candidate reservation {reservation_uuid} expired or not found"
                 )
 
             if (
@@ -165,28 +197,28 @@ class StandardizationService:
                 or str(reservation.source_type) != str(source_type.value)
                 or reservation.source_item_id != draft.source_item_id
             ):
-                raise RuntimeError(
+                raise AssetRejected(
                     f"Candidate reservation ownership mismatch: {reservation_uuid}"
                 )
 
             if reservation.status not in ("RESERVED", "STAGED"):
-                raise RuntimeError(
+                raise AssetRejected(
                     f"Reservation {reservation_uuid} has invalid state "
                     f"{reservation.status}"
                 )
 
             window = db.get(CandidateWindow, reservation.window_id)
             if window is None:
-                raise RuntimeError(
+                raise AssetRejected(
                     f"Candidate window {reservation.window_id} not found"
                 )
 
             if metadata.get("candidate_window_id") != str(window.id):
-                raise RuntimeError("Draft candidate window does not match reservation")
+                raise AssetRejected("Draft candidate window does not match reservation")
 
             batch = db.get(ImageBatch, window.batch_id)
             if batch is None or batch.job_id != job_id:
-                raise RuntimeError("Candidate batch is missing or belongs to another job")
+                raise AssetRejected("Candidate batch is missing or belongs to another job")
 
             batch_id = batch.id
             window_id = window.id

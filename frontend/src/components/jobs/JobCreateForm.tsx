@@ -65,7 +65,7 @@ export function JobCreateForm() {
   }
 
   return (
-    <form onSubmit={handleSubmit(onSubmit)} className="flex max-w-3xl flex-col gap-8 p-6">
+    <form onSubmit={handleSubmit(onSubmit)} className="flex w-full max-w-3xl flex-col gap-8 p-6">
       <div className="flex flex-col gap-2">
         <Textarea
           {...register('query')}

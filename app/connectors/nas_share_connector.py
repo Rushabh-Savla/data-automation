@@ -38,7 +38,7 @@ from app.domain.enums import SourceType
 
 logger = logging.getLogger(__name__)
 
-_SHARD_SIZE = 25
+_SHARD_SIZE = 50
 # Upper bound on files listed per discovery, so pointing a job at a share with
 # millions of files cannot make discovery run for hours.
 _MAX_SCAN_FILES = 200_000
@@ -142,10 +142,10 @@ class NasShareConnector:
                             getattr(admission, "window_index", None),
                             i,
                         )
+                    if status == "INACTIVE":
+                            raise JobStopped(f"Candidate admission closed for {source_item_id}")
                     if status != "ADMITTED":
-                        raise FatalConnectorError(
-                            f"Candidate admission failed for {source_item_id}: {status}"
-                        )
+                        continue
 
                 suffix = Path(rel).suffix.lower() or ".jpg"
                 dest = workdir / f"{hashlib.sha1(rel.encode()).hexdigest()[:16]}{suffix}"

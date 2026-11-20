@@ -228,11 +228,17 @@ export function useJobProgressSocket(jobId: string | undefined): JobProgressSock
         }
 
         case 'job_status': {
-          patchDetail({ status: msg.status, completion_reason: msg.completion_reason ?? undefined })
+          patchDetail({
+            status: msg.status,
+            completion_reason: msg.completion_reason ?? undefined,
+            ...(msg.completed_at ? { completed_at: msg.completed_at } : {}),
+          })
           patchProgress({ status: msg.status })
           logEvent(`Status changed to ${jobStatusLabels[msg.status]}`)
 
           if (JOB_TERMINAL_STATUSES.includes(msg.status)) {
+            queryClient.invalidateQueries({ queryKey: jobKeys.detail(jobId!) })
+            queryClient.invalidateQueries({ queryKey: jobKeys.progress(jobId!) })
             queryClient.invalidateQueries({ queryKey: assetKeys.all })
             const reasonLabel = msg.completion_reason ? ` (${jobCompletionReasonLabels[msg.completion_reason]})` : ''
             toast[msg.status === 'failed' ? 'error' : 'success'](`Job ${jobStatusLabels[msg.status]}${reasonLabel}`)

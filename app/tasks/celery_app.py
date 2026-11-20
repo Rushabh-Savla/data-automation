@@ -82,17 +82,6 @@ celery_app.conf.update(
             "task": "app.tasks.cleanup_tasks.purge_orphan_work_dirs",
             "schedule": 300.0,
         },
-        # Removes the NAS copy of images that stopped being kept (see nas_tasks).
-        "nas-leak-sweep": {
-            "task": "app.tasks.nas_tasks.sweep_leaked_nas_files",
-            "schedule": 60.0,
-        },
-        # Centralized NAS upload queue reconciliation: sweeps actionable transfers
-        # (pending, stale uploading, retryable failed) and pending staging cleanups.
-        "nas-reconcile-transfers": {
-            "task": "app.tasks.nas_tasks.reconcile_nas_transfers",
-            "schedule": 60.0,
-        },
         # End-to-end batch lifecycle reconciliation: sweeps counter drift, resumes paused batches,
         # and re-enqueues orphan ready batches.
         "batch-lifecycle-reconcile": {

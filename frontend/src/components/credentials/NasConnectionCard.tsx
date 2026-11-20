@@ -40,8 +40,8 @@ export function NasConnectionCard() {
             {isLoading ? (
               <Skeleton className="h-5 w-24" />
             ) : (
-              <Badge variant={config?.configured ? 'success' : 'secondary'}>
-                {config?.configured ? 'Connected' : 'Not configured'}
+              <Badge variant={config?.configured ? 'outline' : 'secondary'}>
+                {config?.configured ? 'Configured' : 'Not configured'}
               </Badge>
             )}
           </div>

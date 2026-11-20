@@ -2,6 +2,8 @@
 platform stores filtered images on (and can read source images from)."""
 
 import logging
+import socket
+import threading
 import time
 from pathlib import Path
 
@@ -23,6 +25,7 @@ from app.schemas.nas import (
     NasConfigInput,
     NasConfigResponse,
     NasFoldersResponse,
+    NasStatusResponse,
     NasTestResponse,
     NasTransferInput,
     NasTransferResponse,
@@ -58,6 +61,98 @@ def _to_response(config: NasConfig | None) -> NasConfigResponse:
     )
 
 
+_STATUS_CACHE: dict[str, tuple[float, NasStatusResponse]] = {}
+_STATUS_CACHE_TTL_S = 10.0
+_STATUS_LOCK = threading.Lock()
+_LAST_KNOWN_CONNECTED: bool | None = None
+
+
+def _probe_nas_connection(config: NasConfig) -> tuple[bool, float | None, str | None]:
+    """Lightweight live health probe testing reachability without heavy session overhead."""
+    if config.protocol == "local":
+        t0 = time.monotonic()
+        p = Path(config.share or config.base_path or "")
+        exists = p.exists() and p.is_dir()
+        lat = round((time.monotonic() - t0) * 1000.0, 1)
+        if exists:
+            return True, lat, None
+        return False, lat, f"Local directory not found: {p}"
+
+    host = (config.host or "").strip()
+    if not host:
+        return False, None, "No host configured"
+
+    port = config.port
+    if not port:
+        default_ports = {"sftp": 22, "smb": 445, "ftp": 21, "webdav": 80, "nfs": 2049}
+        port = default_ports.get(config.protocol, 22)
+
+    t0 = time.monotonic()
+    try:
+        with socket.create_connection((host, int(port)), timeout=2.5):
+            lat = round((time.monotonic() - t0) * 1000.0, 1)
+            return True, lat, None
+    except Exception as exc:
+        lat = round((time.monotonic() - t0) * 1000.0, 1)
+        return False, lat, str(exc)
+
+
+@router.get("/status", response_model=NasStatusResponse)
+def get_nas_status(db: Session = Depends(get_db)):
+    """Lightweight live health status check with in-memory caching (10s TTL).
+
+    Pings NAS every 15s from client without flooding requests or session slots.
+    When NAS reconnects after being offline, automatically resets transfer cooldown
+    and triggers reconcile_nas_transfers to offload buffered data in one go.
+    """
+    global _STATUS_CACHE, _LAST_KNOWN_CONNECTED
+
+    now = time.monotonic()
+    with _STATUS_LOCK:
+        if "status" in _STATUS_CACHE:
+            cached_at, cached_resp = _STATUS_CACHE["status"]
+            if now - cached_at < _STATUS_CACHE_TTL_S:
+                return cached_resp
+
+        config = NasConfigService(db).get()
+        if config is None or (not config.host and config.protocol != "local"):
+            resp = NasStatusResponse(
+                configured=False,
+                connected=False,
+                message="NAS not configured",
+            )
+            _STATUS_CACHE["status"] = (now, resp)
+            return resp
+
+        connected, latency_ms, error_msg = _probe_nas_connection(config)
+
+        if _LAST_KNOWN_CONNECTED is False and connected is True:
+            # NAS is back online! Clear Redis cooldown and trigger upload reconciliation
+            try:
+                from app.core.redis_client import get_redis
+                r = get_redis()
+                r.delete("nas_offload:cooldown")
+                from app.tasks.nas_tasks import reconcile_nas_transfers
+                reconcile_nas_transfers.delay()
+                logger.info("[NAS STATUS] NAS reconnected! Flushed cooldown and dispatched reconcile_nas_transfers.")
+            except Exception as exc:
+                logger.warning(f"[NAS STATUS] Could not trigger reconcile on reconnect: {exc}")
+
+        _LAST_KNOWN_CONNECTED = connected
+
+        resp = NasStatusResponse(
+            configured=True,
+            connected=connected,
+            protocol=config.protocol,
+            host=config.host,
+            port=config.port,
+            latency_ms=latency_ms,
+            message=error_msg,
+        )
+        _STATUS_CACHE["status"] = (now, resp)
+        return resp
+
+
 @router.get("/config", response_model=NasConfigResponse)
 def get_nas_config(db: Session = Depends(get_db)):
     return _to_response(NasConfigService(db).get())
@@ -77,6 +172,7 @@ def save_nas_config(body: NasConfigInput, db: Session = Depends(get_db)):
             503, "The server has no CREDENTIAL_ENCRYPTION_KEY configured, so a NAS password cannot be stored."
         ) from e
     db.commit()
+    _STATUS_CACHE.clear()
     return _to_response(config)
 
 
@@ -84,6 +180,7 @@ def save_nas_config(body: NasConfigInput, db: Session = Depends(get_db)):
 def delete_nas_config(db: Session = Depends(get_db)):
     NasConfigService(db).delete()
     db.commit()
+    _STATUS_CACHE.clear()
     return Response(status_code=204)
 
 
@@ -268,11 +365,23 @@ def transfer_nas_images(body: NasTransferInput, db: Session = Depends(get_db)):
         )
 
 
+_FOLDERS_CACHE: dict[str, tuple[float, NasFoldersResponse]] = {}
+_FOLDERS_CACHE_TTL_S = 60.0
+
+
 @router.get("/folders", response_model=NasFoldersResponse)
-def list_nas_folders(path: str = "", max_depth: int = 3, db: Session = Depends(get_db)):
+def list_nas_folders(path: str = "", max_depth: int = 2, db: Session = Depends(get_db)):
     """Explores directories on the connected NAS in a single connection session.
     Walks the folder tree over ONE single connection so the client can navigate
     subfolders entirely offline without sending any further requests to the NAS."""
+    clean_path = path.strip().strip("/")
+    cache_key = f"{clean_path}:{max_depth}"
+    now = time.monotonic()
+    if cache_key in _FOLDERS_CACHE:
+        cached_time, cached_resp = _FOLDERS_CACHE[cache_key]
+        if now - cached_time < _FOLDERS_CACHE_TTL_S:
+            return cached_resp
+
     service = NasConfigService(db)
     saved = service.get()
     if saved is None:
@@ -282,7 +391,6 @@ def list_nas_folders(path: str = "", max_depth: int = 3, db: Session = Depends(g
     except RuntimeError as e:
         raise HTTPException(503, f"Could not decrypt stored NAS password: {e}") from e
 
-    clean_path = path.strip().strip("/")
     try:
         with open_client(params) as client:
             direct_entries = client.list_dir(clean_path)
@@ -296,7 +404,7 @@ def list_nas_folders(path: str = "", max_depth: int = 3, db: Session = Depends(g
             queue: list[str] = [clean_path]
             depth_map = {clean_path: 0}
             visited = set()
-            max_folders = 800
+            max_folders = 250
 
             while queue and len(tree_paths) < max_folders:
                 curr = queue.pop(0)
@@ -322,12 +430,14 @@ def list_nas_folders(path: str = "", max_depth: int = 3, db: Session = Depends(g
                             queue.append(folder_path)
 
             parent = clean_path.rpartition("/")[0] if "/" in clean_path else ("" if clean_path else None)
-            return NasFoldersResponse(
+            resp = NasFoldersResponse(
                 current_path=clean_path,
                 parent_path=parent,
                 folders=direct_folders,
                 tree=sorted(list(set(tree_paths))),
             )
+            _FOLDERS_CACHE[cache_key] = (now, resp)
+            return resp
     except Exception as exc:
         logger.warning(f"Error exploring NAS folders at '{clean_path}': {exc}")
         raise HTTPException(400, f"Could not read NAS folders: {exc}") from exc

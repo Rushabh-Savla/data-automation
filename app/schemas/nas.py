@@ -95,7 +95,7 @@ class NasConfigInput(BaseModel):
 
 class NasConfigResponse(BaseModel):
     configured: bool
-    protocol: NasProtocol = "smb"
+    protocol: NasProtocol = "sftp"
     host: str = ""
     port: int | None = None
     share: str = ""
@@ -109,6 +109,16 @@ class NasConfigResponse(BaseModel):
     use_tls: bool = False
     verify_tls: bool = True
     updated_at: datetime | None = None
+
+
+class NasStatusResponse(BaseModel):
+    configured: bool
+    connected: bool
+    protocol: NasProtocol | None = None
+    host: str | None = None
+    port: int | None = None
+    latency_ms: float | None = None
+    message: str | None = None
 
 
 class NasTestResponse(BaseModel):

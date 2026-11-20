@@ -378,13 +378,16 @@ def build_ytdlp_options(
 ) -> dict:
     opts = {
         "format": (
-            "best[ext=mp4][vcodec!=none][acodec!=none][height<=1080]"
-            "/best[vcodec!=none][acodec!=none][height<=1080]"
-            "/bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]"
+            "best[height<=1080]"
             "/bestvideo[height<=1080]+bestaudio"
-            "/bestvideo[height<=1080]"
+            "/best[vcodec!=none]"
+            "/bestvideo+bestaudio"
             "/bestvideo"
             "/best"
+            "/worst"
+            "/18"
+            "/b/bv*+ba/b"
+            "/auto"
         ),
         "merge_output_format": "mp4",
         "outtmpl": str(output_dir / "%(id)s.%(ext)s"),
@@ -435,7 +438,7 @@ def build_ytdlp_options(
         # since YouTube's SABR-only streaming experiment currently withholds
         # the android client's higher formats without a token, but a working
         # 360p frame source beats a 100%-failing 1080p one.
-        "extractor_args": {"youtube": {"player_client": ["android"]}},
+        "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
     }
     if cc_only:
         opts["match_filter"] = _cc_only_match_filter
@@ -800,10 +803,10 @@ class YouTubeConnector:
                         getattr(admission, "window_index", None),
                         i,
                     )
+                if status == "INACTIVE":
+                    raise JobStopped(f"Candidate admission closed for {source_item_id}")
                 if status != "ADMITTED":
-                    raise FatalConnectorError(
-                        f"Candidate admission failed for {source_item_id}: {status}"
-                    )
+                    continue
 
             metadata = {
                 "frame_number": frame_number,

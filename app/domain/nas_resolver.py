@@ -58,14 +58,14 @@ def sanitize_nas_path(path: str | None) -> str | None:
 def resolve_job_nas_destination(
     job_or_config: Any,
     default_storage: str | None = None,
-) -> str:
+) -> str | None:
     """Authoritatively resolves the base NAS storage folder for a job.
 
     Precedence Order:
       1. Explicit user selection: job.config['nas_storage_path']
       2. Explicit default_storage parameter (e.g. transfer.remote_path)
-      3. Active NAS configuration: params.storage_path
-      4. Hardcoded fallback default: 'data_automation'
+      3. If neither is provided, returns None (images stay in local storage only).
+         The platform does NOT automatically fall back to any previously configured NAS path.
     """
     custom_path: str | None = None
 
@@ -87,13 +87,4 @@ def resolve_job_nas_destination(
         if sanitized_default:
             return sanitized_default
 
-    try:
-        params = get_active_storage_params()
-        if params and params.storage_path:
-            sanitized_params = sanitize_nas_path(params.storage_path)
-            if sanitized_params:
-                return sanitized_params
-    except Exception as e:
-        logger.debug("Could not read active NAS storage params: %s", e)
-
-    return DEFAULT_NAS_DESTINATION
+    return None

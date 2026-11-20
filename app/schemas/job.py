@@ -150,26 +150,106 @@ class JobSourceTaskResponse(BaseModel):
     id: uuid.UUID
     source_type: SourceType
     status: JobSourceTaskStatus
-    discovered_count: int
-    downloaded_count: int
-    accepted_count: int
+    discovered_count: int = 0
+    downloaded_count: int = 0
+    accepted_count: int = 0
     relevance_accepted_count: int = 0
-    rejected_count: int
-    error_count: int
+    rejected_count: int = 0
+    error_count: int = 0
     error_message: str | None
     last_heartbeat_at: datetime | None
     discovered_unit: str = "images"
+    pending_count: int = 0
+    total_inventoried: int = 0
+    processed_count: int = 0
+    completion_percentage: float = 0.0
+    waiting_reason: str = ""
+    is_active: bool = False
+    is_complete: bool = False
+    unit_label: str = "images"
+    is_reschedulable: bool = False
+    status_label: str = ""
+    status_explanation: str = ""
 
     model_config = {"from_attributes": True}
 
+    @model_validator(mode="before")
+    @classmethod
+    def _extract_source_metrics(cls, data):
+        cp = getattr(data, "checkpoint", None) if not isinstance(data, dict) else data.get("checkpoint")
+        cp = cp or {}
+        pending_items = cp.get("_pending_items") or {}
+        completed_items = set(cp.get("_completed_items", []))
+        unconsumed = [k for k in pending_items.keys() if k not in completed_items]
+        pending_cnt = len(unconsumed)
+
+        source_type = getattr(data, "source_type", None) if not isinstance(data, dict) else data.get("source_type")
+        st_val = source_type.value if hasattr(source_type, "value") else str(source_type)
+
+        unit = "images"
+        if st_val == "kaggle":
+            unit = "datasets"
+        elif st_val == "youtube":
+            unit = "videos"
+        elif st_val == "roboflow":
+            unit = "datasets"
+
+        status = getattr(data, "status", None) if not isinstance(data, dict) else data.get("status")
+        from app.domain.enums import JOB_SOURCE_TASK_TERMINAL_STATUSES
+        is_terminal = status in JOB_SOURCE_TASK_TERMINAL_STATUSES
+        is_resched = (pending_cnt > 0) and not is_terminal
+
+        status_val = status.value if hasattr(status, "value") else str(status)
+        if status_val == "completed_partial" and pending_cnt > 0:
+            s_label = "Partially Processed — More Candidates Available"
+            s_expl = f"{pending_cnt} pending {unit} in checkpoint; eligible for next candidate window"
+        elif is_resched:
+            s_label = "Waiting for Window" if status_val == "window_waiting" else status_val.replace("_", " ").title()
+            s_expl = f"{pending_cnt} pending {unit} available to download"
+        else:
+            s_label = status_val.replace("_", " ").title()
+            s_expl = ""
+
+        disc_cnt = getattr(data, "discovered_count", 0) if not isinstance(data, dict) else data.get("discovered_count", 0)
+        acc_cnt = getattr(data, "accepted_count", 0) if not isinstance(data, dict) else data.get("accepted_count", 0)
+        rej_cnt = getattr(data, "rejected_count", 0) if not isinstance(data, dict) else data.get("rejected_count", 0)
+        tot_inv = len(pending_items) if pending_items else disc_cnt
+        proc_cnt = len(completed_items) if pending_items else (acc_cnt + rej_cnt)
+        comp_pct = round((proc_cnt / tot_inv * 100.0), 1) if tot_inv > 0 else (100.0 if is_terminal else 0.0)
+
+        if isinstance(data, dict):
+            data["pending_count"] = pending_cnt
+            data["total_inventoried"] = tot_inv
+            data["processed_count"] = proc_cnt
+            data["completion_percentage"] = comp_pct
+            data["unit_label"] = unit
+            data["discovered_unit"] = unit
+            data["is_reschedulable"] = is_resched
+            data["status_label"] = s_label
+            data["status_explanation"] = s_expl
+        else:
+            setattr(data, "pending_count", pending_cnt)
+            setattr(data, "total_inventoried", tot_inv)
+            setattr(data, "processed_count", proc_cnt)
+            setattr(data, "completion_percentage", comp_pct)
+            setattr(data, "unit_label", unit)
+            setattr(data, "discovered_unit", unit)
+            setattr(data, "is_reschedulable", is_resched)
+            setattr(data, "status_label", s_label)
+            setattr(data, "status_explanation", s_expl)
+        return data
+
     @model_validator(mode="after")
     def _set_discovered_unit(self):
-        # Kaggle's discovered_count counts datasets, not individual images —
-        # downloaded/accepted_count still count images extracted from those
-        # datasets, so "discovered: 5, downloaded: 750" is correct, not a
-        # mismatch. This tells API consumers what unit discovered_count is in.
         if self.source_type == SourceType.KAGGLE:
             self.discovered_unit = "datasets"
+            self.unit_label = "datasets"
+        elif self.source_type == SourceType.YOUTUBE:
+            self.discovered_unit = "videos"
+            self.unit_label = "videos"
+        elif self.source_type == SourceType.ROBOFLOW:
+            self.discovered_unit = "datasets"
+            self.unit_label = "datasets"
         return self
 
 
@@ -215,6 +295,12 @@ class JobResponse(BaseModel):
     parent_job_id: uuid.UUID | None = None
     config: dict | None = None
     nas_destination: str | None = None
+    current_round: int = 1
+    active_source: str | None = None
+    active_source_position: str | None = None
+    completed_sources: list[str] = Field(default_factory=list)
+    next_source_in_queue: str | None = None
+    sequential_waiting_reason: str | None = None
 
     model_config = {"from_attributes": True}
 
@@ -247,6 +333,10 @@ class JobResponse(BaseModel):
     @model_validator(mode="after")
     def _set_derived_fields(self):
         self.filtering_in_progress = self.status in _FILTERING_IN_PROGRESS_STATUSES
+        from app.domain.enums import JOB_TERMINAL_STATUSES
+        if self.status not in JOB_TERMINAL_STATUSES:
+            self.completion_reason = None
+            self.completed_at = None
         return self
 
 
@@ -272,6 +362,12 @@ class JobProgressResponse(BaseModel):
     nas_verified_count: int = 0
     completed_count: int = 0
     filtering_in_progress: bool = False
+    current_round: int = 1
+    active_source: str | None = None
+    active_source_position: str | None = None
+    completed_sources: list[str] = Field(default_factory=list)
+    next_source_in_queue: str | None = None
+    sequential_waiting_reason: str | None = None
     source_tasks: list[JobSourceTaskResponse] = Field(default_factory=list)
 
     @model_validator(mode="after")

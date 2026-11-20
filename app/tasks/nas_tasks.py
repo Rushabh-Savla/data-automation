@@ -26,9 +26,9 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from sqlalchemy import or_, select
+from sqlalchemy import or_, select, update
 
-from app.connectors.nas.base import NasClient, join_relpath, open_client
+from app.connectors.nas.base import NasClient, NasConnectionError, join_relpath, open_client
 from app.core.config import get_settings
 from app.core.exceptions import ConnectorError, FatalConnectorError, TransientConnectorError
 from app.core.redis_client import get_redis
@@ -36,6 +36,7 @@ from app.core.slugify import job_folder_name
 from app.db.models.asset import Asset
 from app.db.models.job import Job
 from app.db.repositories.asset_repository import AssetRepository
+from app.db.repositories.job_repository import JobRepository
 from app.db.session import session_scope
 from app.domain.enums import AssetStatus
 from app.services.nas_config_service import get_active_storage_params, is_storage_active
@@ -60,7 +61,11 @@ def _cooldown_active(redis) -> bool:
 
 
 def _start_cooldown(redis) -> None:
-    redis.set(_COOLDOWN_KEY, "1", ex=get_settings().nas_offload_cooldown_s)
+    cooldown = getattr(get_settings(), "nas_offload_cooldown_s", 60)
+    try:
+        redis.set(_COOLDOWN_KEY, "1", ex=cooldown)
+    except Exception:
+        pass
 
 
 def _remote_rel_for(storage_path: str, local_file: Path, job_folder: str | None = None) -> str:
@@ -71,10 +76,24 @@ def _remote_rel_for(storage_path: str, local_file: Path, job_folder: str | None 
     replaced with `job_folder` (a human-readable, still-unique folder name derived
     from the job's name) when the caller has one, so the job stays easy to find."""
     settings = get_settings()
+    resolved = local_file.resolve()
+    rel = None
     try:
-        rel = local_file.resolve().relative_to(settings.nas_root.resolve()).as_posix()
+        rel = resolved.relative_to(settings.nas_root.resolve()).as_posix()
     except ValueError:
-        rel = "/".join(local_file.parts[-4:])
+        pass
+    if rel is None:
+        try:
+            rel = resolved.relative_to(settings.local_staging_path.resolve()).as_posix()
+        except ValueError:
+            pass
+    if rel is None:
+        parts = local_file.parts
+        job_indices = [i for i, p in enumerate(parts) if p.startswith("job_")]
+        if job_indices:
+            rel = "/".join(parts[job_indices[-1]:])
+        else:
+            rel = "/".join(parts[-4:])
     if job_folder is not None:
         _job_id_segment, _, remainder = rel.partition("/")
         if remainder:
@@ -148,7 +167,13 @@ def _still_kept(asset_uuid: uuid.UUID, remote_image: str) -> bool:
         current = AssetRepository(db).get(asset_uuid)
         return (
             current is not None
-            and current.status == AssetStatus.RELEVANCE_PASSED
+            and current.status in (
+                AssetStatus.RELEVANCE_PASSED,
+                AssetStatus.READY_FOR_UPLOAD,
+                AssetStatus.UPLOADING,
+                AssetStatus.NAS_VERIFIED,
+                AssetStatus.COMPLETED,
+            )
             and current.nas_path == remote_image
         )
 
@@ -269,7 +294,7 @@ def _offload(
         asset = AssetRepository(db).get(asset_uuid)
         if (
             asset is None
-            or asset.status != AssetStatus.RELEVANCE_PASSED
+            or asset.status not in (AssetStatus.RELEVANCE_PASSED, AssetStatus.READY_FOR_UPLOAD)
             or not asset.nas_path
             or asset_files.is_remote(asset.nas_path)
         ):
@@ -345,7 +370,11 @@ def _offload(
         # Row lock: a concurrent reject/trim must either finish before we look
         # or wait until we have committed.
         locked = db.execute(select(Asset).where(Asset.id == asset_uuid).with_for_update()).scalar_one_or_none()
-        if locked is None or locked.status != AssetStatus.RELEVANCE_PASSED or locked.nas_path != str(image_local):
+        if (
+            locked is None
+            or locked.status not in (AssetStatus.RELEVANCE_PASSED, AssetStatus.READY_FOR_UPLOAD)
+            or locked.nas_path != str(image_local)
+        ):
             # Rejected/trimmed/deleted while we were uploading: undo our copy.
             asset_files.delete(remote_image)
             if remote_ann:
@@ -354,6 +383,7 @@ def _offload(
         locked.nas_path = remote_image
         if remote_ann:
             locked.annotation_nas_path = remote_ann
+        locked.status = AssetStatus.NAS_VERIFIED
 
     # A trim/dedup that read this asset before we committed still holds its old local
     # path, so it deleted nothing on the NAS. Look again now that our copy is visible.
@@ -394,7 +424,7 @@ def sweep_unoffloaded_assets() -> int:
             for i in db.execute(
                 select(Asset.id)
                 .where(
-                    Asset.status == AssetStatus.RELEVANCE_PASSED,
+                    Asset.status.in_([AssetStatus.RELEVANCE_PASSED, AssetStatus.READY_FOR_UPLOAD]),
                     Asset.nas_path.is_not(None),
                     ~Asset.nas_path.like(f"{asset_files.NAS_SCHEME}%"),
                 )
@@ -406,49 +436,14 @@ def sweep_unoffloaded_assets() -> int:
     return len(ids)
 
 
-_NOT_KEPT = (AssetStatus.RELEVANCE_REJECTED, AssetStatus.DUPLICATE, AssetStatus.FAILED)
+_NOT_KEPT = (AssetStatus.RELEVANCE_REJECTED, AssetStatus.DUPLICATE, AssetStatus.FAILED, AssetStatus.SURPLUS)
 _RECONCILE_BATCH = 100
 
 
 @celery_app.task(name="app.tasks.nas_tasks.sweep_leaked_nas_files")
 def sweep_leaked_nas_files() -> int:
-    """Safety net: delete the NAS copy of any image that is no longer part of the
-    kept set (rejected, duplicate, trimmed). The normal paths already do this, but
-    an upload that finishes at the same moment the image is rejected can slip past
-    them; this makes "the NAS holds only the kept images" true regardless of timing.
-    A file that could not be removed (NAS busy/offline) is left for the next run."""
-    with session_scope() as db:
-        rows = db.execute(
-            select(Asset.id, Asset.nas_path, Asset.annotation_nas_path)
-            .where(
-                Asset.status.in_(_NOT_KEPT),
-                or_(
-                    Asset.nas_path.like(f"{asset_files.NAS_SCHEME}%"),
-                    Asset.annotation_nas_path.like(f"{asset_files.NAS_SCHEME}%"),
-                ),
-            )
-            .limit(_RECONCILE_BATCH)
-        ).all()
-    cleaned = 0
-    for asset_id, image_path, annotation_path in rows:
-        try:
-            for path in (image_path, annotation_path):
-                if asset_files.is_remote(path):
-                    asset_files.delete(path, strict=True)
-        except (asset_files.NasUnreachable, ConnectorError) as exc:
-            logger.warning(f"NAS cleanup of asset {asset_id} deferred: {exc}")
-            continue
-        with session_scope() as db:
-            asset = AssetRepository(db).get(asset_id)
-            # Only clear paths that are still the ones we just deleted, and only while
-            # the asset is still not kept (a re-judged asset must keep its files).
-            if asset is not None and asset.status in _NOT_KEPT:
-                if asset.nas_path == image_path:
-                    asset.nas_path = None
-                if asset.annotation_nas_path == annotation_path:
-                    asset.annotation_nas_path = None
-        cleaned += 1
-    return cleaned
+    """Disabled: only send requests to NAS after a batch is complete."""
+    return 0
 
 
 def schedule_offload(asset_ids: list[str]) -> None:
@@ -485,6 +480,7 @@ def schedule_offload_for_job(job_id: str) -> None:
 
         # If the job has no NAS storage destination path configured, do not offload to NAS.
         # Images stay in local storage for local export.
+        db_unoffloaded_ids: list[str] = []
         with session_scope() as db:
             if hasattr(db, "execute"):
                 try:
@@ -500,29 +496,69 @@ def schedule_offload_for_job(job_id: str) -> None:
                             redis = get_redis()
                             redis.delete(f"job:{job_id}:offload_pending")
                             return
+
+                    # Query database directly for any unoffloaded accepted assets for this job.
+                    # Exclude assets already associated with an ImageBatch (which are transferred
+                    # by the authoritative NasTransferBatch mechanism).
+                    stmt = select(Asset.id).where(
+                        Asset.job_id == job_uuid,
+                        Asset.status.in_([AssetStatus.RELEVANCE_PASSED, AssetStatus.READY_FOR_UPLOAD]),
+                        Asset.nas_path.is_not(None),
+                        ~Asset.nas_path.like(f"{asset_files.NAS_SCHEME}%"),
+                        Asset.batch_id.is_(None),
+                    )
+                    db_unoffloaded_ids = [str(aid) for aid in db.execute(stmt).scalars().all()]
                 except (ValueError, TypeError):
                     pass
+
         redis = get_redis()
         raw = redis.lrange(f"job:{job_id}:offload_pending", 0, -1)
         redis.delete(f"job:{job_id}:offload_pending")
-        if not raw:
-            return
-        # Decode bytes and deduplicate while preserving insertion order.
+
         seen: set[str] = set()
         asset_ids: list[str] = []
-        for item in raw:
+        for item in (raw or []):
             s = item.decode() if isinstance(item, bytes) else item
             if s not in seen:
                 seen.add(s)
                 asset_ids.append(s)
+        for aid in db_unoffloaded_ids:
+            if aid not in seen:
+                seen.add(aid)
+                asset_ids.append(aid)
+
+        # Exclude assets that already belong to an ImageBatch (handled by NasTransferBatch)
+        if asset_ids:
+            with session_scope() as db:
+                if hasattr(db, "execute"):
+                    try:
+                        valid_uids = []
+                        for aid in asset_ids:
+                            try:
+                                valid_uids.append(uuid.UUID(str(aid)))
+                            except (ValueError, TypeError):
+                                pass
+                        if valid_uids:
+                            batched_stmt = select(Asset.id).where(
+                                Asset.id.in_(valid_uids),
+                                Asset.batch_id.is_not(None),
+                            )
+                            batched_ids = {str(uid) for uid in db.execute(batched_stmt).scalars().all()}
+                            asset_ids = [aid for aid in asset_ids if aid not in batched_ids]
+                    except Exception:
+                        pass
+
         if not asset_ids:
             return
+
         if _cooldown_active(redis):
             logger.info(
-                "NAS offload for job %s deferred (cooldown active); sweeper will retry %d asset(s)",
+                "NAS offload for job %s deferred (cooldown active); %d asset(s) preserved for retry",
                 job_id,
                 len(asset_ids),
             )
+            # Re-enqueue in redis as fallback
+            redis.rpush(f"job:{job_id}:offload_pending", *asset_ids)
             return
 
         total_assets = len(asset_ids)
@@ -550,11 +586,12 @@ def schedule_offload_for_job(job_id: str) -> None:
     bind=True,
     autoretry_for=(TransientConnectorError,),
     retry_backoff=True,
+    default_retry_delay=20,
     retry_backoff_max=900,
     retry_jitter=True,
     max_retries=5,
 )
-def process_nas_upload_queue(self, max_transfers: int = 10) -> dict:
+def process_nas_upload_queue(self, max_transfers: int = 500) -> dict:
     """Process durable NAS transfers under one global Redis lock."""
 
     from app.storage.nas_writer import (
@@ -586,39 +623,57 @@ def process_nas_upload_queue(self, max_transfers: int = 10) -> dict:
         if params is None:
             return {"status": "skipped", "reason": "no_active_storage"}
 
-        limit = max(1, min(int(max_transfers), 10))
+        limit = max(1, min(int(max_transfers), 500))
+
+        # Check for pending transfers before establishing any NAS connection
+        with session_scope() as db:
+            first_transfer_id = dequeue_nas_batch(db)
+
+        if first_transfer_id is None:
+            return {
+                "status": "completed",
+                "processed_batches": 0,
+            }
 
         # One connection reused for sequential transfers.
-        with open_client(params) as client:
-            for _ in range(limit):
+        try:
+            with open_client(params) as client:
+                current_id = first_transfer_id
+                for _ in range(limit):
+                    if current_id is None:
+                        with session_scope() as db:
+                            current_id = dequeue_nas_batch(db)
+                        if current_id is None:
+                            break
 
-                # Redis heartbeat also verifies current lock ownership.
-                if not lock.extend(300):
-                    raise TransientConnectorError(
-                        "NAS writer lock lease lost; stopping transfer processing."
-                    )
+                    # Redis heartbeat also verifies current lock ownership.
+                    if not lock.extend(300):
+                        raise TransientConnectorError(
+                            "NAS writer lock lease lost; stopping transfer processing."
+                        )
 
-                with session_scope() as db:
-                    transfer_id = dequeue_nas_batch(db)
+                    with session_scope() as db:
+                        writer = NasBatchWriter(
+                            db,
+                            params=params,
+                            lock=lock,
+                        )
 
-                    if transfer_id is None:
-                        break
+                        result = writer.upload_batch(
+                            current_id,
+                            client=client,
+                        )
 
-                    writer = NasBatchWriter(
-                        db,
-                        params=params,
-                        lock=lock,
-                    )
-
-                    result = writer.upload_batch(
-                        transfer_id,
-                        client=client,
-                    )
-
-                results.append({
-                    "transfer_id": str(transfer_id),
-                    "result": result,
-                })
+                    results.append({
+                        "transfer_id": str(current_id),
+                        "result": result,
+                    })
+                    current_id = None
+        except (NasConnectionError, TransientConnectorError) as conn_err:
+            from app.storage.nas_writer import start_cooldown
+            start_cooldown(30)
+            logger.warning(f"[NAS QUEUE] Connection to NAS failed ({conn_err}); activated 30s cooldown.")
+            raise
 
         return {
             "status": "completed",
@@ -638,17 +693,21 @@ def reconcile_nas_transfers() -> dict:
     # Resolve dynamically so configuration changes are reflected.
     from app.services.nas_config_service import is_storage_active as storage_active
     from app.db.repositories.image_batch_repository import NasTransferBatchRepository
+    from app.storage.nas_writer import is_cooldown_active
 
     if not storage_active():
         return {"status": "skipped", "reason": "no_active_storage"}
 
+    if is_cooldown_active():
+        return {"status": "skipped", "reason": "cooldown_active"}
+
     with session_scope() as db:
         repo = NasTransferBatchRepository(db)
-        actionable = repo.list_actionable(limit=50)
-        pending_cleanups = repo.list_pending_cleanups(limit=50)
+        actionable = repo.list_actionable(limit=200)
+        pending_cleanups = repo.list_pending_cleanups(limit=200)
 
     if actionable:
-        process_nas_upload_queue.delay()
+        process_nas_upload_queue.delay(max_transfers=max(len(actionable), 50))
 
         return {
             "status": "dispatched",
@@ -686,8 +745,8 @@ def _rmdir_quiet(client: NasClient, rel_dir: str) -> None:
         pass
 
 
-@celery_app.task(name="app.tasks.nas_tasks.consolidate_job_dataset_on_nas")
-def consolidate_job_dataset_on_nas(job_id: str) -> dict:
+@celery_app.task(name="app.tasks.nas_tasks.consolidate_job_dataset_on_nas", bind=True)
+def consolidate_job_dataset_on_nas(self_or_job_id, job_id: str | None = None) -> dict:
     """Consolidates distributed batches and windows on the remote NAS into a
     unified, production-ready dataset layout:
       <storage_path>/<job_folder>/images/<file>
@@ -698,6 +757,12 @@ def consolidate_job_dataset_on_nas(job_id: str) -> dict:
     cleans up empty intermediate directories, builds a master manifest,
     and updates all Asset.nas_path and Asset.annotation_nas_path records in PostgreSQL.
     """
+    if job_id is None:
+        job_id = str(self_or_job_id)
+        task_self = None
+    else:
+        task_self = self_or_job_id
+
     with session_scope() as db:
         try:
             job_uuid = uuid.UUID(str(job_id))
@@ -723,6 +788,79 @@ def consolidate_job_dataset_on_nas(job_id: str) -> dict:
     if params is None:
         return {"status": "skipped", "reason": "no_active_storage"}
 
+    # 1. Distributed Lock to prevent duplicate concurrent consolidation tasks for the same job
+    redis = get_redis()
+    consolidation_lock_key = f"lock:consolidate_job:{job_id}"
+    consolidation_lock = redis.lock(consolidation_lock_key, timeout=600)
+    acquired_job_lock = False
+    try:
+        acquired_job_lock = consolidation_lock.acquire(blocking=False)
+    except Exception as e:
+        logger.warning(f"[CONSOLIDATE] Could not acquire redis consolidation lock for job {job_id}: {e}")
+        acquired_job_lock = True
+
+    if not acquired_job_lock:
+        logger.info(f"[CONSOLIDATE] Consolidation task already in progress for job {job_id}; skipping duplicate.")
+        return {"status": "skipped", "reason": "already_running"}
+
+    # 2. Check for active/pending transfers or in-flight upload batches in PostgreSQL before proceeding
+    from app.db.models.image_batch import NasTransferBatch, ImageBatch
+    from app.domain.enums import TransferStatus, BatchStatus
+    with session_scope() as db:
+        has_active_transfers = db.execute(
+            select(NasTransferBatch.id).where(
+                NasTransferBatch.job_id == job_uuid,
+                NasTransferBatch.transfer_status.in_([
+                    TransferStatus.PENDING,
+                    TransferStatus.UPLOADING,
+                    TransferStatus.VERIFIED,
+                ]),
+            ).limit(1)
+        ).scalar_one_or_none() is not None
+
+        has_in_flight = db.execute(
+            select(ImageBatch.id).where(
+                ImageBatch.job_id == job_uuid,
+                ImageBatch.status.in_([
+                    BatchStatus.READY_FOR_UPLOAD,
+                    BatchStatus.UPLOADING,
+                    BatchStatus.NAS_UPLOADING,
+                    BatchStatus.NAS_PENDING,
+                    BatchStatus.VERIFYING,
+                ]),
+            ).limit(1)
+        ).scalar_one_or_none() is not None
+
+    if has_active_transfers or has_in_flight:
+        logger.warning(
+            f"[CONSOLIDATE] Job {job_id} still has active transfers or in-flight uploads "
+            f"(transfers={has_active_transfers}, in_flight={has_in_flight}). Deferring consolidation."
+        )
+        try:
+            consolidation_lock.release()
+        except Exception:
+            pass
+        if task_self and hasattr(task_self, "retry"):
+            retries = getattr(getattr(task_self, "request", None), "retries", 0)
+            if retries < 30:
+                raise task_self.retry(countdown=10, max_retries=30)
+        return {"status": "deferred", "reason": "active_transfers_in_flight"}
+
+    # 3. Respect NAS Writer Lock: ensure no active batch upload is actively writing to NAS
+    from app.storage.nas_writer import NasWriterLock
+    writer_lock = NasWriterLock(ttl_s=300, heartbeat_interval_s=60, allow_local_fallback=False)
+    if not writer_lock.acquire(timeout_s=30):
+        logger.info(f"[CONSOLIDATE] NAS writer lock is held by upload queue. Deferring consolidation for job {job_id}.")
+        try:
+            consolidation_lock.release()
+        except Exception:
+            pass
+        if task_self and hasattr(task_self, "retry"):
+            retries = getattr(getattr(task_self, "request", None), "retries", 0)
+            if retries < 30:
+                raise task_self.retry(countdown=10, max_retries=30)
+        return {"status": "deferred", "reason": "writer_lock_held"}
+
     remote_job_dir = join_relpath(storage_path, job_folder)
     images_dir = f"{remote_job_dir}/images"
     annotations_dir = f"{remote_job_dir}/annotations"
@@ -732,162 +870,384 @@ def consolidate_job_dataset_on_nas(job_id: str) -> dict:
     deleted_manifests = 0
     subdirs_to_clean = set()
 
-    with open_client(params) as client:
-        _ensure_dir(client, images_dir)
+    with session_scope() as db:
+        curr_job = JobRepository(db).get(job_uuid)
+        job_target = curr_job.target_count if curr_job else None
+        accepted_assets = list(
+            db.execute(
+                select(Asset).where(
+                    Asset.job_id == job_uuid,
+                    Asset.status.in_([
+                        AssetStatus.COMPLETED,
+                        AssetStatus.NAS_VERIFIED,
+                        AssetStatus.RELEVANCE_PASSED,
+                        AssetStatus.READY_FOR_UPLOAD,
+                        AssetStatus.UPLOADING,
+                    ]),
+                )
+            ).scalars().all()
+        )
+        accepted_ids = {str(a.id) for a in accepted_assets}
+        accepted_filenames = {f"{a.id}.jpg" for a in accepted_assets}
+        for a in accepted_assets:
+            if a.nas_path:
+                accepted_filenames.add(Path(a.nas_path).name)
 
-        all_entries = list(client.walk(remote_job_dir))
-
-        for entry in all_entries:
-            path = entry.path
-            parts = path.split("/")
-            filename = parts[-1]
-
-            # Skip top-level manifest or already consolidated files
-            if path == f"{remote_job_dir}/manifest.json":
-                continue
-            if path.startswith(f"{images_dir}/") or path.startswith(f"{annotations_dir}/"):
-                continue
-
-            # Remove intermediate batch or window manifest files
-            if filename == "manifest.json":
-                try:
-                    client.delete(path)
-                    deleted_manifests += 1
-                except Exception as e:
-                    logger.warning(f"[CONSOLIDATE] Could not delete batch manifest {path}: {e}")
-                continue
-
-            # Move image files into unified images/ directory
-            if "/images/" in path or any(filename.lower().endswith(ext) for ext in [".jpg", ".jpeg", ".png", ".webp"]):
-                target_rel = f"{images_dir}/{filename}"
-                if target_rel != path:
-                    try:
-                        client._rename(path, target_rel)
-                        moved_images += 1
-                    except Exception as e:
-                        logger.warning(f"[CONSOLIDATE] Failed to move image {path} -> {target_rel}: {e}")
-
-            # Move annotation files into unified annotations/ directory
-            elif "/annotations/" in path or any(filename.lower().endswith(ext) for ext in [".json", ".xml", ".txt"]):
-                _ensure_dir(client, annotations_dir)
-                target_rel = f"{annotations_dir}/{filename}"
-                if target_rel != path:
-                    try:
-                        client._rename(path, target_rel)
-                        moved_annotations += 1
-                    except Exception as e:
-                        logger.warning(f"[CONSOLIDATE] Failed to move annotation {path} -> {target_rel}: {e}")
-
-        # Recursively remove all intermediate staging directories (e.g. batch_*, window_*)
-        try:
-            top_entries = client.list_dir(remote_job_dir)
-            for top_entry in top_entries:
-                if not top_entry.is_dir:
+    try:
+        with open_client(params) as client:
+            _ensure_dir(client, images_dir)
+    
+            all_entries = list(client.walk(remote_job_dir))
+    
+            for entry in all_entries:
+                path = entry.path
+                parts = path.split("/")
+                filename = parts[-1]
+                stem = Path(filename).stem
+    
+                # Skip top-level manifest or already consolidated files
+                if path == f"{remote_job_dir}/manifest.json":
                     continue
-                # Preserve the consolidated images directory
-                if top_entry.name == "images":
+                if path.startswith(f"{images_dir}/") or path.startswith(f"{annotations_dir}/"):
                     continue
-                # If annotations directory exists but has no annotations, purge it
-                if top_entry.name == "annotations":
-                    ann_files = list(client.walk(annotations_dir))
-                    if not ann_files:
+    
+                # Remove intermediate batch or window manifest files
+                if filename == "manifest.json":
+                    try:
+                        client.delete(path)
+                        deleted_manifests += 1
+                    except Exception as e:
+                        logger.warning(f"[CONSOLIDATE] Could not delete batch manifest {path}: {e}")
+                    continue
+    
+                # Filter out non-accepted/duplicate image files: delete them instead of moving
+                if "/images/" in path or any(filename.lower().endswith(ext) for ext in [".jpg", ".jpeg", ".png", ".webp"]):
+                    if stem not in accepted_ids and filename not in accepted_filenames:
                         try:
-                            client.rmtree(annotations_dir)
+                            client.delete(path)
+                            logger.info(f"[CONSOLIDATE] Discarded duplicate/rejected intermediate image: {path}")
                         except Exception as e:
-                            logger.warning(f"[CONSOLIDATE] Could not remove empty annotations dir: {e}")
-                    continue
-                # Remove any intermediate batch or window directory
-                staging_subdir = f"{remote_job_dir}/{top_entry.name}"
-                try:
-                    client.rmtree(staging_subdir)
-                except Exception as e:
-                    logger.warning(f"[CONSOLIDATE] Could not rmtree staging subdir {staging_subdir}: {e}")
-        except Exception as e:
-            logger.warning(f"[CONSOLIDATE] Error while purging staging subdirs: {e}")
+                            logger.debug(f"[CONSOLIDATE] Could not delete duplicate intermediate image {path}: {e}")
+                        continue
 
-        # Re-walk final images and annotations
-        final_images = list(client.walk(images_dir))
-        final_annots = list(client.walk(annotations_dir)) if client.exists(annotations_dir) else []
+                    target_rel = f"{images_dir}/{filename}"
+                    if target_rel != path:
+                        try:
+                            client._rename(path, target_rel)
+                            moved_images += 1
+                        except Exception as e:
+                            logger.warning(f"[CONSOLIDATE] Failed to move image {path} -> {target_rel}: {e}")
+    
+                # Move annotation files into unified annotations/ directory
+                elif "/annotations/" in path or any(filename.lower().endswith(ext) for ext in [".json", ".xml", ".txt"]):
+                    if stem not in accepted_ids and filename not in accepted_filenames:
+                        try:
+                            client.delete(path)
+                        except Exception:
+                            pass
+                        continue
 
-        # Write master manifest
-        structure_dict = {
-            "images_dir": "images/",
-            "manifest": "manifest.json",
-        }
-        if final_annots:
-            structure_dict["annotations_dir"] = "annotations/"
+                    _ensure_dir(client, annotations_dir)
+                    target_rel = f"{annotations_dir}/{filename}"
+                    if target_rel != path:
+                        try:
+                            client._rename(path, target_rel)
+                            moved_annotations += 1
+                        except Exception as e:
+                            logger.warning(f"[CONSOLIDATE] Failed to move annotation {path} -> {target_rel}: {e}")
+    
+            # Recursively remove all intermediate staging directories (e.g. batch_*, window_*)
+            try:
+                top_entries = client.list_dir(remote_job_dir)
+                for top_entry in top_entries:
+                    if not top_entry.is_dir:
+                        continue
+                    # Preserve the consolidated images directory
+                    if top_entry.name == "images":
+                        continue
+                    # If annotations directory exists but has no annotations, purge it
+                    if top_entry.name == "annotations":
+                        ann_files = list(client.walk(annotations_dir))
+                        if not ann_files:
+                            try:
+                                client.rmtree(annotations_dir)
+                            except Exception as e:
+                                logger.warning(f"[CONSOLIDATE] Could not remove empty annotations dir: {e}")
+                        continue
+                    # Remove any intermediate batch or window directory
+                    staging_subdir = f"{remote_job_dir}/{top_entry.name}"
+                    try:
+                        client.rmtree(staging_subdir)
+                    except Exception as e:
+                        logger.warning(f"[CONSOLIDATE] Could not rmtree staging subdir {staging_subdir}: {e}")
+            except Exception as e:
+                logger.warning(f"[CONSOLIDATE] Error while purging staging subdirs: {e}")
 
-        manifest_payload = {
-            "job_id": str(job_id),
-            "job_name": job_name,
-            "generated_at": datetime.now(timezone.utc).isoformat(),
+            # Prune any duplicate, rejected, or unaccepted files from the final images directory
+            for entry in list(client.walk(images_dir)):
+                fn = Path(entry.path).name
+                stem = Path(entry.path).stem
+                if stem not in accepted_ids and fn not in accepted_filenames:
+                    try:
+                        client.delete(entry.path)
+                        logger.info(f"[CONSOLIDATE] Pruned duplicate/rejected image from NAS images directory: {entry.path}")
+                    except Exception as exc:
+                        logger.warning(f"[CONSOLIDATE] Could not delete duplicate image {entry.path}: {exc}")
+
+            if client.exists(annotations_dir):
+                for entry in list(client.walk(annotations_dir)):
+                    fn = Path(entry.path).name
+                    stem = Path(entry.path).stem
+                    if stem not in accepted_ids and fn not in accepted_filenames:
+                        try:
+                            client.delete(entry.path)
+                        except Exception:
+                            pass
+    
+            # Re-walk final images and annotations
+            final_images = list(client.walk(images_dir))
+            final_annots = list(client.walk(annotations_dir)) if client.exists(annotations_dir) else []
+
+            # If NAS final image count exceeds target_count, prune surplus images safely from NAS
+            with session_scope() as db:
+                curr_job = JobRepository(db).get(job_uuid)
+                job_target = curr_job.target_count if curr_job else None
+
+            if job_target is not None and len(final_images) > job_target:
+                from app.tasks.filtering_tasks import _asset_quality_sort_key
+                from app.services.standardization_service import is_asset_file_shared
+                with session_scope() as db:
+                    all_accepted = list(
+                        db.execute(
+                            select(Asset).where(
+                                Asset.job_id == job_uuid,
+                                Asset.status.in_([
+                                    AssetStatus.COMPLETED,
+                                    AssetStatus.NAS_VERIFIED,
+                                    AssetStatus.RELEVANCE_PASSED,
+                                    AssetStatus.READY_FOR_UPLOAD,
+                                    AssetStatus.UPLOADING,
+                                ]),
+                            )
+                        ).scalars().all()
+                    )
+                    sorted_acc = sorted(all_accepted, key=_asset_quality_sort_key, reverse=True)
+                    surplus_db = sorted_acc[job_target:]
+                    surplus_id_set = {str(a.id) for a in surplus_db}
+                    surplus_filename_set = {f"{a.id}.jpg" for a in surplus_db}
+                    for a in surplus_db:
+                        if a.nas_path:
+                            surplus_filename_set.add(Path(a.nas_path).name)
+
+                    for entry in list(client.walk(images_dir)):
+                        fn = Path(entry.path).name
+                        stem = Path(entry.path).stem
+                        if fn in surplus_filename_set or stem in surplus_id_set:
+                            asset_obj = next((a for a in surplus_db if str(a.id) == stem or (a.nas_path and Path(a.nas_path).name == fn)), None)
+                            shared = False
+                            if asset_obj:
+                                shared = is_asset_file_shared(asset_obj, entry.path)
+                            if not shared:
+                                try:
+                                    client.delete(entry.path)
+                                except Exception as exc:
+                                    logger.debug(f"[CONSOLIDATE] Error deleting surplus image {entry.path}: {exc}")
+
+                    for a in surplus_db:
+                        a.status = AssetStatus.SURPLUS
+                        md = dict(a.asset_metadata or {})
+                        md["trimmed_as_surplus"] = True
+                        md["surplus_trimmed_at"] = datetime.now(timezone.utc).isoformat()
+                        a.asset_metadata = md
+                    db.commit()
+
+                # Re-walk final images after surplus pruning
+                final_images = list(client.walk(images_dir))
+                final_annots = list(client.walk(annotations_dir)) if client.exists(annotations_dir) else []
+    
+            # Write master manifest
+            structure_dict = {
+                "images_dir": "images/",
+                "manifest": "manifest.json",
+            }
+            if final_annots:
+                structure_dict["annotations_dir"] = "annotations/"
+    
+            manifest_payload = {
+                "job_id": str(job_id),
+                "job_name": job_name,
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+                "total_images": len(final_images),
+                "total_annotations": len(final_annots),
+                "structure": structure_dict,
+                "images": [
+                    {
+                        "filename": Path(e.path).name,
+                        "rel_path": f"images/{Path(e.path).name}",
+                        "size": e.size,
+                    }
+                    for e in sorted(final_images, key=lambda x: x.path)
+                ],
+                "annotations": [
+                    {
+                        "filename": Path(e.path).name,
+                        "rel_path": f"annotations/{Path(e.path).name}",
+                        "size": e.size,
+                    }
+                    for e in sorted(final_annots, key=lambda x: x.path)
+                ],
+            }
+    
+            with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as tf:
+                json.dump(manifest_payload, tf, indent=2)
+                tmp_local_path = Path(tf.name)
+    
+            try:
+                client.upload(tmp_local_path, f"{remote_job_dir}/manifest.json")
+            finally:
+                tmp_local_path.unlink(missing_ok=True)
+    
+            # Update PostgreSQL Asset records
+            with session_scope() as db:
+                stmt = select(Asset).where(
+                    Asset.job_id == job_uuid,
+                    Asset.status.in_([
+                        AssetStatus.COMPLETED,
+                        AssetStatus.NAS_VERIFIED,
+                        AssetStatus.RELEVANCE_PASSED,
+                        AssetStatus.READY_FOR_UPLOAD,
+                        AssetStatus.UPLOADING,
+                    ]),
+                )
+                updated_assets = 0
+                failed_assets = 0
+                image_names_set = {Path(e.path).name for e in final_images}
+                annot_names_set = {Path(e.path).name for e in final_annots}
+                recovered_any = False
+    
+                for asset in db.execute(stmt).scalars():
+                    asset_fn = f"{asset.id}.jpg"
+                    if asset.nas_path:
+                        curr_fn = Path(asset.nas_path).name
+                        if curr_fn in image_names_set:
+                            asset_fn = curr_fn
+                    if asset_fn in image_names_set:
+                        asset.nas_path = asset_files.make_remote_path(f"{images_dir}/{asset_fn}")
+                        stem = Path(asset_fn).stem
+                        found_annot = None
+                        for ext in (".json", ".xml", ".txt"):
+                            if f"{stem}{ext}" in annot_names_set:
+                                found_annot = f"{stem}{ext}"
+                                break
+                        if found_annot:
+                            asset.annotation_nas_path = asset_files.make_remote_path(f"{annotations_dir}/{found_annot}")
+                        asset.status = AssetStatus.COMPLETED
+                        updated_assets += 1
+                    else:
+                        # Last-resort fallback: check if local image exists and upload it right now
+                        local_uploaded = False
+                        if asset.nas_path and not asset_files.is_remote(asset.nas_path):
+                            p = Path(asset.nas_path)
+                            if p.is_file():
+                                try:
+                                    client.upload(p, f"{images_dir}/{asset_fn}")
+                                    asset.nas_path = asset_files.make_remote_path(f"{images_dir}/{asset_fn}")
+                                    if asset.annotation_nas_path and not asset_files.is_remote(asset.annotation_nas_path):
+                                        ann_p = Path(asset.annotation_nas_path)
+                                        if ann_p.is_file():
+                                            ann_fn = f"{Path(asset_fn).stem}{ann_p.suffix}"
+                                            client.upload(ann_p, f"{annotations_dir}/{ann_fn}")
+                                            asset.annotation_nas_path = asset_files.make_remote_path(f"{annotations_dir}/{ann_fn}")
+                                    asset.status = AssetStatus.COMPLETED
+                                    updated_assets += 1
+                                    local_uploaded = True
+                                    recovered_any = True
+                                    logger.info(f"[CONSOLIDATE] Recovered local asset {asset.id} and uploaded to NAS.")
+                                except Exception as e:
+                                    logger.warning(f"[CONSOLIDATE] Failed to recover local asset {asset.id}: {e}")
+    
+                        if not local_uploaded:
+                            if asset.status in (AssetStatus.READY_FOR_UPLOAD, AssetStatus.UPLOADING, AssetStatus.RELEVANCE_PASSED):
+                                logger.info(
+                                    f"[CONSOLIDATE] Asset {asset.id} is in in-flight status {asset.status}; "
+                                    "preserving status for upload pipeline instead of marking FAILED."
+                                )
+                                continue
+                            logger.warning(
+                                f"[CONSOLIDATE] Asset {asset.id} not found in NAS consolidated directory for job {job_id}. "
+                                "Marking status as FAILED."
+                            )
+                            asset.status = AssetStatus.FAILED
+                            failed_assets += 1
+    
+                if recovered_any:
+                    final_images = list(client.walk(images_dir))
+                    final_annots = list(client.walk(annotations_dir)) if client.exists(annotations_dir) else []
+                    manifest_payload["total_images"] = len(final_images)
+                    manifest_payload["total_annotations"] = len(final_annots)
+                    manifest_payload["images"] = [
+                        {"filename": Path(e.path).name, "rel_path": f"images/{Path(e.path).name}", "size": e.size}
+                        for e in sorted(final_images, key=lambda x: x.path)
+                    ]
+                    manifest_payload["annotations"] = [
+                        {"filename": Path(e.path).name, "rel_path": f"annotations/{Path(e.path).name}", "size": e.size}
+                        for e in sorted(final_annots, key=lambda x: x.path)
+                    ]
+                    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as tf:
+                        json.dump(manifest_payload, tf, indent=2)
+                        tmp_local_path = Path(tf.name)
+                    try:
+                        client.upload(tmp_local_path, f"{remote_job_dir}/manifest.json")
+                    finally:
+                        tmp_local_path.unlink(missing_ok=True)
+
+            db.execute(
+                update(Asset)
+                .where(
+                    Asset.job_id == job_uuid,
+                    Asset.status.in_(_NOT_KEPT),
+                )
+                .values(nas_path=None, annotation_nas_path=None)
+            )
+
+            from app.services.job_counters import reconcile
+            reconciled = reconcile(db, job_uuid)
+            db.commit()
+
+            try:
+                from app.services.progress_service import ProgressPublisher
+                publisher = ProgressPublisher(get_redis())
+                publisher.publish(str(job_uuid), {"type": "job_progress_updated"})
+            except Exception as e:
+                logger.warning(f"[CONSOLIDATE] Error publishing job progress after consolidation: {e}")
+
+        logger.info(
+            f"[CONSOLIDATE] Job {job_id} dataset consolidated on NAS at {remote_job_dir}: "
+            f"{len(final_images)} images, {len(final_annots)} annotations, "
+            f"{updated_assets} DB assets verified, {failed_assets} missing assets marked FAILED."
+        )
+        try:
+            r = get_redis()
+            if r:
+                r.set(f"nas_consolidated:{job_uuid}", "1", ex=86400 * 7)
+        except Exception:
+            pass
+        return {
+            "status": "completed",
+            "remote_job_dir": remote_job_dir,
             "total_images": len(final_images),
             "total_annotations": len(final_annots),
-            "structure": structure_dict,
-            "images": [
-                {
-                    "filename": Path(e.path).name,
-                    "rel_path": f"images/{Path(e.path).name}",
-                    "size": e.size,
-                }
-                for e in sorted(final_images, key=lambda x: x.path)
-            ],
-            "annotations": [
-                {
-                    "filename": Path(e.path).name,
-                    "rel_path": f"annotations/{Path(e.path).name}",
-                    "size": e.size,
-                }
-                for e in sorted(final_annots, key=lambda x: x.path)
-            ],
+            "moved_images": moved_images,
+            "moved_annotations": moved_annotations,
+            "deleted_manifests": deleted_manifests,
+            "updated_assets": updated_assets,
         }
-
-        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as tf:
-            json.dump(manifest_payload, tf, indent=2)
-            tmp_local_path = Path(tf.name)
-
+    finally:
         try:
-            client.upload(tmp_local_path, f"{remote_job_dir}/manifest.json")
-        finally:
-            tmp_local_path.unlink(missing_ok=True)
-
-    # Update PostgreSQL Asset records
-    with session_scope() as db:
-        stmt = select(Asset).where(
-            Asset.job_id == job_uuid,
-            Asset.status.in_([AssetStatus.COMPLETED, AssetStatus.NAS_VERIFIED, AssetStatus.RELEVANCE_PASSED]),
-        )
-        updated_assets = 0
-        image_names_set = {Path(e.path).name for e in final_images}
-        annot_names_set = {Path(e.path).name for e in final_annots}
-
-        for asset in db.execute(stmt).scalars():
-            asset_fn = f"{asset.id}.jpg"
-            if asset.nas_path:
-                curr_fn = Path(asset.nas_path).name
-                if curr_fn in image_names_set:
-                    asset_fn = curr_fn
-            if asset_fn in image_names_set:
-                asset.nas_path = asset_files.make_remote_path(f"{images_dir}/{asset_fn}")
-                annot_fn = f"{Path(asset_fn).stem}.json"
-                if annot_fn in annot_names_set:
-                    asset.annotation_nas_path = asset_files.make_remote_path(f"{annotations_dir}/{annot_fn}")
-                asset.status = AssetStatus.COMPLETED
-                updated_assets += 1
-
-        db.commit()
-
-    logger.info(
-        f"[CONSOLIDATE] Job {job_id} dataset consolidated on NAS at {remote_job_dir}: "
-        f"{len(final_images)} images, {len(final_annots)} annotations, {updated_assets} DB assets updated."
-    )
-    return {
-        "status": "completed",
-        "remote_job_dir": remote_job_dir,
-        "total_images": len(final_images),
-        "total_annotations": len(final_annots),
-        "moved_images": moved_images,
-        "moved_annotations": moved_annotations,
-        "deleted_manifests": deleted_manifests,
-        "updated_assets": updated_assets,
-    }
+            writer_lock.release()
+        except Exception:
+            pass
+        try:
+            consolidation_lock.release()
+        except Exception:
+            pass
